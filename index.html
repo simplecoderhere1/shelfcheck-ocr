@@ -1,0 +1,1417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#1c1c1c">
+  <title>ShelfCheck</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { height: 100%; }
+    body {
+      height: 100vh; height: 100dvh;
+      background: #0d0d0d; color: #f0f0f0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      display: flex; flex-direction: column;
+      overflow: hidden; -webkit-tap-highlight-color: transparent;
+    }
+
+    /* ── Header ─────────────────────────────────── */
+    .header {
+      flex-shrink: 0; display: flex; align-items: center;
+      justify-content: space-between; padding: 12px 16px;
+      padding-top: max(12px, env(safe-area-inset-top));
+      background: #1c1c1c; border-bottom: 1px solid #2c2c2c;
+    }
+    .app-name { font-size: 15px; font-weight: 600; letter-spacing: .05em; color: #e0e0e0; }
+    .section-tabs { display: flex; background: #2c2c2c; border-radius: 8px; padding: 3px; }
+    .tab-btn {
+      padding: 5px 14px; border-radius: 6px; border: none; background: transparent;
+      color: #888; font-size: 13px; font-weight: 500; cursor: pointer;
+      transition: background .18s, color .18s; user-select: none;
+    }
+    .tab-btn.active { background: #f0f0f0; color: #111; }
+
+    /* ── Camera area ─────────────────────────────── */
+    .camera-wrap { flex: 1; position: relative; background: #000; min-height: 0; display: flex; flex-direction: column; }
+    .photo-area { flex: 1; position: relative; overflow: hidden; min-height: 0; }
+
+    .photo-placeholder {
+      position: absolute; inset: 0; display: flex;
+      flex-direction: column; align-items: center; justify-content: center;
+      gap: 14px; color: #555;
+    }
+    .photo-placeholder svg { opacity: .45; }
+    .photo-placeholder p { font-size: 14px; line-height: 1.6; text-align: center; max-width: 220px; }
+
+    #snapshot {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain; display: none;
+    }
+
+    /* Loading overlay */
+    .loading-overlay {
+      position: absolute; inset: 0; z-index: 25;
+      background: rgba(0,0,0,.55); backdrop-filter: blur(2px);
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 20px; padding: 0 32px;
+    }
+    .loading-cancel {
+      margin-top: 4px; background: rgba(46,46,46,.92); color: #ddd;
+      border: 1px solid #555; font-size: 13px; font-weight: 600;
+      padding: 9px 22px; border-radius: 10px; cursor: pointer;
+    }
+    .loading-cancel:active { transform: scale(.96); }
+
+    /* Results overlay */
+    .results-overlay {
+      position: absolute; bottom: 0; left: 0; right: 0; z-index: 20;
+      padding: 20px 16px;
+      background: linear-gradient(transparent, rgba(0,0,0,.85));
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; pointer-events: none;
+    }
+    .results-overlay .btn-new-scan { pointer-events: auto; }
+    .overlay-badge { font-size: 14px; font-weight: 700; padding: 8px 14px; border-radius: 20px; }
+    .badge-ok           { background: #14532d; color: #4ade80; }
+    .badge-warn         { background: #450a0a; color: #f87171; }
+    .badge-unverifiable { background: #713f12; color: #fde047; }
+
+    /* Error banner */
+    .error-banner {
+      position: absolute; left: 12px; right: 12px; bottom: 16px; z-index: 26;
+      background: #450a0a; border: 1px solid #7f1d1d; border-radius: 12px;
+      padding: 12px 14px; display: flex; align-items: center;
+      justify-content: space-between; gap: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    }
+    .error-banner-msg { font-size: 13px; color: #fecaca; line-height: 1.4; }
+    .error-banner-retry {
+      flex-shrink: 0; background: #ef4444; border: none; color: #fff;
+      font-size: 13px; font-weight: 600; padding: 8px 16px; border-radius: 8px; cursor: pointer;
+    }
+
+    /* First-run hint */
+    .first-hint {
+      position: absolute; inset: 0; z-index: 24;
+      background: rgba(0,0,0,.78); backdrop-filter: blur(3px);
+      display: flex; align-items: center; justify-content: center; padding: 28px;
+    }
+    .first-hint-card {
+      background: #1c1c1c; border: 1px solid #333; border-radius: 16px;
+      padding: 22px 20px; max-width: 320px; text-align: left;
+    }
+    .first-hint-card h3 { font-size: 16px; color: #fff; margin-bottom: 12px; text-align: center; }
+    .first-hint-row {
+      display: flex; align-items: flex-start; gap: 10px; margin-bottom: 11px;
+      font-size: 13px; color: #ccc; line-height: 1.4;
+    }
+    .first-hint-dot { flex-shrink: 0; width: 16px; height: 16px; border-radius: 50%; margin-top: 1px; }
+    .first-hint-btn {
+      width: 100%; margin-top: 8px; background: #2563eb; border: none;
+      color: #fff; font-size: 14px; font-weight: 600; padding: 12px; border-radius: 10px; cursor: pointer;
+    }
+
+    .btn-new-scan {
+      padding: 10px 20px; border-radius: 10px; font-size: 14px;
+      font-weight: 600; border: none; cursor: pointer; background: #2563eb; color: #fff;
+    }
+
+    /* Tap-to-inspect popup */
+    .book-inspect {
+      position: absolute; left: 50%; top: 70px; transform: translateX(-50%);
+      z-index: 30; width: min(86%, 300px);
+      background: rgba(20,20,20,.96); backdrop-filter: blur(6px);
+      border: 1px solid #333; border-radius: 12px; padding: 14px 16px 12px;
+      font-size: 13px; color: #eee; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    }
+    .bi-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+    .bi-key { color: #888; flex-shrink: 0; }
+    .bi-val { color: #eee; text-align: right; word-break: break-word; }
+    .bi-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .bi-status { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2c2c2c; font-weight: 600; color: #cbd5e1; text-align: center; }
+    .bi-close { position: absolute; top: 6px; right: 8px; background: transparent; border: none; color: #888; font-size: 22px; line-height: 1; cursor: pointer; padding: 4px 8px; }
+
+    /* Debug mode */
+    .debug-badge {
+      position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
+      background: #dc2626; color: #fff; font-size: 10px; font-weight: 700;
+      letter-spacing: .08em; padding: 2px 8px; border-radius: 6px;
+      z-index: 50; pointer-events: none;
+    }
+    .timing-badge {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      z-index: 40; background: rgba(0,0,0,.85); border: 1px solid #dc2626;
+      color: #fff; font-size: 12px; font-variant-numeric: tabular-nums;
+      padding: 8px 14px; border-radius: 10px; text-align: center; line-height: 1.5;
+    }
+    .timing-badge b { color: #f87171; }
+
+    .settings-btn {
+      background: transparent; border: none; color: #888; font-size: 18px;
+      cursor: pointer; padding: 4px; line-height: 1; transition: color .15s;
+    }
+    .settings-btn:active { color: #fff; }
+    .settings-btn.debug-active { color: #dc2626; }
+    .settings-menu {
+      display: none; position: absolute; top: 100%; right: 0; margin-top: 4px;
+      background: #1c1c1c; border: 1px solid #333; border-radius: 10px;
+      padding: 8px 0; z-index: 50; min-width: 180px; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    }
+    .settings-menu.show { display: block; }
+    .settings-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px; font-size: 13px; color: #ddd; cursor: pointer; user-select: none;
+    }
+    .settings-item:active { background: #2c2c2c; }
+    .settings-toggle {
+      width: 36px; height: 20px; border-radius: 10px; background: #444;
+      position: relative; transition: background .2s; flex-shrink: 0;
+    }
+    .settings-toggle.on { background: #dc2626; }
+    .settings-toggle::after {
+      content: ''; position: absolute; top: 2px; left: 2px;
+      width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .2s;
+    }
+    .settings-toggle.on::after { transform: translateX(16px); }
+
+    /* Debug table overlay */
+    .debug-overlay {
+      position: absolute; inset: 0; z-index: 25; background: #0d0d0d;
+      overflow-y: auto; -webkit-overflow-scrolling: touch;
+    }
+    .debug-section { padding: 12px 16px; border-bottom: 1px solid #2c2c2c; }
+    .debug-section-title {
+      font-size: 11px; font-weight: 700; letter-spacing: .08em;
+      text-transform: uppercase; color: #888; margin-bottom: 8px;
+    }
+    .debug-book-table { width: 100%; font-size: 11.5px; border-collapse: collapse; }
+    .debug-book-table th {
+      text-align: left; color: #888; font-weight: 600; padding: 6px 8px;
+      border-bottom: 1px solid #333; position: sticky; top: 0; background: #0d0d0d;
+    }
+    .debug-book-table td {
+      padding: 6px 8px; border-bottom: 1px solid #1c1c1c; color: #ddd;
+      vertical-align: top; max-width: 120px; overflow: hidden; text-overflow: ellipsis;
+    }
+    .debug-book-table tr.book-ok  td:first-child { border-left: 3px solid #4ade80; }
+    .debug-book-table tr.book-bad td:first-child { border-left: 3px solid #ef4444; }
+    .debug-book-table tr.book-unv td:first-child { border-left: 3px solid #facc15; }
+    .debug-actions {
+      display: flex; gap: 8px; padding: 12px 16px;
+      padding-bottom: max(12px, env(safe-area-inset-bottom));
+    }
+    .debug-actions .btn { flex: 1; }
+
+    /* Pick buttons (idle state) */
+    .pick-btns {
+      display: flex; flex-direction: column; align-items: center;
+      gap: 14px; width: 100%; max-width: 300px; padding: 0 24px;
+    }
+    .pick-btn {
+      width: 100%; padding: 16px 20px; border-radius: 14px; font-size: 16px;
+      font-weight: 600; border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      gap: 10px; transition: transform .12s ease, opacity .12s;
+    }
+    .pick-btn:active { transform: scale(.97); opacity: .85; }
+    .pick-btn-camera { background: #2563eb; color: #fff; }
+    .pick-btn-upload { background: #2e2e2e; color: #ccc; }
+
+    /* Action bar */
+    .action-bar {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      display: none; align-items: center; gap: 12px;
+      padding: 20px 16px; padding-bottom: max(20px, env(safe-area-inset-bottom));
+      background: linear-gradient(transparent, rgba(0,0,0,.72)); z-index: 21;
+    }
+    .action-bar.show { display: flex; }
+    .btn {
+      flex: 1; padding: 13px 16px; border-radius: 10px; font-size: 15px;
+      font-weight: 600; border: none; cursor: pointer; transition: transform .1s ease;
+    }
+    .btn:active { transform: scale(.96); }
+    .btn-retake  { background: rgba(46,46,46,.92); color: #ddd; }
+    .btn-analyze { background: #2563eb; color: #fff; }
+    .btn-analyze:disabled { background: #1a2f5e; color: #4e71b5; cursor: not-allowed; transform: none; }
+
+    /* Flagged list */
+    .flagged-list {
+      display: none; flex-direction: column; background: #111;
+      border-top: 1px solid #2c2c2c; overflow-y: auto;
+      -webkit-overflow-scrolling: touch; max-height: 200px; flex-shrink: 0;
+    }
+    .flagged-list.show { display: flex; }
+    .flagged-list-header {
+      padding: 8px 14px 6px; font-size: 11px; font-weight: 700;
+      letter-spacing: .07em; text-transform: uppercase; color: #555;
+      flex-shrink: 0; position: sticky; top: 0; background: #111; border-bottom: 1px solid #1e1e1e;
+    }
+    .flagged-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 14px; border-bottom: 1px solid #1a1a1a;
+      cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent;
+      transition: background .12s;
+    }
+    .flagged-item:active { background: #1e1e1e; }
+    .flagged-item-dot { flex-shrink: 0; width: 9px; height: 9px; border-radius: 50%; }
+    .flagged-item-dot-bad { background: #ef4444; }
+    .flagged-item-dot-unv { background: #facc15; }
+    .flagged-item-text { flex: 1; min-width: 0; }
+    .flagged-item-label { font-size: 13px; font-weight: 600; color: #e2e2e2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .flagged-item-sub { font-size: 11px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+    .flagged-item-status { flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 6px; }
+    .flagged-item-status-bad { background: #450a0a; color: #f87171; }
+    .flagged-item-status-unv { background: #713f12; color: #fde047; }
+
+    /* Stage-based loading */
+    .stage-list { display: flex; flex-direction: column; gap: 13px; width: 100%; max-width: 220px; }
+    .stage-row { display: flex; align-items: center; gap: 10px; }
+    .stage-icon { width: 16px; text-align: center; font-size: 12px; flex-shrink: 0; color: rgba(255,255,255,.4); }
+    .stage-label { font-size: 14px; font-weight: 600; color: rgba(255,255,255,.4); transition: color .2s; }
+    .stage-row.s-done .stage-icon, .stage-row.s-done .stage-label { color: #4ade80; }
+    .stage-row.s-active .stage-icon, .stage-row.s-active .stage-label { color: #fff; }
+    .anim-dots span { animation: dotPulse 1.2s ease-in-out infinite; opacity: .2; }
+    .anim-dots span:nth-child(2) { animation-delay: .2s; }
+    .anim-dots span:nth-child(3) { animation-delay: .4s; }
+    @keyframes dotPulse { 0%, 100% { opacity: .2; } 50% { opacity: 1; } }
+
+    /* Landscape layout */
+    @media (orientation: landscape) {
+      body { flex-direction: row; }
+      .header {
+        flex-direction: column; width: auto; border-bottom: none;
+        border-right: 1px solid #2c2c2c; padding: 8px;
+        padding-top: max(8px, env(safe-area-inset-top));
+        padding-left: max(8px, env(safe-area-inset-left));
+        gap: 10px; justify-content: flex-start; align-items: center;
+      }
+      .app-name { display: none; }
+      .section-tabs { flex-direction: column; }
+      .tab-btn { padding: 6px 10px; font-size: 12px; }
+      .pick-btns { flex-direction: row; max-width: none; padding: 0 16px; }
+      .action-bar { flex-direction: row; }
+    }
+
+    /* Landscape gate */
+    .landscape-gate {
+      display: none; position: fixed; inset: 0; z-index: 60;
+      background: #0d0d0d; flex-direction: column; align-items: center;
+      justify-content: center; gap: 20px; padding: 40px 32px; text-align: center;
+    }
+    .landscape-gate.show { display: flex; }
+    .landscape-gate-phone { animation: lsRotate 2.8s ease-in-out infinite; color: #2563eb; }
+    @keyframes lsRotate {
+      0%, 20% { transform: rotate(0deg); }
+      50%, 80% { transform: rotate(-90deg); }
+      100%     { transform: rotate(0deg); }
+    }
+    .landscape-gate h2 { font-size: 22px; font-weight: 700; color: #fff; margin: 0; }
+    .landscape-gate-sub { font-size: 15px; color: #aaa; max-width: 280px; line-height: 1.55; margin: 0; }
+    .landscape-gate-sub strong { color: #f0f0f0; }
+    .landscape-gate-auto { font-size: 12px; color: #555; margin-top: 4px; }
+    .landscape-gate-skip { margin-top: 12px; background: none; border: none; color: #444; font-size: 12px; cursor: pointer; text-decoration: underline; padding: 4px 8px; }
+
+    /* Live camera */
+    .camera-live { display: none; position: fixed; inset: 0; z-index: 70; background: #000; overflow: hidden; touch-action: none; }
+    .camera-live.show { display: block; }
+    .camera-live video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform-origin: center center; }
+    .cam-message { position: absolute; top: max(14px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 3; font-size: 13px; font-weight: 600; color: #fff; background: rgba(0,0,0,.5); padding: 6px 14px; border-radius: 20px; white-space: nowrap; pointer-events: none; }
+    .cam-controls { position: absolute; top: 0; bottom: 0; right: 0; padding: 0 14px; padding-right: max(14px, env(safe-area-inset-right)); display: flex; align-items: center; justify-content: center; z-index: 3; background: linear-gradient(to left, rgba(0,0,0,.4), transparent); }
+    .cam-shutter { width: 46px; height: 46px; border-radius: 50%; border: 3px solid rgba(255,255,255,.9); background: #fff; cursor: pointer; flex-shrink: 0; transition: transform .1s ease; }
+    .cam-shutter:active { transform: scale(.94); }
+    .cam-close { position: absolute; top: max(12px, env(safe-area-inset-top)); left: max(12px, env(safe-area-inset-left)); z-index: 3; width: 40px; height: 40px; border-radius: 50%; border: none; background: rgba(0,0,0,.5); color: #fff; font-size: 24px; line-height: 1; cursor: pointer; }
+  </style>
+</head>
+<body>
+
+<header class="header">
+  <span class="app-name">ShelfCheck</span>
+  <div class="section-tabs" role="group" aria-label="Collection section">
+    <button class="tab-btn active" data-section="fiction">Fiction</button>
+    <button class="tab-btn"        data-section="nonfiction">Nonfiction</button>
+  </div>
+  <div style="position:relative">
+    <button class="settings-btn" id="settingsBtn" aria-label="Settings">&#9881;</button>
+    <div class="settings-menu" id="settingsMenu">
+      <div class="settings-item" id="debugToggle">
+        <span>Debug Mode</span>
+        <div class="settings-toggle" id="debugToggleSwitch"></div>
+      </div>
+      <div style="padding:10px 16px;border-top:1px solid #2c2c2c">
+        <div style="font-size:11px;color:#666;margin-bottom:5px;font-weight:600;letter-spacing:.05em;text-transform:uppercase">Backend URL</div>
+        <input id="backendUrlInput" type="url"
+          placeholder="https://your-backend.onrender.com"
+          style="width:100%;background:#0d0d0d;border:1px solid #444;border-radius:7px;color:#ddd;font-size:12px;padding:7px 9px;outline:none"/>
+        <div id="backendUrlStatus" style="font-size:11px;margin-top:4px;color:#666"></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="camera-wrap" id="cameraWrap">
+  <div class="photo-area" id="photoArea">
+    <div class="photo-placeholder" id="photoPlaceholder">
+      <div class="pick-btns">
+        <button class="pick-btn pick-btn-camera" id="takePicBtn">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+            <circle cx="12" cy="13" r="4"/>
+          </svg>
+          Take Photo
+        </button>
+        <button class="pick-btn pick-btn-upload" id="uploadPicBtn">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
+            <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
+          </svg>
+          Upload Image
+        </button>
+        <p style="font-size:12px;color:#888;text-align:center;line-height:1.5;padding:0 8px">
+          Get close enough that the white label stickers are sharp and readable.
+        </p>
+      </div>
+    </div>
+    <canvas id="snapshot"></canvas>
+    <div class="action-bar" id="actionBar">
+      <button class="btn btn-retake"  id="retakeBtn">Retake</button>
+      <button class="btn btn-analyze" id="analyzeBtn" disabled>Analyze</button>
+    </div>
+  </div>
+  <div class="flagged-list" id="flaggedList"></div>
+</div>
+
+<div class="landscape-gate" id="landscapeGate">
+  <svg class="landscape-gate-phone" width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+    <rect x="5" y="2" width="14" height="20" rx="2.5"/>
+    <circle cx="12" cy="17.5" r=".5" fill="currentColor" stroke="none"/>
+  </svg>
+  <h2>Turn your phone sideways</h2>
+  <p class="landscape-gate-sub">Fit <strong>one shelf row</strong> in frame.</p>
+  <p class="landscape-gate-auto">Camera opens automatically when you rotate.</p>
+  <button class="landscape-gate-skip" id="landscapeSkip">Shoot in portrait anyway</button>
+</div>
+
+<div class="camera-live" id="cameraLive">
+  <video id="cameraVideo" playsinline autoplay muted></video>
+  <div class="cam-message">Take a picture of one shelf row</div>
+  <button class="cam-close" id="camClose" aria-label="Close camera">&times;</button>
+  <div class="cam-controls">
+    <button class="cam-shutter" id="camShutter" aria-label="Take photo"></button>
+  </div>
+</div>
+
+<input type="file" id="photoInput"  accept="image/*" capture="environment" style="display:none">
+<input type="file" id="uploadInput" accept="image/*" style="display:none">
+
+<script>
+  // ── DOM refs ────────────────────────────────────────────────────────────
+  const photoInput        = document.getElementById('photoInput');
+  const uploadInput       = document.getElementById('uploadInput');
+  const photoPlaceholder  = document.getElementById('photoPlaceholder');
+  const takePicBtn        = document.getElementById('takePicBtn');
+  const uploadPicBtn      = document.getElementById('uploadPicBtn');
+  const snapshot          = document.getElementById('snapshot');
+  const actionBar         = document.getElementById('actionBar');
+  const retakeBtn         = document.getElementById('retakeBtn');
+  const analyzeBtn        = document.getElementById('analyzeBtn');
+  const cameraWrap        = document.getElementById('cameraWrap');
+  const photoArea         = document.getElementById('photoArea');
+
+  // ── OCR backend ─────────────────────────────────────────────────────────
+  let BACKEND_URL = (localStorage.getItem('shelfcheck_ocr_backend') || '').replace(/\/$/, '') || null;
+  const OCR_TIMEOUT_MS = 30000;
+
+  // ── State ────────────────────────────────────────────────────────────────
+  const MAX_CANVAS_DIM = 3000;
+  let pendingEncode    = null;   // Promise<{blob, sentW, sentH}> — pre-encodes while user reads photo
+  let lastRawBooks     = null;
+  let lastCheckedBooks = [];
+  let lastApiDims      = null;   // {sentW, sentH} of the image sent to OCR
+  let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
+  let analysisCancelled = false;
+  let analysisAbort     = null;
+
+  // ── Section toggle ────────────────────────────────────────────────────────
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      try { localStorage.setItem('shelfcheck.section', btn.dataset.section); } catch {}
+      if (lastRawBooks && document.getElementById('resultsOverlay')) {
+        showResults(lastRawBooks, btn.dataset.section);
+      }
+    });
+  });
+  try {
+    const saved = localStorage.getItem('shelfcheck.section');
+    if (saved) {
+      const b = document.querySelector(`.tab-btn[data-section="${saved}"]`);
+      if (b) { document.querySelectorAll('.tab-btn').forEach(x => x.classList.remove('active')); b.classList.add('active'); }
+    }
+  } catch {}
+
+  function getSection() { return document.querySelector('.tab-btn.active').dataset.section; }
+
+  // ── Photo loading ─────────────────────────────────────────────────────────
+  function loadPhoto(file) {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, MAX_CANVAS_DIM / Math.max(img.naturalWidth, img.naturalHeight));
+      snapshot.width  = Math.round(img.naturalWidth  * scale);
+      snapshot.height = Math.round(img.naturalHeight * scale);
+      snapshot.getContext('2d').drawImage(img, 0, 0, snapshot.width, snapshot.height);
+      URL.revokeObjectURL(url);
+      saveCleanPhoto();
+      photoPlaceholder.style.display = 'none';
+      snapshot.style.display = 'block';
+      actionBar.classList.add('show');
+      analyzeBtn.disabled = !BACKEND_URL;
+      pendingEncode = encodeForOCR();
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      showErrorBanner("Couldn't open that image — try another photo (JPEG or PNG).", retake);
+    };
+    img.src = url;
+  }
+
+  function retake() {
+    snapshot.style.display = 'none';
+    photoPlaceholder.style.display = '';
+    actionBar.classList.remove('show');
+    analyzeBtn.disabled    = true;
+    analyzeBtn.textContent = 'Analyze';
+    photoInput.value  = '';
+    uploadInput.value = '';
+    pendingEncode    = null;
+    _cleanPhotoData  = null;
+    lastApiDims      = null;
+    lastRawBooks     = null;
+    lastCheckedBooks = [];
+    document.getElementById('errorBanner')?.remove();
+  }
+
+  // ── Clean-photo save/restore (for re-drawing boxes on tab switch) ─────────
+  function saveCleanPhoto() {
+    _cleanPhotoData = snapshot.getContext('2d').getImageData(0, 0, snapshot.width, snapshot.height);
+  }
+
+  function restoreCleanPhoto() {
+    if (_cleanPhotoData && _cleanPhotoData.width === snapshot.width)
+      snapshot.getContext('2d').putImageData(_cleanPhotoData, 0, 0);
+  }
+
+  // ── Landscape gate ────────────────────────────────────────────────────────
+  const landscapeGate = document.getElementById('landscapeGate');
+  function _isPortraitMobile() {
+    return Math.min(screen.width, screen.height) <= 500 && window.innerHeight > window.innerWidth;
+  }
+  takePicBtn.addEventListener('click', () => {
+    if (_isPortraitMobile()) landscapeGate.classList.add('show');
+    else openLiveCamera();
+  });
+  document.getElementById('landscapeSkip').addEventListener('click', () => openLiveCamera());
+  window.addEventListener('resize', () => {
+    if (landscapeGate.classList.contains('show') && !_isPortraitMobile()) openLiveCamera();
+  });
+
+  // ── Live in-app camera ────────────────────────────────────────────────────
+  const cameraLive  = document.getElementById('cameraLive');
+  const cameraVideo = document.getElementById('cameraVideo');
+  const camShutter  = document.getElementById('camShutter');
+  const camClose    = document.getElementById('camClose');
+  let cameraStream  = null;
+  let camZoom       = 1;
+
+  function setZoom(z) {
+    camZoom = Math.min(4, Math.max(1, z));
+    cameraVideo.style.transform = `scale(${camZoom})`;
+  }
+
+  async function openLiveCamera() {
+    landscapeGate.classList.remove('show');
+    if (!navigator.mediaDevices?.getUserMedia) { photoInput.click(); return; }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+        audio: false,
+      });
+    } catch { photoInput.click(); return; }
+    cameraStream = stream;
+    cameraVideo.srcObject = stream;
+    setZoom(1);
+    cameraLive.classList.add('show');
+    try { await cameraVideo.play(); } catch {}
+  }
+
+  function closeLiveCamera() {
+    cameraLive.classList.remove('show');
+    if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
+    cameraVideo.srcObject = null;
+  }
+
+  function captureFromCamera() {
+    const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
+    const dispW = cameraLive.clientWidth, dispH = cameraLive.clientHeight;
+    if (!vw || !vh) { showErrorBanner("Camera isn't ready — try again.", () => openLiveCamera()); return; }
+    const cover = Math.max(dispW / vw, dispH / vh);
+    const eff   = cover * camZoom;
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    const toVX  = px => vw / 2 + (px - dispW / 2) / eff;
+    const toVY  = py => vh / 2 + (py - dispH / 2) / eff;
+    const sx  = clamp(toVX(0),     0, vw), sx2 = clamp(toVX(dispW), 0, vw);
+    const sy  = clamp(toVY(0),     0, vh), sy2 = clamp(toVY(dispH), 0, vh);
+    const sw  = Math.max(1, sx2 - sx), sh = Math.max(1, sy2 - sy);
+    const sc  = Math.min(1, MAX_CANVAS_DIM / Math.max(sw, sh));
+    snapshot.width  = Math.round(sw * sc);
+    snapshot.height = Math.round(sh * sc);
+    snapshot.getContext('2d').drawImage(cameraVideo, sx, sy, sw, sh, 0, 0, snapshot.width, snapshot.height);
+    closeLiveCamera();
+    saveCleanPhoto();
+    photoPlaceholder.style.display = 'none';
+    snapshot.style.display = 'block';
+    actionBar.classList.add('show');
+    analyzeBtn.disabled = false;
+    pendingEncode = encodeForOCR();
+  }
+
+  // Pinch-to-zoom
+  let pinchDist = 0, pinchZoom = 1;
+  const touchDist = t => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  cameraLive.addEventListener('touchstart', e => { if (e.touches.length === 2) { pinchDist = touchDist(e.touches); pinchZoom = camZoom; } }, { passive: false });
+  cameraLive.addEventListener('touchmove',  e => { if (e.touches.length === 2 && pinchDist) { e.preventDefault(); setZoom(pinchZoom * touchDist(e.touches) / pinchDist); } }, { passive: false });
+
+  camShutter.addEventListener('click', captureFromCamera);
+  camClose.addEventListener('click', closeLiveCamera);
+  uploadPicBtn.addEventListener('click', () => uploadInput.click());
+  retakeBtn.addEventListener('click', retake);
+  photoInput.addEventListener('change',  () => { if (photoInput.files[0])  loadPhoto(photoInput.files[0]); });
+  uploadInput.addEventListener('change', () => { if (uploadInput.files[0]) loadPhoto(uploadInput.files[0]); });
+
+  // ── Image encoding ────────────────────────────────────────────────────────
+  // Step-halving downscale avoids bilinear smearing on large reductions.
+  function stepDownscale(srcCanvas, tW, tH) {
+    let cur = srcCanvas, cw = cur.width, ch = cur.height;
+    while (cw / tW > 2 || ch / tH > 2) {
+      const nw = Math.max(tW, Math.ceil(cw / 2)), nh = Math.max(tH, Math.ceil(ch / 2));
+      const step = document.createElement('canvas');
+      step.width = nw; step.height = nh;
+      step.getContext('2d').drawImage(cur, 0, 0, nw, nh);
+      cur = step; cw = nw; ch = nh;
+    }
+    if (cw !== tW || ch !== tH) {
+      const fin = document.createElement('canvas');
+      fin.width = tW; fin.height = tH;
+      fin.getContext('2d').drawImage(cur, 0, 0, tW, tH);
+      return fin;
+    }
+    return cur;
+  }
+
+  // Returns Promise<{blob, sentW, sentH}>
+  // sentW/sentH are the pixel dims of what is actually sent to the backend —
+  // used to map OCR bbox coordinates back onto the canvas.
+  function encodeForOCR(maxDim = 2400, quality = 0.88) {
+    const W = snapshot.width, H = snapshot.height;
+    const scale = Math.min(1, maxDim / Math.max(W, H));
+    const sentW = Math.round(W * scale), sentH = Math.round(H * scale);
+    const resized = stepDownscale(snapshot, sentW, sentH);
+    const out = document.createElement('canvas');
+    out.width = sentW; out.height = sentH;
+    const ctx = out.getContext('2d');
+    ctx.filter = 'contrast(1.08) saturate(1.05)';
+    ctx.drawImage(resized, 0, 0);
+    return new Promise((resolve, reject) => {
+      out.toBlob(blob => {
+        if (!blob) { reject(new Error('image encoding failed')); return; }
+        resolve({ blob, sentW, sentH });
+      }, 'image/jpeg', quality);
+    });
+  }
+
+  // ── OCR backend ───────────────────────────────────────────────────────────
+  async function callOCR(blob, externalSignal) {
+    const fd = new FormData();
+    fd.append('file', blob, 'shelf.jpg');
+
+    const ctrl  = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), OCR_TIMEOUT_MS);
+    const onAbort = () => ctrl.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) ctrl.abort();
+      else externalSignal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    if (!BACKEND_URL) throw Object.assign(new Error('No backend URL configured. Open ⚙ and paste your backend URL.'), { status: 0 });
+    let res;
+    try {
+      res = await fetch(BACKEND_URL + '/ocr', { method: 'POST', body: fd, signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
+    }
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      const err = new Error(`${res.status}: ${errText.slice(0, 200)}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();   // {labels, ms, imageSize, n}
+  }
+
+  // Convert OCR label array to the book format the ordering logic expects.
+  function labelsToBooks(labels) {
+    return (labels || []).map(label => ({
+      spine_label: label.text,
+      title:       null,
+      confidence:  label.score >= 0.65 ? 'high' : 'low',
+      shelfRow:    label.shelfRow ?? 0,
+      _bbox:       label.bbox,    // [x, y, w, h] in sent-image coordinate space
+      _score:      label.score,
+    }));
+  }
+
+  // ── Loading stages ────────────────────────────────────────────────────────
+  const LOADING_STAGES = ['Compressing image', 'Reading spine labels', 'Checking order'];
+  let _currentStage = -1;
+
+  function _dotsHtml() { return '<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span>'; }
+  const STAGE_ICON = { done: '✓', pending: '○' };
+
+  function _setStageState(i, state) {
+    const row  = document.getElementById(`stage-row-${i}`);
+    const icon = document.getElementById(`stage-icon-${i}`);
+    if (!row || !icon) return;
+    row.classList.toggle('s-done',   state === 'done');
+    row.classList.toggle('s-active', state === 'active');
+    icon.innerHTML = state === 'active' ? _dotsHtml() : STAGE_ICON[state];
+  }
+
+  function showLoading() {
+    const overlay = document.createElement('div');
+    overlay.id = 'loadingOverlay'; overlay.className = 'loading-overlay';
+    const rows = LOADING_STAGES.map((label, i) => `
+      <div class="stage-row" id="stage-row-${i}">
+        <span class="stage-icon" id="stage-icon-${i}">${STAGE_ICON.pending}</span>
+        <span class="stage-label">${label}</span>
+      </div>`).join('');
+    overlay.innerHTML = `<div class="stage-list">${rows}</div>
+      <button class="loading-cancel" id="loadingCancel" style="margin-top:8px">Cancel</button>`;
+    photoArea.appendChild(overlay);
+    document.getElementById('loadingCancel').onclick = cancelAnalysis;
+    resetStageTo(0);
+  }
+
+  function advanceStage() {
+    _setStageState(_currentStage, 'done');
+    _setStageState(++_currentStage, 'active');
+  }
+
+  function resetStageTo(idx) {
+    LOADING_STAGES.forEach((_, i) =>
+      _setStageState(i, i < idx ? 'done' : i === idx ? 'active' : 'pending'));
+    _currentStage = idx;
+  }
+
+  function hideLoading() { document.getElementById('loadingOverlay')?.remove(); }
+
+  function cancelAnalysis() {
+    analysisCancelled = true;
+    analysisAbort?.abort();
+    hideLoading();
+    analyzeBtn.disabled    = false;
+    analyzeBtn.textContent = 'Analyze';
+    actionBar.classList.add('show');
+  }
+
+  // ── Main pipeline ─────────────────────────────────────────────────────────
+  async function analyzeShelf() {
+    analyzeBtn.disabled    = true;
+    analyzeBtn.textContent = 'Reading…';
+    analysisCancelled = false;
+    analysisAbort     = new AbortController();
+    showLoading();
+
+    // Yield two frames so the overlay paints before encoding blocks the thread.
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    const tPrep0 = performance.now();
+    let encoded;
+    try {
+      encoded = await (pendingEncode ?? encodeForOCR());
+      pendingEncode = null;
+    } catch (err) {
+      if (analysisCancelled) return;
+      hideLoading();
+      showErrorBanner('Could not prepare the photo. Try retaking it.', () => analyzeShelf());
+      analyzeBtn.disabled    = false;
+      analyzeBtn.textContent = 'Analyze';
+      return;
+    }
+    const prepTime = Math.round(performance.now() - tPrep0);
+
+    advanceStage();  // → "Reading spine labels"
+
+    let ocrData, apiTime;
+    try {
+      const t0 = performance.now();
+      ocrData  = await callOCR(encoded.blob, analysisAbort.signal);
+      apiTime  = Math.round(performance.now() - t0);
+    } catch (err) {
+      if (analysisCancelled) return;
+      hideLoading();
+      showErrorBanner(friendlyErrorMessage(err), () => analyzeShelf());
+      analyzeBtn.disabled    = false;
+      analyzeBtn.textContent = 'Analyze';
+      return;
+    }
+
+    if (analysisCancelled) return;
+
+    advanceStage();  // → "Checking order"
+
+    lastRawBooks = labelsToBooks(ocrData.labels);
+    lastApiDims  = { sentW: encoded.sentW, sentH: encoded.sentH };
+
+    hideLoading();
+    showResults(lastRawBooks, getSection());
+    if (debugMode) showTimingBadge(prepTime, apiTime, ocrData.ms);
+
+    analyzeBtn.disabled    = false;
+    analyzeBtn.textContent = 'Analyze';
+  }
+
+  function friendlyErrorMessage(err) {
+    if (err.name === 'AbortError' || err.name === 'TimeoutError')
+      return 'Reading took too long. Try again with the shelf closer and better lit.';
+    if (!navigator.onLine || /Failed to fetch|NetworkError/i.test(err.message))
+      return "Couldn't reach the server. Check your connection.";
+    if (err.status === 429) return 'Server is busy — wait a moment and retry.';
+    if (err.status === 413) return 'Photo is too large. Try a lower camera resolution.';
+    return `Analysis failed: ${err.message}`;
+  }
+
+  function showErrorBanner(message, onRetry) {
+    document.getElementById('errorBanner')?.remove();
+    const banner = document.createElement('div');
+    banner.id = 'errorBanner'; banner.className = 'error-banner';
+    banner.innerHTML = `<span class="error-banner-msg">${escapeHtml(message)}</span>
+      <button class="error-banner-retry" id="errBannerRetry">Retry</button>`;
+    photoArea.appendChild(banner);
+    document.getElementById('errBannerRetry').onclick = () => { banner.remove(); onRetry(); };
+  }
+
+  // ── Bounding box drawing ──────────────────────────────────────────────────
+  function drawBoundingBoxes(checkedBooks, sentW, sentH) {
+    const ctx = snapshot.getContext('2d');
+    const sx  = snapshot.width  / sentW;
+    const sy  = snapshot.height / sentH;
+    const lw  = Math.max(2, Math.round(snapshot.width / 450));
+    const fs  = Math.max(11, Math.round(snapshot.width / 65));
+
+    ctx.save();
+    ctx.lineWidth    = lw;
+    ctx.font         = `bold ${fs}px sans-serif`;
+    ctx.textBaseline = 'bottom';
+
+    checkedBooks.forEach((book, i) => {
+      if (!book._bbox) return;
+      const [bx, by, bw, bh] = book._bbox;
+      const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
+      const color = book.unverifiable ? '#facc15'
+                  : book.outOfOrder  ? '#ef4444'
+                  : '#22c55e';
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = lw;
+      ctx.strokeRect(cx, cy, cw, ch);
+
+      // Number badge above the box
+      const num  = String(i + 1);
+      const tw   = ctx.measureText(num).width;
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(cx, cy - fs - 3, tw + 6, fs + 3);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#000';
+      ctx.fillText(num, cx + 3, cy - 2);
+    });
+
+    ctx.restore();
+  }
+
+  // ── Tap to inspect ────────────────────────────────────────────────────────
+  snapshot.addEventListener('click', e => {
+    if (!lastCheckedBooks.length || !lastApiDims) return;
+    const rect = snapshot.getBoundingClientRect();
+    const tapX = (e.clientX - rect.left) * (snapshot.width  / rect.width);
+    const tapY = (e.clientY - rect.top)  * (snapshot.height / rect.height);
+    const sx = snapshot.width  / lastApiDims.sentW;
+    const sy = snapshot.height / lastApiDims.sentH;
+
+    const hit = lastCheckedBooks.find(b => {
+      if (!b._bbox) return false;
+      const [bx, by, bw, bh] = b._bbox;
+      return tapX >= bx * sx && tapX <= (bx + bw) * sx &&
+             tapY >= by * sy && tapY <= (by + bh) * sy;
+    });
+    if (hit) showBookInspect(hit);
+    else document.getElementById('bookInspect')?.remove();
+  });
+
+  function showBookInspect(book) {
+    document.getElementById('bookInspect')?.remove();
+    const div   = document.createElement('div');
+    div.id = 'bookInspect'; div.className = 'book-inspect';
+    const color = book.unverifiable ? '#facc15' : book.outOfOrder ? '#ef4444' : '#22c55e';
+    const status = book.unverifiable ? 'Check manually' : book.outOfOrder ? 'Out of order' : 'In order';
+    div.innerHTML = `
+      <button class="bi-close" onclick="document.getElementById('bookInspect').remove()">&times;</button>
+      <div class="bi-row"><span class="bi-key">Label</span><span class="bi-val">${escapeHtml(book.spine_label || '—')}</span></div>
+      <div class="bi-row"><span class="bi-key">Confidence</span><span class="bi-val">${Math.round((book._score || 0) * 100)}%</span></div>
+      <div class="bi-row"><span class="bi-key">Position</span><span class="bi-val">#${book.shelfPosition} of ${book.shelfSize} on shelf ${(book.shelfIndex ?? 0) + 1}</span></div>
+      ${book.outOfOrder ? `<div class="bi-row"><span class="bi-key">Should be</span><span class="bi-val">slot ${book.idealPosition ?? '?'}</span></div>` : ''}
+      <div class="bi-status"><span class="bi-dot" style="background:${color}"></span>${status}</div>`;
+    photoArea.appendChild(div);
+  }
+
+  // ── Ordering logic (identical to shelfcheck/index.html) ──────────────────
+  const SURNAME_PREFIXES = new Set([
+    'de','del','dela','di','du','la','le','les','lo','mac','mc',
+    'o','van','von','st','san','santa','el','al','bin','ibn','da','das','dos',
+  ]);
+
+  function lettersLower(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+  function buildMultiWordSurname(tokens, start) {
+    let surname = ''; let i = start;
+    while (i < tokens.length - 1 && SURNAME_PREFIXES.has(tokens[i].toLowerCase())) { surname += tokens[i].toLowerCase(); i++; }
+    if (i < tokens.length) surname += tokens[i].toLowerCase();
+    return surname.replace(/[^a-z]/g, '') || null;
+  }
+
+  function parseSurnameAndFirst(s) {
+    if (!s) return null;
+    let str = String(s).trim().replace(/\s*\d+\s*$/, '').trim();
+    if (!str) return null;
+    if (str.includes(',')) {
+      const parts = str.split(',').map(p => p.trim()).filter(Boolean);
+      const sTokens = parts[0].split(/\s+/).filter(Boolean);
+      const surname = buildMultiWordSurname(sTokens, 0) || lettersLower(parts[0]);
+      const first   = parts[1] ? lettersLower(parts[1]) : '';
+      if (!surname) return null;
+      return { surname, first };
+    }
+    let tokens = str.split(/\s+/).filter(Boolean);
+    if (!tokens.length) return null;
+    while (tokens.length > 1 && /^(jr|sr|ii|iii|iv|v|esq)\.?$/i.test(tokens[tokens.length - 1])) tokens.pop();
+    if (tokens.length === 1) return { surname: lettersLower(tokens[0]), first: '' };
+    const t0 = tokens[0], t1 = tokens[1];
+    if (/^[A-Z]{2,}$/.test(t0) && /^[A-Z][a-z]/.test(t1)) {
+      const surname = buildMultiWordSurname(tokens.slice(0, -1), 0) || lettersLower(t0);
+      return { surname, first: lettersLower(tokens[tokens.length - 1]) };
+    }
+    let surnameStart = tokens.length - 1;
+    while (surnameStart > 1 && SURNAME_PREFIXES.has(tokens[surnameStart - 1].toLowerCase())) surnameStart--;
+    const surname = buildMultiWordSurname(tokens, surnameStart);
+    const first   = lettersLower(tokens.slice(0, surnameStart).join(''));
+    return { surname: surname || lettersLower(tokens[tokens.length - 1]), first };
+  }
+
+  function parseDewey(s) {
+    if (!s) return null;
+    const m = s.match(/^\s*([0-9]+(?:\.[0-9]+)?|[A-Za-z]+)\s*([A-Za-z]+)?/i);
+    if (!m) return null;
+    const num    = isNaN(parseFloat(m[1])) ? null : parseFloat(m[1]);
+    const prefix = m[1].toLowerCase();
+    let cut = (m[2] || '').toLowerCase();
+    if (num === null) cut = (prefix + cut).replace(/[^a-z]/g, '');
+    return { num, cut, prefix };
+  }
+
+  function extractVolume(book) {
+    if (typeof book.series_volume === 'number' && isFinite(book.series_volume)) return book.series_volume;
+    if (book.spine_label) { const m = String(book.spine_label).match(/(\d+)\s*$/); if (m) return parseInt(m[1], 10); }
+    return null;
+  }
+
+  function sortKey(book, section) {
+    if (book.confidence === 'low') return null;
+    const vol   = extractVolume(book);
+    const title = lettersLower((book.title || '').replace(/^the\s+|^a\s+|^an\s+/i, ''));
+    function strKey(s) {
+      const a = parseSurnameAndFirst(s);
+      return a ? { kind: 'str', val: a.surname, first: a.first, vol, title } : null;
+    }
+    if (section === 'fiction')    return book.spine_label ? strKey(book.spine_label) : null;
+    if (section === 'nonfiction') { const d = parseDewey(book.spine_label); return d ? { kind: 'dewey', val: d, vol, title } : null; }
+    const d = parseDewey(book.spine_label);
+    if (d && d.num !== null) return { kind: 'dewey', val: d, vol, title };
+    return book.spine_label ? strKey(book.spine_label) : null;
+  }
+
+  function compareKeys(a, b) {
+    if (a.kind !== b.kind) return a.kind === 'dewey' ? -1 : 1;
+    let cmp;
+    if (a.kind === 'str') {
+      cmp = a.val.localeCompare(b.val, undefined, { sensitivity: 'base' });
+    } else {
+      const an = a.val.num === null ? Infinity : a.val.num;
+      const bn = b.val.num === null ? Infinity : b.val.num;
+      cmp = an !== bn ? an - bn : a.val.cut.localeCompare(b.val.cut, undefined, { sensitivity: 'base' });
+    }
+    if (cmp !== 0) return cmp;
+    if (a.kind === 'str') {
+      cmp = (a.first || '').localeCompare(b.first || '', undefined, { sensitivity: 'base' });
+      if (cmp !== 0) return cmp;
+    }
+    const av = a.vol == null ? Infinity : a.vol, bv = b.vol == null ? Infinity : b.vol;
+    if (av !== bv) return av - bv;
+    const at = a.title || '', bt = b.title || '';
+    if (!at || !bt) return 0;
+    return at.localeCompare(bt, undefined, { sensitivity: 'base' });
+  }
+
+  function longestNonDecreasingSubseq(keys) {
+    const n = keys.length, dp = new Array(n).fill(1), prev = new Array(n).fill(-1);
+    let bestEnd = 0;
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < i; j++) {
+        if (compareKeys(keys[j], keys[i]) <= 0 && dp[j] + 1 > dp[i]) { dp[i] = dp[j] + 1; prev[i] = j; }
+      }
+      if (dp[i] > dp[bestEnd]) bestEnd = i;
+    }
+    const set = new Set();
+    for (let i = bestEnd; i !== -1; i = prev[i]) set.add(i);
+    return set;
+  }
+
+  function groupByShelfRow(books) {
+    const byRow = new Map();
+    for (const b of books) {
+      const row = (typeof b.shelfRow === 'number' && b.shelfRow >= 0) ? b.shelfRow : 0;
+      if (!byRow.has(row)) byRow.set(row, []);
+      byRow.get(row).push(b);
+    }
+    return [...byRow.entries()].sort((a, b) => a[0] - b[0]).map(([, shelf]) => shelf);
+  }
+
+  function editDistance(a, b) {
+    a = a || ''; b = b || '';
+    const m = a.length, n = b.length;
+    if (!m) return n; if (!n) return m;
+    let prev = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) {
+      const cur = [i];
+      for (let j = 1; j <= n; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      }
+      prev = cur;
+    }
+    return prev[n];
+  }
+
+  function checkOrderOneShelf(books, section) {
+    const keys = books.map(b => sortKey(b, section));
+
+    function samePrimary(a, b) {
+      if (a.kind !== b.kind) return false;
+      return a.kind === 'str' ? a.val === b.val && (a.first || '') === (b.first || '')
+                              : a.val.num === b.val.num && a.val.cut === b.val.cut;
+    }
+    function primaryStr(k) { return k.kind === 'str' ? (k.val || '') : String(k.val.num ?? ''); }
+
+    // Pre-pass: demote obvious OCR outliers before LIS
+    const misreads = [];
+    for (let i = 0; i < keys.length; i++) {
+      if (!keys[i]) continue;
+      let L = i - 1; while (L >= 0 && !keys[L]) L--;
+      let R = i + 1; while (R < keys.length && !keys[R]) R++;
+      if (L < 0 || R >= keys.length) continue;
+      const kL = keys[L], kR = keys[R], kM = keys[i];
+      if (samePrimary(kL, kR) && !samePrimary(kM, kL)) { misreads.push(i); continue; }
+      const vL = primaryStr(kL), vR = primaryStr(kR), vM = primaryStr(kM);
+      if (vL && vR && vM && vL[0] === vR[0] &&
+          Math.abs(vM.charCodeAt(0) - vL.charCodeAt(0)) >= 3 &&
+          Math.abs(vM.charCodeAt(0) - vR.charCodeAt(0)) >= 3) misreads.push(i);
+    }
+    for (const i of misreads) keys[i] = null;
+
+    const vIdx = []; keys.forEach((k, i) => { if (k) vIdx.push(i); });
+    const lisLocal  = longestNonDecreasingSubseq(vIdx.map(i => keys[i]));
+    const lisGlobal = new Set([...lisLocal].map(li => vIdx[li]));
+
+    const sortedV = [...vIdx].sort((a, b) => compareKeys(keys[a], keys[b]));
+    const idealRank = new Map();
+    sortedV.forEach((origIdx, rank) => idealRank.set(origIdx, vIdx[rank] + 1));
+
+    const tiedSlots = new Map();
+    let r = 0;
+    while (r < sortedV.length) {
+      let s = r;
+      while (s + 1 < sortedV.length && compareKeys(keys[sortedV[s + 1]], keys[sortedV[r]]) === 0) s++;
+      const lo = vIdx[r] + 1, hi = vIdx[s] + 1;
+      for (let k = r; k <= s; k++) tiedSlots.set(sortedV[k], [lo, hi]);
+      r = s + 1;
+    }
+
+    const checked = books.map((book, i) => {
+      const pos = i + 1;
+      if (!keys[i]) return { ...book, outOfOrder: false, unverifiable: true, idealPosition: null, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: null };
+      const ideal    = idealRank.get(i) ?? null;
+      const tied     = tiedSlots.get(i) || null;
+      const inTied   = tied && pos >= tied[0] && pos <= tied[1];
+      return { ...book, outOfOrder: !lisGlobal.has(i) && !inTied, unverifiable: false, idealPosition: ideal, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: tied };
+    });
+
+    // Post-pass: sandwich / near-twin demotion
+    for (let i = 0; i < checked.length; i++) {
+      if (!checked[i].outOfOrder) continue;
+      let L = i - 1; while (L >= 0 && checked[L].outOfOrder) L--;
+      let R = i + 1; while (R < checked.length && checked[R].outOfOrder) R++;
+      if (L < 0 || R >= checked.length) continue;
+      const kL = keys[L], kR = keys[R], kM = keys[i];
+      if (!kL || !kR || !kM) continue;
+      let demote = compareKeys(kL, kR) === 0;
+      if (!demote && kL.kind === kR.kind && kM.kind === kL.kind) {
+        const vL = kL.kind === 'str' ? kL.val : String(kL.val.num ?? '');
+        const vR = kR.kind === 'str' ? kR.val : String(kR.val.num ?? '');
+        const vM = kM.kind === 'str' ? kM.val : String(kM.val.num ?? '');
+        if (vL && vR && vM && vL[0] === vR[0] &&
+            Math.abs(vM.charCodeAt(0) - vL.charCodeAt(0)) >= 3 &&
+            Math.abs(vM.charCodeAt(0) - vR.charCodeAt(0)) >= 3) demote = true;
+      }
+      if (!demote && kM.kind === 'str') {
+        const vM = kM.val || '';
+        for (const kN of [kL, kR]) {
+          if (kN.kind !== 'str') continue;
+          const vN = kN.val || '';
+          if (Math.min(vM.length, vN.length) >= 5 && vM !== vN && editDistance(vM, vN) <= 2) { demote = true; break; }
+        }
+      }
+      if (demote) { checked[i].outOfOrder = false; checked[i].unverifiable = true; checked[i].idealPosition = null; }
+    }
+    return checked;
+  }
+
+  function checkOrder(books, section) {
+    const shelves = groupByShelfRow(books);
+    return shelves.flatMap((shelf, si) =>
+      checkOrderOneShelf(shelf, section).map(b => ({ ...b, shelfIndex: si }))
+    );
+  }
+
+  // ── Results display ───────────────────────────────────────────────────────
+  function detectSectionMismatch(books, section) {
+    if (section !== 'fiction') return null;
+    const labels = books.map(b => b.spine_label).filter(Boolean);
+    if (labels.length < 3) return null;
+    const deweyish = labels.filter(l => /^\s*\d{1,3}(\.\d+)?(\s|$)/.test(String(l))).length;
+    return deweyish / labels.length > 0.6 ? 'nonfiction' : null;
+  }
+
+  function setActiveTab(section) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.section === section));
+    try { localStorage.setItem('shelfcheck.section', section); } catch {}
+  }
+
+  function showResults(books, section) {
+    const checked = checkOrder(books, section);
+    lastCheckedBooks = checked;
+
+    document.getElementById('resultsOverlay')?.remove();
+    document.getElementById('sectionHint')?.remove();
+    document.getElementById('bookInspect')?.remove();
+    actionBar.classList.remove('show');
+
+    // Redraw the clean photo then overlay boxes
+    restoreCleanPhoto();
+    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH);
+
+    const total    = checked.length;
+    const outCount = checked.filter(b => b.outOfOrder).length;
+    const unvCount = checked.filter(b => b.unverifiable).length;
+
+    if (total === 0) { showNoBooksBadge(); showFlaggedList([]); return; }
+
+    showSummaryBadge(total, outCount, unvCount);
+    showFlaggedList(checked);
+
+    const suggest = detectSectionMismatch(books, section);
+    if (suggest) showSectionHint(suggest);
+  }
+
+  function showNoBooksBadge() {
+    const overlay = document.createElement('div');
+    overlay.id = 'resultsOverlay'; overlay.className = 'results-overlay';
+    overlay.innerHTML = `<div class="overlay-badge badge-warn">No labels detected — retake</div>
+      <button class="btn-new-scan" onclick="newScan()">Retake</button>`;
+    photoArea.appendChild(overlay);
+  }
+
+  function showSummaryBadge(total, outCount, unvCount) {
+    let cls, text;
+    if (outCount > 0)      { cls = 'badge-warn';         text = `${outCount} out of order${unvCount ? ` · ${unvCount} to check` : ''} · ${total} read`; }
+    else if (unvCount > 0) { cls = 'badge-unverifiable'; text = `${unvCount} to check · ${total} read`; }
+    else                   { cls = 'badge-ok';           text = `✓ All ${total} in order`; }
+    const overlay = document.createElement('div');
+    overlay.id = 'resultsOverlay'; overlay.className = 'results-overlay';
+    overlay.innerHTML = `<div class="overlay-badge ${cls}">${text}</div>
+      <button class="btn-new-scan" onclick="newScan()">New Scan</button>`;
+    photoArea.appendChild(overlay);
+  }
+
+  function showSectionHint(suggest) {
+    const hint = document.createElement('div');
+    hint.id = 'sectionHint'; hint.className = 'error-banner';
+    hint.style.cssText = 'background:#713f12;border-color:#a16207;bottom:86px';
+    hint.innerHTML = `<span class="error-banner-msg" style="color:#fde047">
+        These look like Dewey numbers — is this a ${suggest} shelf?</span>
+      <button class="error-banner-retry" style="background:#ca8a04" id="sectionHintBtn">Re-check</button>`;
+    photoArea.appendChild(hint);
+    document.getElementById('sectionHintBtn').onclick = () => {
+      hint.remove(); setActiveTab(suggest); showResults(lastRawBooks, suggest);
+    };
+  }
+
+  function showFlaggedList(checked) {
+    const panel = document.getElementById('flaggedList');
+    const flagged = checked.filter(b => b.outOfOrder || b.unverifiable);
+    panel.innerHTML = '';
+    if (!flagged.length) { panel.classList.remove('show'); return; }
+
+    const multiShelf = new Set(checked.map(b => b.shelfIndex).filter(i => i >= 0)).size > 1;
+    const header = document.createElement('div');
+    header.className = 'flagged-list-header';
+    header.textContent = `Flagged books (${flagged.length})`;
+    panel.appendChild(header);
+
+    // Build a global index map: book → box number (1-based position in checked array)
+    const globalIdx = new Map(checked.map((b, i) => [b, i + 1]));
+
+    for (const book of flagged) {
+      const isBad = book.outOfOrder;
+      const row = document.createElement('div');
+      row.className = 'flagged-item';
+      row.onclick = () => showBookInspect(book);
+
+      const posBits = [];
+      if (multiShelf && book.shelfIndex >= 0) posBits.push(`shelf ${book.shelfIndex + 1}`);
+      if (book.shelfPosition) posBits.push(`#${book.shelfPosition} of ${book.shelfSize}`);
+      posBits.push(`box ${globalIdx.get(book) ?? '?'}`);
+
+      row.innerHTML = `
+        <div class="flagged-item-dot ${isBad ? 'flagged-item-dot-bad' : 'flagged-item-dot-unv'}"></div>
+        <div class="flagged-item-text">
+          <div class="flagged-item-label">${escapeHtml(book.spine_label) || '—'}</div>
+          <div class="flagged-item-sub">${escapeHtml(posBits.join(' · '))}</div>
+        </div>
+        <div class="flagged-item-status ${isBad ? 'flagged-item-status-bad' : 'flagged-item-status-unv'}">${isBad ? 'Out of order' : 'Check'}</div>`;
+      panel.appendChild(row);
+    }
+    panel.classList.add('show');
+  }
+
+  function newScan() {
+    document.getElementById('resultsOverlay')?.remove();
+    document.getElementById('debugOverlay')?.remove();
+    document.getElementById('bookInspect')?.remove();
+    document.getElementById('sectionHint')?.remove();
+    const panel = document.getElementById('flaggedList');
+    panel.classList.remove('show'); panel.innerHTML = '';
+    lastRawBooks = null; lastCheckedBooks = [];
+    retake();
+  }
+
+  // ── Debug mode ────────────────────────────────────────────────────────────
+  let debugMode = false;
+  const settingsBtn  = document.getElementById('settingsBtn');
+  const settingsMenu = document.getElementById('settingsMenu');
+  const debugToggle  = document.getElementById('debugToggle');
+  const debugSwitch  = document.getElementById('debugToggleSwitch');
+
+  settingsBtn.addEventListener('click', e => { e.stopPropagation(); settingsMenu.classList.toggle('show'); });
+  document.addEventListener('click', () => settingsMenu.classList.remove('show'));
+  settingsMenu.addEventListener('click', e => e.stopPropagation());
+  debugToggle.addEventListener('click', () => {
+    debugMode = !debugMode;
+    debugSwitch.classList.toggle('on', debugMode);
+    settingsBtn.classList.toggle('debug-active', debugMode);
+    document.getElementById('debugBadge')?.remove();
+    if (debugMode) {
+      const badge = document.createElement('div');
+      badge.id = 'debugBadge'; badge.className = 'debug-badge'; badge.textContent = 'DEBUG';
+      document.querySelector('.header').appendChild(badge);
+    }
+    settingsMenu.classList.remove('show');
+  });
+
+  // ── Backend URL setting ───────────────────────────────────────────────────
+  const backendUrlInput  = document.getElementById('backendUrlInput');
+  const backendUrlStatus = document.getElementById('backendUrlStatus');
+
+  function refreshBackendStatus() {
+    if (BACKEND_URL) {
+      backendUrlStatus.textContent = '✓ Saved';
+      backendUrlStatus.style.color = '#4ade80';
+    } else {
+      backendUrlStatus.textContent = 'Not configured — backend required to analyze';
+      backendUrlStatus.style.color = '#f87171';
+    }
+    analyzeBtn.disabled = !BACKEND_URL || snapshot.style.display === 'none';
+  }
+
+  backendUrlInput.value = BACKEND_URL || '';
+  refreshBackendStatus();
+
+  backendUrlInput.addEventListener('change', () => {
+    const v = backendUrlInput.value.trim().replace(/\/$/, '');
+    if (v) { localStorage.setItem('shelfcheck_ocr_backend', v); BACKEND_URL = v; }
+    else   { localStorage.removeItem('shelfcheck_ocr_backend');  BACKEND_URL = null; }
+    refreshBackendStatus();
+  });
+
+  backendUrlInput.addEventListener('keydown', e => { if (e.key === 'Enter') { backendUrlInput.blur(); } });
+
+  function showTimingBadge(prepMs, apiMs, ocrMs) {
+    document.getElementById('timingBadge')?.remove();
+    const fmt   = ms => (ms / 1000).toFixed(1) + 's';
+    const badge = document.createElement('div');
+    badge.id = 'timingBadge'; badge.className = 'timing-badge';
+    badge.innerHTML =
+      `⏱ prep <b>${fmt(prepMs)}</b> · network <b>${fmt(apiMs)}</b> · ocr <b>${fmt(ocrMs)}</b>`;
+    photoArea.appendChild(badge);
+    badge.onclick = () => badge.remove();
+    setTimeout(() => badge.remove(), 12000);
+  }
+
+  // Debug analyze: runs OCR and shows a full results table without rendering the normal UI.
+  async function analyzeShelfDebug() {
+    analyzeBtn.disabled    = true;
+    analyzeBtn.textContent = 'Processing…';
+    await new Promise(r => setTimeout(r, 50));
+
+    let encoded;
+    try { encoded = await encodeForOCR(); } catch (err) {
+      analyzeBtn.disabled = false; analyzeBtn.textContent = 'Analyze';
+      showErrorBanner('Could not encode image.', () => analyzeShelfDebug());
+      return;
+    }
+
+    const overlay = document.createElement('div');
+    overlay.id = 'debugOverlay'; overlay.className = 'debug-overlay';
+    overlay.innerHTML = `
+      <div class="debug-section">
+        <div class="debug-section-title">Image sent to OCR (${encoded.sentW}×${encoded.sentH})</div>
+        <img style="width:100%;border-radius:8px;border:1px solid #333" src="${URL.createObjectURL(encoded.blob)}" />
+      </div>
+      <div class="debug-section" id="debugResultsSection">
+        <div class="debug-section-title">OCR Results</div>
+        <div style="color:#888;font-size:13px;text-align:center;padding:20px 0">Tap "Send to OCR" below</div>
+      </div>
+      <div class="debug-actions">
+        <button class="btn btn-retake" id="debugClose">Close</button>
+        <button class="btn btn-analyze" id="debugSend">Send to OCR</button>
+      </div>`;
+    cameraWrap.appendChild(overlay);
+
+    document.getElementById('debugClose').onclick = () => {
+      overlay.remove(); analyzeBtn.disabled = false; analyzeBtn.textContent = 'Analyze';
+    };
+
+    document.getElementById('debugSend').onclick = async () => {
+      const sendBtn = document.getElementById('debugSend');
+      sendBtn.disabled = true; sendBtn.textContent = 'Reading…';
+      const rd = document.getElementById('debugResultsSection');
+      rd.innerHTML = `<div class="debug-section-title">OCR Results</div>
+        <div style="color:#888;font-size:13px;text-align:center;padding:20px 0">Waiting…</div>`;
+      try {
+        const t0      = performance.now();
+        const data    = await callOCR(encoded.blob);
+        const elapsed = Math.round(performance.now() - t0);
+        const section = getSection();
+        const books   = labelsToBooks(data.labels);
+        const checked = checkOrder(books, section);
+        const out = checked.filter(b => b.outOfOrder).length;
+        const unv = checked.filter(b => b.unverifiable).length;
+        const ok  = checked.length - out - unv;
+        let html = `<div class="debug-section-title">
+            ${data.n} labels · ${data.ms}ms OCR · ${elapsed}ms total ·
+            <span style="color:#4ade80">${ok} ok</span>
+            <span style="color:#ef4444"> ${out} out</span>
+            <span style="color:#facc15"> ${unv} check</span>
+          </div><div style="overflow-x:auto">
+          <table class="debug-book-table">
+            <tr><th>#</th><th>Label</th><th>Score</th><th>Row</th><th>Status</th></tr>`;
+        checked.forEach((b, i) => {
+          const cls = b.outOfOrder ? 'book-bad' : b.unverifiable ? 'book-unv' : 'book-ok';
+          const status = b.outOfOrder ? `<span style="color:#ef4444">→ slot ${b.idealPosition ?? '?'}</span>`
+                       : b.unverifiable ? '<span style="color:#facc15">Check</span>'
+                       : '<span style="color:#4ade80">OK</span>';
+          html += `<tr class="${cls}"><td>${i + 1}</td><td>${escapeHtml(b.spine_label || '—')}</td>
+            <td>${Math.round((b._score || 0) * 100)}%</td><td>${(b.shelfIndex ?? 0) + 1}</td><td>${status}</td></tr>`;
+        });
+        html += `</table></div>`;
+        rd.innerHTML = html;
+        lastRawBooks = books; lastApiDims = { sentW: encoded.sentW, sentH: encoded.sentH };
+      } catch (err) {
+        rd.innerHTML = `<div class="debug-section-title">OCR Results</div>
+          <div style="color:#f87171;font-size:13px;padding:12px 0">Error: ${escapeHtml(err.message)}</div>`;
+      }
+      sendBtn.disabled = false; sendBtn.textContent = 'Send Again';
+    };
+  }
+
+  analyzeBtn.addEventListener('click', () => {
+    if (debugMode) analyzeShelfDebug();
+    else analyzeShelf();
+  });
+
+  // ── Utilities ─────────────────────────────────────────────────────────────
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // ── First-run hint ────────────────────────────────────────────────────────
+  function maybeShowFirstHint() {
+    let seen = false;
+    try { seen = localStorage.getItem('shelfcheck.hintSeen') === '1'; } catch {}
+    if (seen) return;
+    const hint = document.createElement('div');
+    hint.className = 'first-hint';
+    hint.innerHTML = `
+      <div class="first-hint-card">
+        <h3>How ShelfCheck works</h3>
+        <div class="first-hint-row">
+          <span class="first-hint-dot" style="background:#3b82f6"></span>
+          <span>Take a straight-on photo of one shelf. Get close enough that the white label stickers are sharp.</span>
+        </div>
+        <div class="first-hint-row">
+          <span class="first-hint-dot" style="background:#ef4444"></span>
+          <span><b>Red box</b> on the photo = out of order — listed below with its box number.</span>
+        </div>
+        <div class="first-hint-row">
+          <span class="first-hint-dot" style="background:#facc15"></span>
+          <span><b>Yellow box</b> = label unclear — check it by eye.</span>
+        </div>
+        <div class="first-hint-row">
+          <span class="first-hint-dot" style="background:#22c55e"></span>
+          <span><b>Green box</b> = in order. Tap any box for details.</span>
+        </div>
+        <button class="first-hint-btn" id="firstHintBtn">Got it</button>
+      </div>`;
+    photoArea.appendChild(hint);
+    document.getElementById('firstHintBtn').onclick = () => {
+      hint.remove();
+      try { localStorage.setItem('shelfcheck.hintSeen', '1'); } catch {}
+    };
+  }
+
+  maybeShowFirstHint();
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: shelfcheck-ocr-backend
+    runtime: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    # plan: free        ← free tier (15-min sleep after inactivity, cold start ~20s)
+    # plan: starter     ← $7/mo, always-on, no cold starts  ← recommended
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
+      # Optional: uncomment and set a key to protect the /ocr endpoint
+      # - key: SHELFCHECK_API_KEY
+      #   generateValue: true
