@@ -258,6 +258,7 @@
     .flagged-item-dot-unv { background: #facc15; }
     .flagged-item-text { flex: 1; min-width: 0; }
     .flagged-item-label { font-size: 13px; font-weight: 600; color: #e2e2e2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .flagged-item-title { font-size: 12px; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; font-style: italic; }
     .flagged-item-sub { font-size: 11px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
     .flagged-item-status { flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 6px; }
     .flagged-item-status-bad { background: #450a0a; color: #f87171; }
@@ -418,7 +419,10 @@
   const photoArea         = document.getElementById('photoArea');
 
   // ── OCR backend ─────────────────────────────────────────────────────────
-  let BACKEND_URL = (localStorage.getItem('shelfcheck_ocr_backend') || '').replace(/\/$/, '') || null;
+  // On localhost defaults to port 7860. In production, user sets it once via ⚙ → Backend URL.
+  const _LOCAL = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+  let BACKEND_URL = (localStorage.getItem('shelfcheck_ocr_backend') || '').replace(/\/$/, '')
+    || (_LOCAL ? 'http://localhost:7860' : null);
   const OCR_TIMEOUT_MS = 30000;
 
   // ── State ────────────────────────────────────────────────────────────────
@@ -665,12 +669,13 @@
   // Convert OCR label array to the book format the ordering logic expects.
   function labelsToBooks(labels) {
     return (labels || []).map(label => ({
-      spine_label: label.text,
-      title:       null,
-      confidence:  label.score >= 0.65 ? 'high' : 'low',
-      shelfRow:    label.shelfRow ?? 0,
-      _bbox:       label.bbox,    // [x, y, w, h] in sent-image coordinate space
-      _score:      label.score,
+      spine_label:  label.text,
+      title:        label.title  || null,
+      confidence:   label.score >= 0.65 ? 'high' : 'low',
+      shelfRow:     label.shelfRow ?? 0,
+      _bbox:        label.bbox,
+      _score:       label.score,
+      _title_score: label.title_score || null,
     }));
   }
 
@@ -870,7 +875,8 @@
     div.innerHTML = `
       <button class="bi-close" onclick="document.getElementById('bookInspect').remove()">&times;</button>
       <div class="bi-row"><span class="bi-key">Label</span><span class="bi-val">${escapeHtml(book.spine_label || '—')}</span></div>
-      <div class="bi-row"><span class="bi-key">Confidence</span><span class="bi-val">${Math.round((book._score || 0) * 100)}%</span></div>
+      ${book.title ? `<div class="bi-row"><span class="bi-key">Title</span><span class="bi-val">${escapeHtml(book.title)}</span></div>` : ''}
+      <div class="bi-row"><span class="bi-key">Confidence</span><span class="bi-val">${Math.round((book._score || 0) * 100)}%${book._title_score ? ` · title ${Math.round(book._title_score * 100)}%` : ''}</span></div>
       <div class="bi-row"><span class="bi-key">Position</span><span class="bi-val">#${book.shelfPosition} of ${book.shelfSize} on shelf ${(book.shelfIndex ?? 0) + 1}</span></div>
       ${book.outOfOrder ? `<div class="bi-row"><span class="bi-key">Should be</span><span class="bi-val">slot ${book.idealPosition ?? '?'}</span></div>` : ''}
       <div class="bi-status"><span class="bi-dot" style="background:${color}"></span>${status}</div>`;
@@ -1203,10 +1209,12 @@
       if (book.shelfPosition) posBits.push(`#${book.shelfPosition} of ${book.shelfSize}`);
       posBits.push(`box ${globalIdx.get(book) ?? '?'}`);
 
+      const titleLine = book.title ? `<div class="flagged-item-title">${escapeHtml(book.title)}</div>` : '';
       row.innerHTML = `
         <div class="flagged-item-dot ${isBad ? 'flagged-item-dot-bad' : 'flagged-item-dot-unv'}"></div>
         <div class="flagged-item-text">
           <div class="flagged-item-label">${escapeHtml(book.spine_label) || '—'}</div>
+          ${titleLine}
           <div class="flagged-item-sub">${escapeHtml(posBits.join(' · '))}</div>
         </div>
         <div class="flagged-item-status ${isBad ? 'flagged-item-status-bad' : 'flagged-item-status-unv'}">${isBad ? 'Out of order' : 'Check'}</div>`;

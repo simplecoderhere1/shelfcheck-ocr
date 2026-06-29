@@ -1,21 +1,26 @@
 """
 ShelfCheck OCR v2 — FastAPI + RapidOCR with label-sticker filtering.
 
-POST /ocr → {labels:[{text,score,bbox:[x,y,w,h],quad,shelfRow}], ms, imageSize, n}
+POST /ocr → {labels:[{text,score,bbox:[x,y,w,h],quad,shelfRow,title,title_score}], ms, imageSize, n}
 
-Filtering pipeline (fixes the grouping failure of v1):
-  1. Resize to MAX_SIDE — keeps sticker detail without slow inference on huge images
-  2. CLAHE contrast boost — evens out shelf lighting before OCR
-  3. RapidOCR (det + rec, no angle classifier — stickers are always horizontal)
-  4. Drop results below MIN_SCORE confidence
-  5. Drop non-horizontal regions (spine titles printed vertically)
-  6. Drop regions whose background isn't mostly white (library stickers are white)
-  7. Sort top→bottom, left→right; assign shelfRow from y-centroid clustering
+Filtering pipeline:
+  Pass 1 — call-number stickers
+    1. Resize to MAX_SIDE, CLAHE contrast boost
+    2. RapidOCR (no angle classifier — stickers are always horizontal)
+    3. Keep: score ≥ MIN_SCORE, horizontal region, white background
+    4. Sort top→bottom, left→right; assign shelfRow by y-centroid
+
+  Pass 2 — spine titles
+    5. Rotate image 90° CW (bottom-to-top spine text becomes left-to-right)
+    6. RapidOCR on rotated image
+    7. Keep: horizontal region in rotated space, NOT white background
+    8. Map coordinates back to original image space
+    9. Attach nearest title to each sticker label (matched by x-center)
 
 Env vars (all optional):
   SHELFCHECK_API_KEY   if set, requests must send X-Api-Key header
   ALLOWED_ORIGINS      comma-separated CORS origins (default *)
-  MAX_SIDE             downscale longest edge to this before OCR (default 1600)
+  MAX_SIDE             downscale longest edge before OCR (default 1600)
   MIN_SCORE            minimum OCR confidence to keep (default 0.4)
   WHITE_THRESH         pixel brightness floor for "white" (0-255, default 175)
   WHITE_RATIO          fraction of pixels that must be white (default 0.55)
@@ -97,7 +102,7 @@ async def ocr(
 
     orig_h, orig_w = img.shape[:2]
 
-    # Resize so the longest edge = MAX_SIDE (keeps OCR fast without losing sticker detail)
+    # Resize so the longest edge = MAX_SIDE
     scale = 1.0
     if max(orig_h, orig_w) > MAX_SIDE:
         scale = MAX_SIDE / max(orig_h, orig_w)
@@ -107,21 +112,22 @@ async def ocr(
             interpolation=cv2.INTER_AREA,
         )
 
-    # CLAHE contrast equalisation — helps with uneven shelf lighting
+    # CLAHE contrast equalisation in LAB space
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     l_ch = _clahe.apply(l_ch)
     img = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
-    t0 = time.time()
-    # use_cls=False: stickers are horizontal — angle classifier adds latency with no gain
-    result, _ = engine(img, use_cls=False)
-    ms = int((time.time() - t0) * 1000)
-
+    scaled_h = img.shape[0]  # height of scaled image, needed for title coord mapping
     inv = 1.0 / scale
-    candidates = []
 
-    for box, text, score in result or []:
+    t0 = time.time()
+
+    # ── Pass 1: call-number sticker labels (white + horizontal) ─────────────
+    result1, _ = engine(img, use_cls=False)
+
+    candidates = []
+    for box, text, score in result1 or []:
         text = (text or "").strip()
         if not text or float(score) < MIN_SCORE:
             continue
@@ -129,26 +135,72 @@ async def ocr(
             continue
         if not _has_white_background(img, box):
             continue
-
         x, y, w, h = _pts_bbox(box)
         candidates.append({
             "text":  text,
             "score": round(float(score), 3),
-            # Return coords in original-image pixel space (undo the resize)
             "bbox":  [round(x * inv), round(y * inv), round(w * inv), round(h * inv)],
             "quad":  [[round(float(p[0]) * inv), round(float(p[1]) * inv)] for p in box],
+            "title":       None,
+            "title_score": None,
         })
 
-    # Assign shelf rows by y-centroid: bucket = 10% of original image height
+    # ── Pass 2: spine titles (rotate 90° CW, non-white + horizontal) ────────
+    #
+    # cv2.ROTATE_90_CLOCKWISE maps original pixel (x, y) → rotated (scaled_h-1-y, x).
+    # Inverse: rotated (rx, ry) → original (ry, scaled_h-1-rx).
+    # For a bbox (rx, ry, rw, rh) in rotated space the original bbox is:
+    #   orig_x = ry,  orig_y = scaled_h-1-rx-rw,  orig_w = rh,  orig_h = rw
+    #
+    rotated = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    result2, _ = engine(rotated, use_cls=False)
+
+    title_candidates = []
+    for box, text, score in result2 or []:
+        text = (text or "").strip()
+        if not text or float(score) < MIN_SCORE:
+            continue
+        if not _is_horizontal(box):          # horizontal in rotated space = was vertical
+            continue
+        if _has_white_background(rotated, box):  # skip regions that are sticker labels
+            continue
+        rx, ry, rw, rh = _pts_bbox(box)
+        orig_x = ry
+        orig_y = max(0.0, scaled_h - 1 - rx - rw)
+        orig_w = rh
+        orig_h = rw
+        title_candidates.append({
+            "text":  text,
+            "score": round(float(score), 3),
+            "bbox":  [round(orig_x * inv), round(orig_y * inv),
+                      round(orig_w * inv), round(orig_h * inv)],
+        })
+
+    ms = int((time.time() - t0) * 1000)
+
+    # ── Match titles to sticker labels by x-center proximity ────────────────
+    for c in candidates:
+        lx, ly, lw, lh = c["bbox"]
+        l_cx = lx + lw / 2
+        best, best_dist = None, float("inf")
+        for tc in title_candidates:
+            tx, ty, tw, th = tc["bbox"]
+            dist = abs((tx + tw / 2) - l_cx)
+            if dist < best_dist:
+                best_dist, best = dist, tc
+        # Accept the match only if it falls within 2× the sticker width
+        if best is not None and best_dist <= lw * 2:
+            c["title"]       = best["text"]
+            c["title_score"] = best["score"]
+
+    # ── Sort + assign shelfRow ───────────────────────────────────────────────
     row_h = max(1, round(orig_h * 0.10))
     for c in candidates:
         bx, by, bw, bh = c["bbox"]
         c["_row"] = (by + bh // 2) // row_h
 
-    # Sort: top shelf first, then left-to-right within each shelf
     candidates.sort(key=lambda c: (c["_row"], c["bbox"][0]))
 
-    # Normalise row buckets → 0, 1, 2, … (skipped buckets due to gaps collapse away)
     bucket_map: dict[int, int] = {}
     for c in candidates:
         b = c["_row"]
@@ -157,11 +209,13 @@ async def ocr(
 
     labels = [
         {
-            "text":     c["text"],
-            "score":    c["score"],
-            "bbox":     c["bbox"],
-            "quad":     c["quad"],
-            "shelfRow": bucket_map[c["_row"]],
+            "text":        c["text"],
+            "score":       c["score"],
+            "bbox":        c["bbox"],
+            "quad":        c["quad"],
+            "shelfRow":    bucket_map[c["_row"]],
+            "title":       c["title"],
+            "title_score": c["title_score"],
         }
         for c in candidates
     ]
