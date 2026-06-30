@@ -116,20 +116,16 @@
       font-weight: 600; border: none; cursor: pointer; background: #2563eb; color: #fff;
     }
 
-    /* Tap-to-inspect popup */
-    .book-inspect {
-      position: absolute; left: 50%; top: 70px; transform: translateX(-50%);
-      z-index: 30; width: min(86%, 300px);
-      background: rgba(20,20,20,.96); backdrop-filter: blur(6px);
-      border: 1px solid #333; border-radius: 12px; padding: 14px 16px 12px;
-      font-size: 13px; color: #eee; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    /* Expandable detail row inside flagged list */
+    .flagged-item-detail {
+      display: none; padding: 8px 14px 10px 33px;
+      border-bottom: 1px solid #1a1a1a; background: #0a0a0a;
     }
-    .bi-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
-    .bi-key { color: #888; flex-shrink: 0; }
-    .bi-val { color: #eee; text-align: right; word-break: break-word; }
-    .bi-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-    .bi-status { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2c2c2c; font-weight: 600; color: #cbd5e1; text-align: center; }
-    .bi-close { position: absolute; top: 6px; right: 8px; background: transparent; border: none; color: #888; font-size: 22px; line-height: 1; cursor: pointer; padding: 4px 8px; }
+    .flagged-item-detail.open { display: block; }
+    .fi-drow { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; font-size: 12px; }
+    .fi-dk { color: #666; flex-shrink: 0; }
+    .fi-dv { color: #ccc; text-align: right; word-break: break-word; }
+    .fi-dstatus { margin-top: 6px; font-size: 11px; font-weight: 600; }
 
     /* Debug mode */
     .debug-badge {
@@ -871,8 +867,10 @@
 
     // Only run Call 2 (titles + OL verification) when two or more labels share
     // the same primary sort key and genuinely need a title to break the tie.
-    const section = getSection();
-    const needsTitles = hasPrimaryTies(labels, section);
+    // Use auto-detected section for the tie check so we get the right key type.
+    const rawBooks = labels.map(l => ({ spine_label: l.text }));
+    const tieSect = autoDetectSection(rawBooks) || getSection();
+    const needsTitles = hasPrimaryTies(labels, tieSect);
 
     if (onCall1Done) onCall1Done();
 
@@ -896,7 +894,7 @@
 
       // Verify titles against Open Library; clears unrecognised OCR text so it
       // doesn't corrupt tiebreaking.
-      await verifyTitlesOpenLibrary(labels, section, signal);
+      await verifyTitlesOpenLibrary(labels, tieSect, signal);
     }
 
     // Assign shelfRow (port of server-side sort + bucket_map logic)
@@ -1047,6 +1045,10 @@
     lastRawBooks = labelsToBooks(ocrData.labels);
     lastApiDims  = { sentW: encoded.sentW, sentH: encoded.sentH };
 
+    // Auto-detect section from label patterns and switch tab if confident
+    const detected = autoDetectSection(lastRawBooks);
+    if (detected) setActiveTab(detected);
+
     hideLoading();
     showResults(lastRawBooks, getSection());
     if (debugMode) showTimingBadge(prepTime, apiTime, ocrData.ms);
@@ -1076,8 +1078,6 @@
   }
 
   // ── Bounding box drawing ─────────────────────────────────────────────────
-  // Only draws boxes for flagged books (red = out of order, yellow = check).
-  // In-order books are intentionally skipped to keep the photo clean.
   function drawBoundingBoxes(checkedBooks, sentW, sentH) {
     const ctx = snapshot.getContext('2d');
     const sx  = snapshot.width  / sentW;
@@ -1091,23 +1091,25 @@
 
     checkedBooks.forEach((book, i) => {
       if (!book._bbox) return;
-      if (!book.outOfOrder && !book.unverifiable) return;  // skip green
       const [bx, by, bw, bh] = book._bbox;
       const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
-      const color = book.unverifiable ? '#facc15' : '#ef4444';
+      const color = book.unverifiable ? '#facc15' : book.outOfOrder ? '#ef4444' : '#22c55e';
 
       ctx.strokeStyle = color;
-      ctx.lineWidth   = lw;
+      ctx.lineWidth   = book.outOfOrder || book.unverifiable ? lw : Math.max(1, lw - 1);
       ctx.strokeRect(cx, cy, cw, ch);
 
-      const num = String(i + 1);
-      const tw  = ctx.measureText(num).width;
-      ctx.fillStyle   = color;
-      ctx.globalAlpha = 0.85;
-      ctx.fillRect(cx, cy - fs - 3, tw + 6, fs + 3);
-      ctx.globalAlpha = 1;
-      ctx.fillStyle   = '#000';
-      ctx.fillText(num, cx + 3, cy - 2);
+      // Number badge only for flagged (non-green) books
+      if (book.outOfOrder || book.unverifiable) {
+        const num = String(i + 1);
+        const tw  = ctx.measureText(num).width;
+        ctx.fillStyle   = color;
+        ctx.globalAlpha = 0.85;
+        ctx.fillRect(cx, cy - fs - 3, tw + 6, fs + 3);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle   = '#000';
+        ctx.fillText(num, cx + 3, cy - 2);
+      }
     });
 
     ctx.restore();
@@ -1135,26 +1137,20 @@
       return tapX >= bx * sx && tapX <= (bx + bw) * sx &&
              tapY >= by * sy && tapY <= (by + bh) * sy;
     });
-    if (hit) { highlightArrow(hit); showBookInspect(hit); }
-    else document.getElementById('bookInspect')?.remove();
+    if (hit) {
+      highlightArrow(hit);
+      // Expand the detail row in the flagged list for this book (if flagged)
+      const row = _flaggedRowMap.get(hit);
+      if (row) {
+        const detail = row.nextElementSibling;
+        if (detail?.classList.contains('flagged-item-detail')) {
+          document.querySelectorAll('.flagged-item-detail').forEach(d => d.classList.remove('open'));
+          detail.classList.add('open');
+          row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }
+    }
   });
-
-  function showBookInspect(book) {
-    document.getElementById('bookInspect')?.remove();
-    const div   = document.createElement('div');
-    div.id = 'bookInspect'; div.className = 'book-inspect';
-    const color = book.unverifiable ? '#facc15' : book.outOfOrder ? '#ef4444' : '#22c55e';
-    const status = book.unverifiable ? 'Check manually' : book.outOfOrder ? 'Out of order' : 'In order';
-    div.innerHTML = `
-      <button class="bi-close" onclick="document.getElementById('bookInspect').remove()">&times;</button>
-      <div class="bi-row"><span class="bi-key">Label</span><span class="bi-val">${escapeHtml(book.spine_label || '—')}</span></div>
-      ${book.title ? `<div class="bi-row"><span class="bi-key">Title</span><span class="bi-val">${escapeHtml(book.title)}<span style="margin-left:5px;font-size:10px;opacity:.6">${book.title_verified ? '✓ verified' : '(unverified)'}</span></span></div>` : ''}
-      <div class="bi-row"><span class="bi-key">Confidence</span><span class="bi-val">${Math.round((book._score || 0) * 100)}%${book._title_score ? ` · title ${Math.round(book._title_score * 100)}%` : ''}</span></div>
-      <div class="bi-row"><span class="bi-key">Position</span><span class="bi-val">#${book.shelfPosition} of ${book.shelfSize} on shelf ${(book.shelfIndex ?? 0) + 1}</span></div>
-      ${book.outOfOrder ? `<div class="bi-row"><span class="bi-key">Should be</span><span class="bi-val">slot ${book.idealPosition ?? '?'}</span></div>` : ''}
-      <div class="bi-status"><span class="bi-dot" style="background:${color}"></span>${status}</div>`;
-    photoArea.appendChild(div);
-  }
 
   // ── Ordering logic (identical to shelfcheck/index.html) ──────────────────
   const SURNAME_PREFIXES = new Set([
@@ -1384,12 +1380,15 @@
   }
 
   // ── Results display ───────────────────────────────────────────────────────
-  function detectSectionMismatch(books, section) {
-    if (section !== 'fiction') return null;
+  // Returns 'nonfiction', 'fiction', or null if ambiguous / too few labels.
+  function autoDetectSection(books) {
     const labels = books.map(b => b.spine_label).filter(Boolean);
     if (labels.length < 3) return null;
     const deweyish = labels.filter(l => /^\s*\d{1,3}(\.\d+)?(\s|$)/.test(String(l))).length;
-    return deweyish / labels.length > 0.6 ? 'nonfiction' : null;
+    const ratio = deweyish / labels.length;
+    if (ratio > 0.6)  return 'nonfiction';
+    if (ratio < 0.15) return 'fiction';
+    return null;
   }
 
   function setActiveTab(section) {
@@ -1402,8 +1401,6 @@
     lastCheckedBooks = checked;
 
     document.getElementById('resultsOverlay')?.remove();
-    document.getElementById('sectionHint')?.remove();
-    document.getElementById('bookInspect')?.remove();
     actionBar.classList.remove('show');
 
     // Redraw the clean photo then overlay flagged boxes
@@ -1418,9 +1415,6 @@
 
     showSummaryBadge(total, outCount, unvCount);
     showFlaggedList(checked);
-
-    const suggest = detectSectionMismatch(books, section);
-    if (suggest) showSectionHint(suggest);
   }
 
   function showNoBooksBadge() {
@@ -1441,19 +1435,6 @@
     overlay.innerHTML = `<div class="overlay-badge ${cls}">${text}</div>
       <button class="btn-new-scan" onclick="newScan()">New Scan</button>`;
     photoArea.appendChild(overlay);
-  }
-
-  function showSectionHint(suggest) {
-    const hint = document.createElement('div');
-    hint.id = 'sectionHint'; hint.className = 'error-banner';
-    hint.style.cssText = 'background:#713f12;border-color:#a16207;bottom:86px';
-    hint.innerHTML = `<span class="error-banner-msg" style="color:#fde047">
-        These look like Dewey numbers — is this a ${suggest} shelf?</span>
-      <button class="error-banner-retry" style="background:#ca8a04" id="sectionHintBtn">Re-check</button>`;
-    photoArea.appendChild(hint);
-    document.getElementById('sectionHintBtn').onclick = () => {
-      hint.remove(); setActiveTab(suggest); showResults(lastRawBooks, suggest);
-    };
   }
 
   function showFlaggedList(checked) {
@@ -1477,7 +1458,6 @@
       const row = document.createElement('div');
       row.className = 'flagged-item';
       _flaggedRowMap.set(book, row);
-      row.onclick = () => { highlightArrow(book); showBookInspect(book); };
 
       const posBits = [];
       if (multiShelf && book.shelfIndex >= 0) posBits.push(`shelf ${book.shelfIndex + 1}`);
@@ -1493,7 +1473,28 @@
           <div class="flagged-item-sub">${escapeHtml(posBits.join(' · '))}</div>
         </div>
         <div class="flagged-item-status ${isBad ? 'flagged-item-status-bad' : 'flagged-item-status-unv'}">${isBad ? 'Out of order' : 'Check'}</div>`;
+
+      // Build inline expandable detail (shown below row on tap)
+      const detail = document.createElement('div');
+      detail.className = 'flagged-item-detail';
+      const dcolor = book.unverifiable ? '#facc15' : book.outOfOrder ? '#ef4444' : '#22c55e';
+      const dstatus = book.unverifiable ? 'Check manually' : 'Out of order';
+      detail.innerHTML = `
+        ${book.title ? `<div class="fi-drow"><span class="fi-dk">Title</span><span class="fi-dv">${escapeHtml(book.title)}${book.title_verified ? ' <span style="opacity:.5;font-size:10px">✓</span>' : ''}</span></div>` : ''}
+        <div class="fi-drow"><span class="fi-dk">Confidence</span><span class="fi-dv">${Math.round((book._score || 0) * 100)}%${book._title_score ? ` · title ${Math.round(book._title_score * 100)}%` : ''}</span></div>
+        <div class="fi-drow"><span class="fi-dk">Position</span><span class="fi-dv">#${book.shelfPosition} of ${book.shelfSize} on shelf ${(book.shelfIndex ?? 0) + 1}</span></div>
+        ${book.outOfOrder ? `<div class="fi-drow"><span class="fi-dk">Should be</span><span class="fi-dv">slot ${book.idealPosition ?? '?'}</span></div>` : ''}
+        <div class="fi-dstatus" style="color:${dcolor}">${dstatus}</div>`;
+
+      row.onclick = () => {
+        highlightArrow(book);
+        const wasOpen = detail.classList.contains('open');
+        panel.querySelectorAll('.flagged-item-detail').forEach(d => d.classList.remove('open'));
+        if (!wasOpen) detail.classList.add('open');
+      };
+
       panel.appendChild(row);
+      panel.appendChild(detail);
     }
     panel.classList.add('show');
   }
@@ -1501,8 +1502,6 @@
   function newScan() {
     document.getElementById('resultsOverlay')?.remove();
     document.getElementById('debugOverlay')?.remove();
-    document.getElementById('bookInspect')?.remove();
-    document.getElementById('sectionHint')?.remove();
     const panel = document.getElementById('flaggedList');
     panel.classList.remove('show'); panel.innerHTML = '';
     lastRawBooks = null; lastCheckedBooks = [];
@@ -1657,7 +1656,7 @@
         </div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#22c55e"></span>
-          <span><b>Green box</b> = in order. Tap any box for details.</span>
+          <span><b>Green box</b> = in order. Tap a flagged item below for details.</span>
         </div>
         <button class="first-hint-btn" id="firstHintBtn">Got it</button>
       </div>`;
