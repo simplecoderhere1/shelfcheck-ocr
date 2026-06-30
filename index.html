@@ -986,125 +986,68 @@
     document.getElementById('errBannerRetry').onclick = () => { banner.remove(); onRetry(); };
   }
 
-  // ── Arrow markers ─────────────────────────────────────────────────────────
-  // Draws downward-pointing pin arrows at the top of the photo, one per book.
-  // highlightBook: the one book to emphasise (larger, white border); others dim.
-  function drawArrowMarkers(checkedBooks, sentW, sentH, highlightBook) {
+  // ── Bounding box drawing ─────────────────────────────────────────────────
+  // Only draws boxes for flagged books (red = out of order, yellow = check).
+  // In-order books are intentionally skipped to keep the photo clean.
+  function drawBoundingBoxes(checkedBooks, sentW, sentH) {
     const ctx = snapshot.getContext('2d');
-    const sx  = snapshot.width / sentW;
-
-    const aw  = Math.max(18, Math.round(snapshot.width / 24));  // pin width
-    const sh  = Math.round(aw * 0.92);   // stem height
-    const th  = Math.round(aw * 0.65);   // triangle height
-    const r   = Math.round(aw * 0.22);   // corner radius
-    const fs  = Math.max(9, Math.round(sh * 0.52));
-    const TOP = 5;
+    const sx  = snapshot.width  / sentW;
+    const sy  = snapshot.height / sentH;
+    const lw  = Math.max(2, Math.round(snapshot.width / 450));
+    const fs  = Math.max(11, Math.round(snapshot.width / 65));
 
     ctx.save();
     ctx.font         = `bold ${fs}px sans-serif`;
-    ctx.textAlign    = 'center';
-    ctx.textBaseline = 'middle';
+    ctx.textBaseline = 'bottom';
 
     checkedBooks.forEach((book, i) => {
       if (!book._bbox) return;
-      const [bx,, bw] = book._bbox;
-      const cx     = (bx + bw / 2) * sx;
-      const isHl   = book === highlightBook;
-      const hasHl  = highlightBook !== null && highlightBook !== undefined;
-      const alpha  = (hasHl && !isHl) ? 0.35 : 1;
-      const scale  = isHl ? 1.5 : 1;
-      const hw     = aw / 2;
-      const color  = book.unverifiable ? '#facc15'
-                   : book.outOfOrder   ? '#ef4444'
-                   : '#22c55e';
+      if (!book.outOfOrder && !book.unverifiable) return;  // skip green
+      const [bx, by, bw, bh] = book._bbox;
+      const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
+      const color = book.unverifiable ? '#facc15' : '#ef4444';
 
-      ctx.save();
-      ctx.globalAlpha = alpha;
-      ctx.translate(cx, TOP);
-      ctx.scale(scale, scale);
+      ctx.strokeStyle = color;
+      ctx.lineWidth   = lw;
+      ctx.strokeRect(cx, cy, cw, ch);
 
-      // Stem (rounded rect)
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.roundRect(-hw, 0, aw, sh, r);
-      ctx.fill();
-
-      // Triangle
-      ctx.beginPath();
-      ctx.moveTo(-hw, sh);
-      ctx.lineTo(hw, sh);
-      ctx.lineTo(0, sh + th);
-      ctx.closePath();
-      ctx.fill();
-
-      // White outline when highlighted
-      if (isHl) {
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth   = 2.5;
-        ctx.globalAlpha = 1;
-        ctx.beginPath();
-        ctx.roundRect(-hw, 0, aw, sh, r);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(-hw, sh);
-        ctx.lineTo(hw, sh);
-        ctx.lineTo(0, sh + th);
-        ctx.closePath();
-        ctx.stroke();
-      }
-
-      // Number label
+      const num = String(i + 1);
+      const tw  = ctx.measureText(num).width;
+      ctx.fillStyle   = color;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(cx, cy - fs - 3, tw + 6, fs + 3);
       ctx.globalAlpha = 1;
       ctx.fillStyle   = '#000';
-      ctx.fillText(String(i + 1), 0, sh / 2);
-
-      ctx.restore();
+      ctx.fillText(num, cx + 3, cy - 2);
     });
 
     ctx.restore();
   }
 
-  // Highlight one book: dim others, enlarge its arrow, select its list row.
+  // Highlight one book in the flagged list.
   function highlightArrow(book) {
     document.querySelectorAll('.flagged-item').forEach(r => r.classList.remove('active'));
     const row = _flaggedRowMap.get(book);
     if (row) { row.classList.add('active'); row.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
-    restoreCleanPhoto();
-    if (lastApiDims) drawArrowMarkers(lastCheckedBooks, lastApiDims.sentW, lastApiDims.sentH, book);
   }
 
-  // ── Tap arrow to inspect ──────────────────────────────────────────────────
+  // ── Tap box to inspect ───────────────────────────────────────────────────
   snapshot.addEventListener('click', e => {
     if (!lastCheckedBooks.length || !lastApiDims) return;
     const rect = snapshot.getBoundingClientRect();
     const tapX = (e.clientX - rect.left) * (snapshot.width  / rect.width);
     const tapY = (e.clientY - rect.top)  * (snapshot.height / rect.height);
-    const sx  = snapshot.width / lastApiDims.sentW;
-    const aw  = Math.max(18, Math.round(snapshot.width / 24));
-    const sh  = Math.round(aw * 0.92);
-    const th  = Math.round(aw * 0.65);
-    const arrowZone = (sh + th) * 1.6 + 5;  // generous tap target
+    const sx = snapshot.width  / lastApiDims.sentW;
+    const sy = snapshot.height / lastApiDims.sentH;
 
-    // Only register taps in the top arrow zone
-    if (tapY > arrowZone) { document.getElementById('bookInspect')?.remove(); return; }
-
-    // Find nearest arrow by x-center
-    let hit = null, bestDist = aw;
-    for (const book of lastCheckedBooks) {
-      if (!book._bbox) continue;
-      const [bx,, bw] = book._bbox;
-      const dist = Math.abs(tapX - (bx + bw / 2) * sx);
-      if (dist < bestDist) { bestDist = dist; hit = book; }
-    }
-
+    const hit = lastCheckedBooks.find(b => {
+      if (!b._bbox) return false;
+      const [bx, by, bw, bh] = b._bbox;
+      return tapX >= bx * sx && tapX <= (bx + bw) * sx &&
+             tapY >= by * sy && tapY <= (by + bh) * sy;
+    });
     if (hit) { highlightArrow(hit); showBookInspect(hit); }
-    else {
-      // Tapped between arrows — deselect
-      document.querySelectorAll('.flagged-item').forEach(r => r.classList.remove('active'));
-      restoreCleanPhoto();
-      drawArrowMarkers(lastCheckedBooks, lastApiDims.sentW, lastApiDims.sentH, null);
-      document.getElementById('bookInspect')?.remove();
-    }
+    else document.getElementById('bookInspect')?.remove();
   });
 
   function showBookInspect(book) {
@@ -1374,9 +1317,9 @@
     document.getElementById('bookInspect')?.remove();
     actionBar.classList.remove('show');
 
-    // Redraw the clean photo then overlay arrows
+    // Redraw the clean photo then overlay flagged boxes
     restoreCleanPhoto();
-    if (lastApiDims) drawArrowMarkers(checked, lastApiDims.sentW, lastApiDims.sentH, null);
+    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH);
 
     const total    = checked.length;
     const outCount = checked.filter(b => b.outOfOrder).length;
