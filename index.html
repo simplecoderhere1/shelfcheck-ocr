@@ -749,6 +749,82 @@
     });
   }
 
+  // Returns true if any two labels share the same primary sort key and therefore
+  // need a title to break the tie (same Dewey+Cutter for nonfiction, same
+  // surname+first for fiction).  Uses the same parse functions as compareKeys.
+  function hasPrimaryTies(labels, section) {
+    const seen = new Set();
+    for (const lbl of labels) {
+      let k;
+      if (section === 'fiction') {
+        const p = parseSurnameAndFirst(lbl.text);
+        if (!p) continue;
+        k = p.surname + '\x00' + (p.first || '');
+      } else {
+        const d = parseDewey(lbl.text);
+        if (!d) continue;
+        k = String(d.num ?? '') + '\x00' + (d.cut || '');
+      }
+      if (seen.has(k)) return true;
+      seen.add(k);
+    }
+    return false;
+  }
+
+  // For each label that sits in a tied group AND has an OCR title, query
+  // Open Library to confirm the title is real.  Confirmed titles are kept
+  // (replaced with the canonical OL form); unconfirmed titles are cleared so
+  // they don't pollute tiebreaking.
+  async function verifyTitlesOpenLibrary(labels, section, signal) {
+    // Build a map of primary-key → [indices] to find tied groups.
+    const groups = new Map();
+    labels.forEach((lbl, i) => {
+      let k;
+      if (section === 'fiction') {
+        const p = parseSurnameAndFirst(lbl.text);
+        if (!p) return;
+        k = p.surname + '\x00' + (p.first || '');
+      } else {
+        const d = parseDewey(lbl.text);
+        if (!d) return;
+        k = String(d.num ?? '') + '\x00' + (d.cut || '');
+      }
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(i);
+    });
+
+    // Collect indices that actually need verification (tied + have a title).
+    const toVerify = [];
+    for (const [, idxs] of groups) {
+      if (idxs.length < 2) continue;
+      for (const i of idxs) { if (labels[i].title) toVerify.push(i); }
+    }
+    if (!toVerify.length) return;
+
+    await Promise.all(toVerify.map(async i => {
+      const lbl = labels[i];
+      const params = new URLSearchParams({ title: lbl.title, limit: '3', fields: 'title,author_name' });
+      if (section === 'fiction') {
+        const p = parseSurnameAndFirst(lbl.text);
+        if (p?.surname) params.set('author', p.surname);
+      }
+      try {
+        const res = await fetch(`https://openlibrary.org/search.json?${params}`,
+          { signal, headers: { 'Accept': 'application/json' } });
+        const data = await res.json();
+        if (data.numFound > 0 && data.docs[0]?.title) {
+          lbl.title          = data.docs[0].title;
+          lbl.title_verified = true;
+        } else {
+          lbl.title          = null;   // unrecognised — don't use for ordering
+          lbl.title_verified = false;
+        }
+      } catch {
+        lbl.title_verified = false;  // network error — keep raw title but unverified
+      }
+    }));
+  }
+
   // Run the full two-pass OCR pipeline; returns {labels, ms, imageSize, n}.
   // Calls onCall1Done() between the two proxy calls so the UI can advance stages.
   async function runOcr(encoded, signal, onCall1Done) {
@@ -793,24 +869,35 @@
       labels.length = 0; labels.push(...merged);
     }
 
+    // Only run Call 2 (titles + OL verification) when two or more labels share
+    // the same primary sort key and genuinely need a title to break the tie.
+    const section = getSection();
+    const needsTitles = hasPrimaryTies(labels, section);
+
     if (onCall1Done) onCall1Done();
 
-    // Call 2: rotated image → spine titles (horizontal in rotated space, non-white)
-    const { blob: rotBlob, canvas: rotCanvas } = await makeRotatedBlob(encoded);
-    const rotCtx = rotCanvas.getContext('2d');
-    const data2 = await callOcrProxy(rotBlob, signal);
-    const lines2 = parseOcrOverlay(data2);
+    if (needsTitles) {
+      // Call 2: rotated image → spine titles (horizontal in rotated space, non-white)
+      const { blob: rotBlob, canvas: rotCanvas } = await makeRotatedBlob(encoded);
+      const rotCtx = rotCanvas.getContext('2d');
+      const data2 = await callOcrProxy(rotBlob, signal);
+      const lines2 = parseOcrOverlay(data2);
 
-    const titleCands = [];
-    for (const ln of lines2) {
-      const [rx, ry, rw, rh] = ln.bbox;
-      if (rw < MIN_BOX_W) continue;
-      if (rw < rh * 0.75) continue;
-      if (hasWhiteBg(rotCtx, rx, ry, rw, rh)) continue;
-      titleCands.push({ ...ln, bbox: mapBackRotated(rx, ry, rw, rh, origH) });
+      const titleCands = [];
+      for (const ln of lines2) {
+        const [rx, ry, rw, rh] = ln.bbox;
+        if (rw < MIN_BOX_W) continue;
+        if (rw < rh * 0.75) continue;
+        if (hasWhiteBg(rotCtx, rx, ry, rw, rh)) continue;
+        titleCands.push({ ...ln, bbox: mapBackRotated(rx, ry, rw, rh, origH) });
+      }
+
+      attachTitlesJS(labels, titleCands);
+
+      // Verify titles against Open Library; clears unrecognised OCR text so it
+      // doesn't corrupt tiebreaking.
+      await verifyTitlesOpenLibrary(labels, section, signal);
     }
-
-    attachTitlesJS(labels, titleCands);
 
     // Assign shelfRow (port of server-side sort + bucket_map logic)
     const rowH = Math.max(1, Math.round(origH * 0.10));
@@ -827,13 +914,14 @@
 
     return {
       labels: labels.map(l => ({
-        text:        l.text,
-        score:       l.score,
-        bbox:        l.bbox,
-        quad:        null,
-        shelfRow:    l.shelfRow,
-        title:       l.title || null,
-        title_score: l.title_score || null,
+        text:           l.text,
+        score:          l.score,
+        bbox:           l.bbox,
+        quad:           null,
+        shelfRow:       l.shelfRow,
+        title:          l.title          || null,
+        title_score:    l.title_score    || null,
+        title_verified: l.title_verified ?? false,
       })),
       ms: Math.round(performance.now() - t0),
       imageSize: [encoded.sentW, encoded.sentH],
@@ -844,18 +932,19 @@
   // Convert OCR label array to the book format the ordering logic expects.
   function labelsToBooks(labels) {
     return (labels || []).map(label => ({
-      spine_label:  label.text,
-      title:        label.title  || null,
-      confidence:   label.score >= 0.65 ? 'high' : 'low',
-      shelfRow:     label.shelfRow ?? 0,
-      _bbox:        label.bbox,
-      _score:       label.score,
-      _title_score: label.title_score || null,
+      spine_label:    label.text,
+      title:          label.title          || null,
+      title_verified: label.title_verified ?? false,
+      confidence:     label.score >= 0.65 ? 'high' : 'low',
+      shelfRow:       label.shelfRow ?? 0,
+      _bbox:          label.bbox,
+      _score:         label.score,
+      _title_score:   label.title_score || null,
     }));
   }
 
   // ── Loading stages ────────────────────────────────────────────────────────
-  const LOADING_STAGES = ['Compressing image', 'Reading labels', 'Reading titles', 'Checking order'];
+  const LOADING_STAGES = ['Compressing image', 'Reading labels', 'Reading & verifying titles', 'Checking order'];
   let _currentStage = -1;
 
   function _dotsHtml() { return '<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span>'; }
@@ -1059,7 +1148,7 @@
     div.innerHTML = `
       <button class="bi-close" onclick="document.getElementById('bookInspect').remove()">&times;</button>
       <div class="bi-row"><span class="bi-key">Label</span><span class="bi-val">${escapeHtml(book.spine_label || '—')}</span></div>
-      ${book.title ? `<div class="bi-row"><span class="bi-key">Title</span><span class="bi-val">${escapeHtml(book.title)}</span></div>` : ''}
+      ${book.title ? `<div class="bi-row"><span class="bi-key">Title</span><span class="bi-val">${escapeHtml(book.title)}<span style="margin-left:5px;font-size:10px;opacity:.6">${book.title_verified ? '✓ verified' : '(unverified)'}</span></span></div>` : ''}
       <div class="bi-row"><span class="bi-key">Confidence</span><span class="bi-val">${Math.round((book._score || 0) * 100)}%${book._title_score ? ` · title ${Math.round(book._title_score * 100)}%` : ''}</span></div>
       <div class="bi-row"><span class="bi-key">Position</span><span class="bi-val">#${book.shelfPosition} of ${book.shelfSize} on shelf ${(book.shelfIndex ?? 0) + 1}</span></div>
       ${book.outOfOrder ? `<div class="bi-row"><span class="bi-key">Should be</span><span class="bi-val">slot ${book.idealPosition ?? '?'}</span></div>` : ''}
