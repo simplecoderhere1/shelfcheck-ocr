@@ -253,6 +253,7 @@
       transition: background .12s;
     }
     .flagged-item:active { background: #1e1e1e; }
+    .flagged-item.active { background: #162316; }
     .flagged-item-dot { flex-shrink: 0; width: 9px; height: 9px; border-radius: 50%; }
     .flagged-item-dot-bad { background: #ef4444; }
     .flagged-item-dot-unv { background: #facc15; }
@@ -426,6 +427,7 @@
   let lastRawBooks     = null;
   let lastCheckedBooks = [];
   let lastApiDims      = null;   // {sentW, sentH} of the image sent to OCR
+  let _flaggedRowMap   = new Map();  // book object → flagged-list DOM row
   let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
   let analysisCancelled = false;
   let analysisAbort     = null;
@@ -768,6 +770,29 @@
       labels.push({ ...ln });
     }
 
+    // Merge label fragments from the same physical sticker that ocr.space split
+    // across multiple overlay lines (e.g. "641.56" and "SAL" as separate entries).
+    if (labels.length > 1) {
+      labels.sort((a, b) => (a.bbox[0] + a.bbox[2]/2) - (b.bbox[0] + b.bbox[2]/2));
+      const merged = [labels[0]];
+      for (let i = 1; i < labels.length; i++) {
+        const prev = merged[merged.length - 1];
+        const prevCX = prev.bbox[0] + prev.bbox[2]/2;
+        const curCX  = labels[i].bbox[0] + labels[i].bbox[2]/2;
+        const gap    = Math.max(prev.bbox[2], labels[i].bbox[2]) * 0.55;
+        if (Math.abs(curCX - prevCX) < gap) {
+          const [x1,y1,w1,h1] = prev.bbox, [x2,y2,w2,h2] = labels[i].bbox;
+          const nx = Math.min(x1,x2), ny = Math.min(y1,y2);
+          merged[merged.length - 1] = {
+            text:  prev.text + ' ' + labels[i].text,
+            score: Math.max(prev.score, labels[i].score),
+            bbox:  [nx, ny, Math.max(x1+w1,x2+w2)-nx, Math.max(y1+h1,y2+h2)-ny],
+          };
+        } else { merged.push(labels[i]); }
+      }
+      labels.length = 0; labels.push(...merged);
+    }
+
     if (onCall1Done) onCall1Done();
 
     // Call 2: rotated image → spine titles (horizontal in rotated space, non-white)
@@ -961,61 +986,125 @@
     document.getElementById('errBannerRetry').onclick = () => { banner.remove(); onRetry(); };
   }
 
-  // ── Bounding box drawing ──────────────────────────────────────────────────
-  function drawBoundingBoxes(checkedBooks, sentW, sentH) {
+  // ── Arrow markers ─────────────────────────────────────────────────────────
+  // Draws downward-pointing pin arrows at the top of the photo, one per book.
+  // highlightBook: the one book to emphasise (larger, white border); others dim.
+  function drawArrowMarkers(checkedBooks, sentW, sentH, highlightBook) {
     const ctx = snapshot.getContext('2d');
-    const sx  = snapshot.width  / sentW;
-    const sy  = snapshot.height / sentH;
-    const lw  = Math.max(2, Math.round(snapshot.width / 450));
-    const fs  = Math.max(11, Math.round(snapshot.width / 65));
+    const sx  = snapshot.width / sentW;
+
+    const aw  = Math.max(18, Math.round(snapshot.width / 24));  // pin width
+    const sh  = Math.round(aw * 0.92);   // stem height
+    const th  = Math.round(aw * 0.65);   // triangle height
+    const r   = Math.round(aw * 0.22);   // corner radius
+    const fs  = Math.max(9, Math.round(sh * 0.52));
+    const TOP = 5;
 
     ctx.save();
-    ctx.lineWidth    = lw;
     ctx.font         = `bold ${fs}px sans-serif`;
-    ctx.textBaseline = 'bottom';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
 
     checkedBooks.forEach((book, i) => {
       if (!book._bbox) return;
-      const [bx, by, bw, bh] = book._bbox;
-      const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
-      const color = book.unverifiable ? '#facc15'
-                  : book.outOfOrder  ? '#ef4444'
-                  : '#22c55e';
-      ctx.strokeStyle = color;
-      ctx.lineWidth   = lw;
-      ctx.strokeRect(cx, cy, cw, ch);
+      const [bx,, bw] = book._bbox;
+      const cx     = (bx + bw / 2) * sx;
+      const isHl   = book === highlightBook;
+      const hasHl  = highlightBook !== null && highlightBook !== undefined;
+      const alpha  = (hasHl && !isHl) ? 0.35 : 1;
+      const scale  = isHl ? 1.5 : 1;
+      const hw     = aw / 2;
+      const color  = book.unverifiable ? '#facc15'
+                   : book.outOfOrder   ? '#ef4444'
+                   : '#22c55e';
 
-      // Number badge above the box
-      const num  = String(i + 1);
-      const tw   = ctx.measureText(num).width;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(cx, TOP);
+      ctx.scale(scale, scale);
+
+      // Stem (rounded rect)
       ctx.fillStyle = color;
-      ctx.globalAlpha = 0.85;
-      ctx.fillRect(cx, cy - fs - 3, tw + 6, fs + 3);
+      ctx.beginPath();
+      ctx.roundRect(-hw, 0, aw, sh, r);
+      ctx.fill();
+
+      // Triangle
+      ctx.beginPath();
+      ctx.moveTo(-hw, sh);
+      ctx.lineTo(hw, sh);
+      ctx.lineTo(0, sh + th);
+      ctx.closePath();
+      ctx.fill();
+
+      // White outline when highlighted
+      if (isHl) {
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth   = 2.5;
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        ctx.roundRect(-hw, 0, aw, sh, r);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(-hw, sh);
+        ctx.lineTo(hw, sh);
+        ctx.lineTo(0, sh + th);
+        ctx.closePath();
+        ctx.stroke();
+      }
+
+      // Number label
       ctx.globalAlpha = 1;
-      ctx.fillStyle = '#000';
-      ctx.fillText(num, cx + 3, cy - 2);
+      ctx.fillStyle   = '#000';
+      ctx.fillText(String(i + 1), 0, sh / 2);
+
+      ctx.restore();
     });
 
     ctx.restore();
   }
 
-  // ── Tap to inspect ────────────────────────────────────────────────────────
+  // Highlight one book: dim others, enlarge its arrow, select its list row.
+  function highlightArrow(book) {
+    document.querySelectorAll('.flagged-item').forEach(r => r.classList.remove('active'));
+    const row = _flaggedRowMap.get(book);
+    if (row) { row.classList.add('active'); row.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    restoreCleanPhoto();
+    if (lastApiDims) drawArrowMarkers(lastCheckedBooks, lastApiDims.sentW, lastApiDims.sentH, book);
+  }
+
+  // ── Tap arrow to inspect ──────────────────────────────────────────────────
   snapshot.addEventListener('click', e => {
     if (!lastCheckedBooks.length || !lastApiDims) return;
     const rect = snapshot.getBoundingClientRect();
     const tapX = (e.clientX - rect.left) * (snapshot.width  / rect.width);
     const tapY = (e.clientY - rect.top)  * (snapshot.height / rect.height);
-    const sx = snapshot.width  / lastApiDims.sentW;
-    const sy = snapshot.height / lastApiDims.sentH;
+    const sx  = snapshot.width / lastApiDims.sentW;
+    const aw  = Math.max(18, Math.round(snapshot.width / 24));
+    const sh  = Math.round(aw * 0.92);
+    const th  = Math.round(aw * 0.65);
+    const arrowZone = (sh + th) * 1.6 + 5;  // generous tap target
 
-    const hit = lastCheckedBooks.find(b => {
-      if (!b._bbox) return false;
-      const [bx, by, bw, bh] = b._bbox;
-      return tapX >= bx * sx && tapX <= (bx + bw) * sx &&
-             tapY >= by * sy && tapY <= (by + bh) * sy;
-    });
-    if (hit) showBookInspect(hit);
-    else document.getElementById('bookInspect')?.remove();
+    // Only register taps in the top arrow zone
+    if (tapY > arrowZone) { document.getElementById('bookInspect')?.remove(); return; }
+
+    // Find nearest arrow by x-center
+    let hit = null, bestDist = aw;
+    for (const book of lastCheckedBooks) {
+      if (!book._bbox) continue;
+      const [bx,, bw] = book._bbox;
+      const dist = Math.abs(tapX - (bx + bw / 2) * sx);
+      if (dist < bestDist) { bestDist = dist; hit = book; }
+    }
+
+    if (hit) { highlightArrow(hit); showBookInspect(hit); }
+    else {
+      // Tapped between arrows — deselect
+      document.querySelectorAll('.flagged-item').forEach(r => r.classList.remove('active'));
+      restoreCleanPhoto();
+      drawArrowMarkers(lastCheckedBooks, lastApiDims.sentW, lastApiDims.sentH, null);
+      document.getElementById('bookInspect')?.remove();
+    }
   });
 
   function showBookInspect(book) {
@@ -1285,9 +1374,9 @@
     document.getElementById('bookInspect')?.remove();
     actionBar.classList.remove('show');
 
-    // Redraw the clean photo then overlay boxes
+    // Redraw the clean photo then overlay arrows
     restoreCleanPhoto();
-    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH);
+    if (lastApiDims) drawArrowMarkers(checked, lastApiDims.sentW, lastApiDims.sentH, null);
 
     const total    = checked.length;
     const outCount = checked.filter(b => b.outOfOrder).length;
@@ -1339,6 +1428,7 @@
     const panel = document.getElementById('flaggedList');
     const flagged = checked.filter(b => b.outOfOrder || b.unverifiable);
     panel.innerHTML = '';
+    _flaggedRowMap.clear();
     if (!flagged.length) { panel.classList.remove('show'); return; }
 
     const multiShelf = new Set(checked.map(b => b.shelfIndex).filter(i => i >= 0)).size > 1;
@@ -1347,14 +1437,15 @@
     header.textContent = `Flagged books (${flagged.length})`;
     panel.appendChild(header);
 
-    // Build a global index map: book → box number (1-based position in checked array)
+    // Build a global index map: book → arrow number (1-based position in checked array)
     const globalIdx = new Map(checked.map((b, i) => [b, i + 1]));
 
     for (const book of flagged) {
       const isBad = book.outOfOrder;
       const row = document.createElement('div');
       row.className = 'flagged-item';
-      row.onclick = () => showBookInspect(book);
+      _flaggedRowMap.set(book, row);
+      row.onclick = () => { highlightArrow(book); showBookInspect(book); };
 
       const posBits = [];
       if (multiShelf && book.shelfIndex >= 0) posBits.push(`shelf ${book.shelfIndex + 1}`);
