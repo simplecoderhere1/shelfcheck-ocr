@@ -162,6 +162,16 @@
     }
     .timing-badge b { color: #f87171; }
 
+    /* Small non-blocking pill: OCR results are shown, Gemini is still refining */
+    .refining-badge {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      z-index: 39; background: rgba(20,20,20,.9); border: 1px solid #333;
+      color: #aaa; font-size: 12px; padding: 6px 12px; border-radius: 20px;
+      display: flex; align-items: center; gap: 4px; pointer-events: none;
+      animation: refiningFadeIn .2s ease-out;
+    }
+    @keyframes refiningFadeIn { from { opacity: 0; transform: translate(-50%, -4px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
     .settings-btn {
       background: transparent; border: none; color: #888; font-size: 18px;
       cursor: pointer; padding: 4px; line-height: 1; transition: color .15s;
@@ -255,8 +265,18 @@
       display: none; flex-direction: column; background: #111;
       border-top: 1px solid #2c2c2c; overflow-y: auto;
       -webkit-overflow-scrolling: touch; max-height: 200px; flex-shrink: 0;
+      opacity: 0; transition: opacity .18s ease-out;
     }
-    .flagged-list.show { display: flex; }
+    .flagged-list.show { display: flex; opacity: 1; }
+    .flagged-list-success {
+      display: flex; align-items: center; gap: 10px; padding: 14px;
+      font-size: 13px; color: #86efac; line-height: 1.4;
+    }
+    .flagged-list-success-icon {
+      flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
+      background: #14532d; color: #4ade80; font-size: 13px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+    }
     .flagged-list-header {
       padding: 8px 14px 6px; font-size: 11px; font-weight: 700;
       letter-spacing: .07em; text-transform: uppercase; color: #555;
@@ -350,8 +370,9 @@
       flex-direction: column; background: #111; border-top: 1px solid #2c2c2c;
       border-radius: 14px 14px 0 0; max-height: 42%; overflow-y: auto;
       -webkit-overflow-scrolling: touch; padding-bottom: env(safe-area-inset-bottom);
+      opacity: 0; transition: opacity .18s ease-out;
     }
-    .ar-sheet.show { display: flex; }
+    .ar-sheet.show { display: flex; opacity: 1; }
     .ar-resume {
       display: none; position: absolute; left: 50%; transform: translateX(-50%);
       bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 6;
@@ -366,18 +387,18 @@
 
 <header class="header">
   <span class="app-name">ShelfCheck</span>
-  <div class="section-tabs" role="group" aria-label="Collection section">
-    <button class="tab-btn active" data-section="fiction">Fiction</button>
-    <button class="tab-btn"        data-section="nonfiction">Nonfiction</button>
+  <div class="section-tabs" role="tablist" aria-label="Collection section">
+    <button class="tab-btn active" data-section="fiction"    role="tab" aria-selected="true"  aria-label="Fiction collection">Fiction</button>
+    <button class="tab-btn"        data-section="nonfiction" role="tab" aria-selected="false" aria-label="Nonfiction collection">Nonfiction</button>
   </div>
   <div style="position:relative">
-    <button class="settings-btn" id="settingsBtn" aria-label="Settings">&#9881;</button>
-    <div class="settings-menu" id="settingsMenu">
-      <div class="settings-item" id="debugToggle">
+    <button class="settings-btn" id="settingsBtn" aria-label="Settings" aria-haspopup="true" aria-expanded="false">&#9881;</button>
+    <div class="settings-menu" id="settingsMenu" role="menu" aria-label="Settings">
+      <div class="settings-item" id="debugToggle" role="menuitemcheckbox" aria-checked="false" tabindex="0">
         <span>Debug Mode</span>
         <div class="settings-toggle" id="debugToggleSwitch"></div>
       </div>
-      <div class="settings-item" id="geminiToggle">
+      <div class="settings-item" id="geminiToggle" role="menuitemcheckbox" aria-checked="true" tabindex="0">
         <span>AI cross-check (Gemini)</span>
         <div class="settings-toggle" id="geminiToggleSwitch"></div>
       </div>
@@ -392,37 +413,37 @@
   <div class="photo-area" id="photoArea">
     <div class="photo-placeholder" id="photoPlaceholder">
       <div class="pick-btns">
-        <button class="pick-btn pick-btn-camera" id="takePicBtn">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <button class="pick-btn pick-btn-camera" id="takePicBtn" aria-label="Take photo with camera">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false">
             <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
             <circle cx="12" cy="13" r="4"/>
           </svg>
           Take Photo
         </button>
-        <button class="pick-btn pick-btn-upload" id="uploadPicBtn">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <button class="pick-btn pick-btn-upload" id="uploadPicBtn" aria-label="Upload an existing image">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false">
             <polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
             <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
           </svg>
           Upload Image
         </button>
         <p style="font-size:12px;color:#888;text-align:center;line-height:1.5;padding:0 8px">
-          Get close enough that the white label stickers are sharp and readable.
+          Photograph <strong>one shelf row</strong>, close-up, phone in landscape — get close enough that the label stickers are sharp.
         </p>
       </div>
     </div>
-    <canvas id="snapshot"></canvas>
+    <canvas id="snapshot" role="img" aria-label="Captured shelf photo"></canvas>
     <div class="box-pulse" id="boxPulse"></div>
     <div class="action-bar" id="actionBar">
-      <button class="btn btn-retake"  id="retakeBtn">Retake</button>
-      <button class="btn btn-analyze" id="analyzeBtn" disabled>Analyze</button>
+      <button class="btn btn-retake"  id="retakeBtn" aria-label="Retake photo">Retake</button>
+      <button class="btn btn-analyze" id="analyzeBtn" disabled aria-label="Analyze shelf photo">Analyze</button>
     </div>
   </div>
-  <div class="flagged-list" id="flaggedList"></div>
+  <div class="flagged-list" id="flaggedList" role="region" aria-label="Flagged books"></div>
 </div>
 
-<div class="landscape-gate" id="landscapeGate">
-  <svg class="landscape-gate-phone" width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+<div class="landscape-gate" id="landscapeGate" role="dialog" aria-label="Rotate your phone">
+  <svg class="landscape-gate-phone" width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false">
     <rect x="5" y="2" width="14" height="20" rx="2.5"/>
     <circle cx="12" cy="17.5" r=".5" fill="currentColor" stroke="none"/>
   </svg>
@@ -432,17 +453,17 @@
   <button class="landscape-gate-skip" id="landscapeSkip">Shoot in portrait anyway</button>
 </div>
 
-<div class="camera-live" id="cameraLive">
-  <video id="cameraVideo" playsinline autoplay muted></video>
-  <canvas id="camFreeze"></canvas>
+<div class="camera-live" id="cameraLive" role="dialog" aria-label="Camera">
+  <video id="cameraVideo" playsinline autoplay muted aria-hidden="true"></video>
+  <canvas id="camFreeze" role="img" aria-label="Captured shelf photo"></canvas>
   <div class="box-pulse" id="arBoxPulse"></div>
   <div class="cam-message">Take a picture of one shelf row</div>
   <button class="cam-close" id="camClose" aria-label="Close camera">&times;</button>
   <div class="cam-controls">
     <button class="cam-shutter" id="camShutter" aria-label="Take photo"></button>
   </div>
-  <button class="ar-resume" id="arResume">&#8635; Resume camera</button>
-  <div class="ar-sheet" id="arSheet"></div>
+  <button class="ar-resume" id="arResume" aria-label="Resume live camera">&#8635; Resume camera</button>
+  <div class="ar-sheet" id="arSheet" role="region" aria-label="Flagged books"></div>
 </div>
 
 <input type="file" id="photoInput"  accept="image/*" capture="environment" style="display:none">
@@ -466,7 +487,7 @@
   // All OCR calls go through a Cloudflare Worker that injects the ocr.space API key.
   // Replace this URL with your own Worker URL after deploying worker/index.js.
   const WORKER_URL = 'https://shelfcheck-ocr-proxy.krish-sundareswar.workers.dev';
-  const OCR_TIMEOUT_MS = 60000;
+  const OCR_TIMEOUT_MS = 20000;
 
   // Gemini is used as a pure text cross-checker (never asked for boxes — output
   // tokens dominate vision-LLM latency, so bbox output would blow the time budget).
@@ -487,12 +508,14 @@
   let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
   let analysisCancelled = false;
   let analysisAbort     = null;
+  let analysisGeneration = 0;   // bumped on every new analysis/retake so a late Gemini refine can't clobber stale UI
 
   // ── Section toggle ────────────────────────────────────────────────────────
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
       btn.classList.add('active');
+      btn.setAttribute('aria-selected', 'true');
       try { localStorage.setItem('shelfcheck.section', btn.dataset.section); } catch {}
       if (lastRawBooks && document.getElementById('resultsOverlay')) {
         showResults(lastRawBooks, btn.dataset.section);
@@ -503,7 +526,10 @@
     const saved = localStorage.getItem('shelfcheck.section');
     if (saved) {
       const b = document.querySelector(`.tab-btn[data-section="${saved}"]`);
-      if (b) { document.querySelectorAll('.tab-btn').forEach(x => x.classList.remove('active')); b.classList.add('active'); }
+      if (b) {
+        document.querySelectorAll('.tab-btn').forEach(x => { x.classList.remove('active'); x.setAttribute('aria-selected', 'false'); });
+        b.classList.add('active'); b.setAttribute('aria-selected', 'true');
+      }
     }
   } catch {}
 
@@ -549,6 +575,8 @@
     lastApiDims      = null;
     lastRawBooks     = null;
     lastCheckedBooks = [];
+    analysisGeneration++;   // invalidate any in-flight Gemini refine
+    hideRefiningBadge();
     document.getElementById('errorBanner')?.remove();
   }
 
@@ -1115,9 +1143,14 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     if (A === B) return 1;
     const pa = fuseParse(A), pb = fuseParse(B);
     if (pa.num && pb.num) {
+      // Number-only agreement must NOT alone clear MATCH_MIN (0.5): a whole
+      // nonfiction shelf row shares one Dewey number, so a bare-number base
+      // score that already crosses the threshold makes the aligner blind to
+      // cutters and lets it pair unrelated same-number books. Cutter
+      // agreement (exact or 1-edit typo) is required to push the pair over.
       let s = 0;
-      if (pa.num === pb.num || pa.num.startsWith(pb.num) || pb.num.startsWith(pa.num)) s = 0.6;
-      else if (fuseEditDist(pa.num, pb.num) <= 1) s = 0.3;
+      if (pa.num === pb.num || pa.num.startsWith(pb.num) || pb.num.startsWith(pa.num)) s = 0.3;
+      else if (fuseEditDist(pa.num, pb.num) <= 1) s = 0.15;
       else return 0;
       if (pa.cut && pb.cut) {
         if (pa.cut === pb.cut) s += 0.4;
@@ -1167,9 +1200,55 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     return { pairs, oOnly, gOnly };
   }
 
+  // OCR sometimes merges 2-4 adjacent spines' text into a single wide line
+  // (e.g. "WAGANWAGAMES WAGGONER WAGGONE RichardRichard Tim"). Left as one
+  // anchor, this starves the aligner: a run of several distinct GT labels
+  // has only one real OCR box to pair against, so the rest fall through to
+  // Gemini-only synthesis with poor bracketing anchors. Detect such lines by
+  // width relative to the row's other spines and split them into evenly
+  // sized sub-boxes (one per detected token group) before alignment, so each
+  // fragment can independently pair with a Gemini candidate. Implemented as
+  // a pre-alignment step here (not inside reconstructFiction) so the
+  // parity-checked reconstruction output stays untouched.
+  function splitWideOcrLabels(labels) {
+    if (labels.length < 2) return labels;
+    const rows = [];
+    for (const l of labels) {
+      const cy = l.bbox[1] + l.bbox[3] / 2;
+      let row = rows.find(r => Math.abs(r.cy - cy) <= l.bbox[3]);
+      if (!row) { row = { cy, items: [] }; rows.push(row); }
+      row.items.push(l);
+    }
+    const out = [];
+    for (const row of rows) {
+      const widths = row.items.map(l => l.bbox[2]).sort((a, b) => a - b);
+      const medW = widths[Math.floor(widths.length / 2)];
+      for (const l of row.items) {
+        const tokens = String(l.text).trim().split(/\s+/).filter(Boolean);
+        // Unusually wide AND enough tokens to plausibly hold multiple
+        // names; long single-name lines are left untouched.
+        if (medW > 0 && l.bbox[2] > medW * 1.6 && tokens.length >= 4) {
+          const nSplit = Math.max(2, Math.min(4, Math.round(l.bbox[2] / medW)));
+          const perGroup = Math.ceil(tokens.length / nSplit);
+          const groups = [];
+          for (let i = 0; i < tokens.length; i += perGroup) groups.push(tokens.slice(i, i + perGroup));
+          const [x, y, w, h] = l.bbox;
+          const segW = w / groups.length;
+          groups.forEach((g, gi) => {
+            out.push({ ...l, text: g.join(' '), bbox: [x + gi * segW, y, segW, h] });
+          });
+        } else {
+          out.push(l);
+        }
+      }
+    }
+    return out;
+  }
+
   // Fuse ocr.space labels (geometry) with Gemini books (text) into a new
   // labels array in the same shape runOcr already produces.
   function fuseLabels(ocrLabels, gemBooks, imgW, imgH) {
+    ocrLabels = splitWideOcrLabels(ocrLabels);
     const rowH = Math.max(1, Math.round(imgH * 0.10));
     const withRow = ocrLabels.map(l => ({ ...l, _frow: Math.round((l.bbox[1] + l.bbox[3] / 2) / rowH) }));
     const rowOrder = [...new Set(withRow.map(l => l._frow))].sort((a, b) => a - b);
@@ -1237,22 +1316,51 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
         const gaps = matchedByGPos.slice(1).map((p, i) => p.cx - matchedByGPos[i].cx).filter(g => g > 1);
         const medGap = gaps.length ? gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : medW * 1.5;
 
-        for (const gi of gOnly) {
-          const g = G[gi];
-          if (!g.spine_label || g.confidence !== 'high') continue;
+        // Never silently drop a confident candidate for landing on a crowded
+        // position — on dense rows (many more Gemini entries than OCR
+        // anchors) that cascades into dropping the majority of correct
+        // reads. Instead, group consecutive gOnly candidates that share the
+        // same bracketing anchors and redistribute them evenly by rank
+        // across the available room between those anchors, which guarantees
+        // non-overlapping placement for any candidate count.
+        const bracketOf = gi => {
           let left = null, right = null;
           for (const p of matchedByGPos) { if (p.gi < gi) left = p; if (p.gi > gi && !right) right = p; }
-          let cx;
-          if (left && right) cx = left.cx + (right.cx - left.cx) * (gi - left.gi) / (right.gi - left.gi);
-          else if (left) cx = left.cx + medGap * (gi - left.gi);
-          else if (right) cx = right.cx - medGap * (right.gi - gi);
-          else continue;
-          if (rowOut.some(o => Math.abs((o.bbox[0] + o.bbox[2] / 2) - cx) < medW / 2)) continue;
-          const bx = Math.max(0, Math.min(imgW - medW, cx - medW / 2));
-          rowOut.push({
-            text: g.spine_label, bbox: [bx, medY, medW, medH], score: 0.7, src: 'gemini-synth', synthBox: true,
-            title: g.title || null, title_score: 0.9,
+          return { left, right };
+        };
+        const confident = gOnly.filter(gi => G[gi].spine_label && G[gi].confidence === 'high');
+        let k = 0;
+        while (k < confident.length) {
+          const { left: left0, right: right0 } = bracketOf(confident[k]);
+          let k2 = k + 1;
+          while (k2 < confident.length) {
+            const b = bracketOf(confident[k2]);
+            if (b.left !== left0 || b.right !== right0) break;
+            k2++;
+          }
+          const group = confident.slice(k, k2);
+          const count = group.length;
+          // Interior groups (bracketed on both sides) have a bounded, known
+          // span to redistribute across. One-sided groups (off the start/end
+          // of the row) extrapolate past the last real anchor using the
+          // row's median gap; every confident candidate is still placed
+          // (never silently dropped) — geometry is only ever approximate for
+          // gemini-synth entries regardless, and downstream scoring already
+          // demotes them (score 0.7, below the "high confidence" cutoff).
+          group.forEach((gi, idx) => {
+            const g = G[gi];
+            let cx;
+            if (left0 && right0) cx = left0.cx + (right0.cx - left0.cx) * (idx + 1) / (count + 1);
+            else if (left0) cx = left0.cx + medGap * (idx + 1);
+            else if (right0) cx = right0.cx - medGap * (count - idx);
+            else return;
+            const bx = Math.max(0, Math.min(imgW - medW, cx - medW / 2));
+            rowOut.push({
+              text: g.spine_label, bbox: [bx, medY, medW, medH], score: 0.7, src: 'gemini-synth', synthBox: true,
+              title: g.title || null, title_score: 0.9,
+            });
           });
+          k = k2;
         }
       }
 
@@ -1385,7 +1493,70 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     }));
   }
 
-  // Run the full two-pass OCR pipeline; returns {labels, ms, imageSize, n}.
+  // Fuse (if gem is provided), tie-check, verify tied titles against Open
+  // Library, and assign shelfRow — the tail of the pipeline shared by both
+  // the immediate (OCR-only or Gemini-on-time) render and the later refine
+  // pass once a slow Gemini call finally resolves. Mutates/sorts `labels`
+  // in place except when fuseLabels swaps in a brand-new fused array.
+  async function finishLabels(labels, imgW, imgH, gem, section, signal) {
+    // Fuse Gemini's text reads onto the ocr.space boxes before anything else
+    // (tie-checking, titles, ordering) touches the labels.
+    if (gem && gem.length) labels = fuseLabels(labels, gem, imgW, imgH);
+
+    // Only use Call 2 (titles + OL verification) when two or more labels share
+    // the same primary sort key and genuinely need a title to break the tie.
+    // Use auto-detected section for the tie check so we get the right key type.
+    const rawBooks = labels.map(l => ({ spine_label: l.text }));
+    const tieSect = autoDetectSection(rawBooks) || section;
+    const needsTitles = hasPrimaryTies(labels, tieSect);
+
+    // Titles now come from Gemini (fused above) instead of a separate rotated
+    // ocr.space call. Only verify against Open Library when a tie genuinely
+    // needs a title to break it — cheap, parallel, ties only. If Gemini didn't
+    // run or found no titles, this simply no-ops and tied books fall into the
+    // existing tiedSlots handling (any order within a tie group is OK).
+    if (needsTitles && labels.some(l => l.title)) {
+      await verifyTitlesOpenLibrary(labels, tieSect, signal);
+    }
+
+    // Assign shelfRow (port of server-side sort + bucket_map logic)
+    const rowH = Math.max(1, Math.round(imgH * 0.10));
+    for (const lbl of labels) {
+      const [, by,, bh] = lbl.bbox;
+      lbl._row = Math.round((by + bh / 2) / rowH);
+    }
+    labels.sort((a, b) => a._row - b._row || a.bbox[0] - b.bbox[0]);
+    const rowMap = new Map();
+    for (const lbl of labels) {
+      if (!rowMap.has(lbl._row)) rowMap.set(lbl._row, rowMap.size);
+    }
+    for (const lbl of labels) lbl.shelfRow = rowMap.get(lbl._row) ?? 0;
+
+    return labels.map(l => ({
+      text:           l.text,
+      score:          l.score,
+      bbox:           l.bbox,
+      quad:           null,
+      shelfRow:       l.shelfRow,
+      title:          l.title          || null,
+      title_score:    l.title_score    || null,
+      title_verified: l.title_verified ?? false,
+      src:            l.src            || 'ocr',
+    }));
+  }
+
+  // How long OCR results will wait for the in-flight Gemini cross-check
+  // before rendering without it. Gemini itself still gets up to
+  // GEMINI_TIMEOUT_MS to finish in the background; if it lands after this
+  // grace window, runOcr's `refine` promise carries the improved result so
+  // the caller can update the already-rendered UI in place.
+  const GEMINI_GRACE_MS = 1500;
+
+  // Run the full OCR pipeline; returns {labels, ms, imageSize, n, refine}.
+  // `refine` is null when Gemini either was disabled or answered within the
+  // grace window (already folded into `labels`); otherwise it's a promise
+  // that resolves to an improved {labels, imageSize, n} once Gemini lands,
+  // or null if Gemini ultimately failed/added nothing.
   // Calls onCall1Done() between the two proxy calls so the UI can advance stages.
   async function runOcr(encoded, signal, onCall1Done) {
     const t0 = performance.now();
@@ -1426,57 +1597,38 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
       imgW = fullCanvas.width; imgH = fullCanvas.height;
     }
 
-    // Fuse Gemini's text reads onto the ocr.space boxes before anything else
-    // (tie-checking, titles, ordering) touches the labels.
-    const gem = await geminiP;
-    if (gem && gem.length) labels = fuseLabels(labels, gem, imgW, imgH);
-
-    // Only use Call 2 (titles + OL verification) when two or more labels share
-    // the same primary sort key and genuinely need a title to break the tie.
-    // Use auto-detected section for the tie check so we get the right key type.
-    const rawBooks = labels.map(l => ({ spine_label: l.text }));
-    const tieSect = autoDetectSection(rawBooks) || section;
-    const needsTitles = hasPrimaryTies(labels, tieSect);
+    // Race the already-in-flight Gemini promise against a short grace timer
+    // instead of always awaiting it — a slow cross-check must never hold up
+    // OCR results that are already sitting in memory.
+    const GRACE_TIMEOUT = Symbol('gemini-grace-timeout');
+    let graceTimer;
+    const graceP = new Promise(r => { graceTimer = setTimeout(() => r(GRACE_TIMEOUT), GEMINI_GRACE_MS); });
+    const raced = geminiEnabled ? await Promise.race([geminiP, graceP]) : null;
+    clearTimeout(graceTimer);
+    const gemOnTime = raced === GRACE_TIMEOUT ? null : raced;
 
     if (onCall1Done) onCall1Done();
 
-    // Titles now come from Gemini (fused above) instead of a separate rotated
-    // ocr.space call. Only verify against Open Library when a tie genuinely
-    // needs a title to break it — cheap, parallel, ties only. If Gemini didn't
-    // run or found no titles, this simply no-ops and tied books fall into the
-    // existing tiedSlots handling (any order within a tie group is OK).
-    if (needsTitles && labels.some(l => l.title)) {
-      await verifyTitlesOpenLibrary(labels, tieSect, signal);
-    }
+    const finishedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gemOnTime, section, signal);
 
-    // Assign shelfRow (port of server-side sort + bucket_map logic)
-    const rowH = Math.max(1, Math.round(imgH * 0.10));
-    for (const lbl of labels) {
-      const [, by,, bh] = lbl.bbox;
-      lbl._row = Math.round((by + bh / 2) / rowH);
+    // Gemini didn't make the grace window — hand the caller a promise that
+    // resolves to a refined result once it (eventually) does, so the UI can
+    // fuse it in without blocking the first render.
+    let refine = null;
+    if (raced === GRACE_TIMEOUT) {
+      refine = geminiP.then(async gem => {
+        if (!gem || !gem.length) return null;
+        const refinedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gem, section, signal);
+        return { labels: refinedLabels, imageSize: [imgW, imgH], n: refinedLabels.length };
+      }).catch(() => null);
     }
-    labels.sort((a, b) => a._row - b._row || a.bbox[0] - b.bbox[0]);
-    const rowMap = new Map();
-    for (const lbl of labels) {
-      if (!rowMap.has(lbl._row)) rowMap.set(lbl._row, rowMap.size);
-    }
-    for (const lbl of labels) lbl.shelfRow = rowMap.get(lbl._row) ?? 0;
 
     return {
-      labels: labels.map(l => ({
-        text:           l.text,
-        score:          l.score,
-        bbox:           l.bbox,
-        quad:           null,
-        shelfRow:       l.shelfRow,
-        title:          l.title          || null,
-        title_score:    l.title_score    || null,
-        title_verified: l.title_verified ?? false,
-        src:            l.src            || 'ocr',
-      })),
+      labels: finishedLabels,
       ms: Math.round(performance.now() - t0),
       imageSize: [imgW, imgH],
-      n: labels.length,
+      n: finishedLabels.length,
+      refine,
     };
   }
 
@@ -1542,10 +1694,26 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
 
   function hideLoading() { document.getElementById('loadingOverlay')?.remove(); }
 
+  // Small non-blocking pill shown while OCR-only results are already on
+  // screen but the Gemini cross-check is still refining them in the
+  // background (see runOcr's `refine` promise / GEMINI_GRACE_MS).
+  function showRefiningBadge(parent = photoArea) {
+    hideRefiningBadge();
+    const badge = document.createElement('div');
+    badge.id = 'refiningBadge'; badge.className = 'refining-badge';
+    badge.setAttribute('role', 'status');
+    badge.setAttribute('aria-live', 'polite');
+    badge.innerHTML = `Refining results${_dotsHtml()}`;
+    parent.appendChild(badge);
+  }
+  function hideRefiningBadge() { document.getElementById('refiningBadge')?.remove(); }
+
   function cancelAnalysis() {
     analysisCancelled = true;
     analysisAbort?.abort();
+    analysisGeneration++;   // invalidate any in-flight Gemini refine
     hideLoading();
+    hideRefiningBadge();
     if (arActive) {
       camFreeze.classList.remove('loading', 'show');
       arActive = false;
@@ -1563,6 +1731,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     analyzeBtn.textContent = 'Reading…';
     analysisCancelled = false;
     analysisAbort     = new AbortController();
+    const myGen = ++analysisGeneration;
     showLoading();
 
     // Yield two frames so the overlay paints before encoding blocks the thread.
@@ -1618,6 +1787,20 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
 
     analyzeBtn.disabled    = false;
     analyzeBtn.textContent = 'Analyze';
+
+    // Gemini didn't land in time to be in the first render — results are
+    // already on screen (OCR-only); refine them in place if/when it arrives.
+    if (ocrData.refine) {
+      showRefiningBadge(photoArea);
+      ocrData.refine.then(refined => {
+        if (myGen !== analysisGeneration) return;  // superseded by a newer scan
+        hideRefiningBadge();
+        if (!refined) return;
+        lastRawBooks = labelsToBooks(refined.labels);
+        lastApiDims  = { sentW: refined.imageSize[0], sentH: refined.imageSize[1] };
+        showResults(lastRawBooks, getSection());
+      });
+    }
   }
 
   // ── AR capture: freeze the live camera in place, analyze, overlay results ──
@@ -1648,6 +1831,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
 
     analysisCancelled = false;
     analysisAbort     = new AbortController();
+    const myGen = ++analysisGeneration;
     showLoading(cameraLive);
 
     // Yield two frames so the overlay paints before encoding blocks the thread.
@@ -1694,6 +1878,20 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     camFreeze.classList.remove('loading');
     showResults(lastRawBooks, getSection(), { ar: true });
     arResume.classList.add('show');
+
+    // Gemini didn't land in time to be in the first render — results are
+    // already on screen (OCR-only); refine them in place if/when it arrives.
+    if (ocrData.refine) {
+      showRefiningBadge(cameraLive);
+      ocrData.refine.then(refined => {
+        if (myGen !== analysisGeneration) return;  // superseded by a newer capture
+        hideRefiningBadge();
+        if (!refined || !arActive) return;
+        lastRawBooks = labelsToBooks(refined.labels);
+        lastApiDims  = { sentW: refined.imageSize[0], sentH: refined.imageSize[1] };
+        showResults(lastRawBooks, getSection(), { ar: true });
+      });
+    }
   }
 
   // "Resume camera" button, and the retry action on AR-mode errors: drop the
@@ -1705,12 +1903,14 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     arSheet.classList.remove('show'); arSheet.innerHTML = '';
     arResume.classList.remove('show');
     arActive = false;
+    analysisGeneration++;   // invalidate any in-flight Gemini refine
+    hideRefiningBadge();
     cameraVideo.play().catch(() => {});
   }
 
   function friendlyErrorMessage(err) {
     if (err.name === 'AbortError' || err.name === 'TimeoutError')
-      return 'Reading took too long. Try again with the shelf closer and better lit.';
+      return 'Reading timed out. Move closer, improve lighting, and tap Retry.';
     if (!navigator.onLine || /Failed to fetch|NetworkError/i.test(err.message))
       return "Couldn't reach the server. Check your connection.";
     if (err.status === 429) return 'Server is busy — wait a moment and retry.';
@@ -2170,7 +2370,11 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
   }
 
   function setActiveTab(section) {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.section === section));
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      const active = b.dataset.section === section;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-selected', String(active));
+    });
     try { localStorage.setItem('shelfcheck.section', section); } catch {}
   }
 
@@ -2217,7 +2421,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     let cls, text;
     if (outCount > 0)      { cls = 'badge-warn';         text = `${outCount} out of order${unvCount ? ` · ${unvCount} to check` : ''} · ${total} read`; }
     else if (unvCount > 0) { cls = 'badge-unverifiable'; text = `${unvCount} to check · ${total} read`; }
-    else                   { cls = 'badge-ok';           text = `✓ All ${total} in order`; }
+    else                   { cls = 'badge-ok';           text = `✓ Shelf looks correct — ${total} book${total === 1 ? '' : 's'} read, none out of order`; }
     const overlay = document.createElement('div');
     overlay.id = 'resultsOverlay'; overlay.className = 'results-overlay';
     overlay.innerHTML = `<div class="overlay-badge ${cls}">${text}</div>
@@ -2229,7 +2433,22 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     const flagged = checked.filter(b => b.outOfOrder || b.unverifiable);
     panel.innerHTML = '';
     _flaggedRowMap.clear();
-    if (!flagged.length) { panel.classList.remove('show'); return; }
+    if (!flagged.length) {
+      // Distinct success state: books were read and none needed flagging —
+      // don't just leave the panel looking empty/broken.
+      if (checked.length > 0) {
+        const success = document.createElement('div');
+        success.className = 'flagged-list-success';
+        success.setAttribute('role', 'status');
+        success.innerHTML = `<span class="flagged-list-success-icon" aria-hidden="true">&#10003;</span>
+          <span>Shelf looks correct — ${checked.length} book${checked.length === 1 ? '' : 's'} read, none out of order.</span>`;
+        panel.appendChild(success);
+        panel.classList.add('show');
+      } else {
+        panel.classList.remove('show');
+      }
+      return;
+    }
 
     const multiShelf = new Set(checked.map(b => b.shelfIndex).filter(i => i >= 0)).size > 1;
     const header = document.createElement('div');
@@ -2244,6 +2463,10 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
       const isBad = book.outOfOrder;
       const row = document.createElement('div');
       row.className = 'flagged-item';
+      row.setAttribute('role', 'button');
+      row.setAttribute('tabindex', '0');
+      row.setAttribute('aria-expanded', 'false');
+      row.setAttribute('aria-label', `${book.spine_label || 'Book'}${book.title ? `, ${book.title}` : ''} — ${isBad ? 'out of order' : 'check manually'}`);
       _flaggedRowMap.set(book, row);
 
       const posBits = [];
@@ -2273,11 +2496,16 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
         ${book.outOfOrder ? `<div class="fi-drow"><span class="fi-dk">Should be</span><span class="fi-dv">slot ${book.idealPosition ?? '?'}</span></div>` : ''}
         <div class="fi-dstatus" style="color:${dcolor}">${dstatus}</div>`;
 
-      row.onclick = () => {
+      const toggleDetail = () => {
         highlightArrow(book);
         const wasOpen = detail.classList.contains('open');
         panel.querySelectorAll('.flagged-item-detail').forEach(d => d.classList.remove('open'));
-        if (!wasOpen) detail.classList.add('open');
+        panel.querySelectorAll('.flagged-item').forEach(r => r.setAttribute('aria-expanded', 'false'));
+        if (!wasOpen) { detail.classList.add('open'); row.setAttribute('aria-expanded', 'true'); }
+      };
+      row.onclick = toggleDetail;
+      row.onkeydown = e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDetail(); }
       };
 
       panel.appendChild(row);
@@ -2302,12 +2530,17 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
   const debugToggle  = document.getElementById('debugToggle');
   const debugSwitch  = document.getElementById('debugToggleSwitch');
 
-  settingsBtn.addEventListener('click', e => { e.stopPropagation(); settingsMenu.classList.toggle('show'); });
-  document.addEventListener('click', () => settingsMenu.classList.remove('show'));
+  settingsBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    const show = settingsMenu.classList.toggle('show');
+    settingsBtn.setAttribute('aria-expanded', String(show));
+  });
+  document.addEventListener('click', () => { settingsMenu.classList.remove('show'); settingsBtn.setAttribute('aria-expanded', 'false'); });
   settingsMenu.addEventListener('click', e => e.stopPropagation());
   debugToggle.addEventListener('click', () => {
     debugMode = !debugMode;
     debugSwitch.classList.toggle('on', debugMode);
+    debugToggle.setAttribute('aria-checked', String(debugMode));
     settingsBtn.classList.toggle('debug-active', debugMode);
     document.getElementById('debugBadge')?.remove();
     if (debugMode) {
@@ -2316,16 +2549,20 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
       document.querySelector('.header').appendChild(badge);
     }
     settingsMenu.classList.remove('show');
+    settingsBtn.setAttribute('aria-expanded', 'false');
   });
 
   const geminiToggle = document.getElementById('geminiToggle');
   const geminiSwitch  = document.getElementById('geminiToggleSwitch');
   geminiSwitch.classList.toggle('on', geminiEnabled);
+  geminiToggle.setAttribute('aria-checked', String(geminiEnabled));
   geminiToggle.addEventListener('click', () => {
     geminiEnabled = !geminiEnabled;
     localStorage.setItem('shelfcheck.gemini', geminiEnabled ? '1' : '0');
     geminiSwitch.classList.toggle('on', geminiEnabled);
+    geminiToggle.setAttribute('aria-checked', String(geminiEnabled));
     settingsMenu.classList.remove('show');
+    settingsBtn.setAttribute('aria-expanded', 'false');
   });
 
 
@@ -2436,12 +2673,14 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     if (seen) return;
     const hint = document.createElement('div');
     hint.className = 'first-hint';
+    hint.setAttribute('role', 'dialog');
+    hint.setAttribute('aria-label', 'How ShelfCheck works');
     hint.innerHTML = `
       <div class="first-hint-card">
         <h3>How ShelfCheck works</h3>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#3b82f6"></span>
-          <span>Take a straight-on photo of one shelf. Get close enough that the white label stickers are sharp.</span>
+          <span>Photograph <b>one shelf row</b>, close-up, phone in landscape. Get close enough that the white label stickers are sharp.</span>
         </div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#ef4444"></span>
