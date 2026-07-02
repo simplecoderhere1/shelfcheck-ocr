@@ -493,7 +493,11 @@
   // tokens dominate vision-LLM latency, so bbox output would blow the time budget).
   // Shared proxy worker from the sibling shelfcheck app; see README for fallback.
   const GEMINI_URL = 'https://selfcheck-proxy.krish-sundareswar.workers.dev/';
-  const GEMINI_TIMEOUT_MS = 15000;
+  // Generous on purpose: Gemini never blocks the first render (it races a
+  // short grace window, then refines in the background), and on dense
+  // multi-row shelves its round trip measures 14-16s — a 15s timeout made
+  // the background refine fail on a coin flip.
+  const GEMINI_TIMEOUT_MS = 30000;
   const OL_TIMEOUT_MS = 4000;   // Open Library is third-party; never let one slow request stall analysis
   let geminiEnabled = (localStorage.getItem('shelfcheck.gemini') ?? '1') === '1';
 
@@ -1252,17 +1256,36 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     return out;
   }
 
+  // Cluster labels into shelf rows by sorting on box centerY and starting a
+  // new row wherever the gap between consecutive centers exceeds a threshold.
+  // Fixed-width banding (Math.round(cy/rowH)) split one physical shelf into
+  // two rows whenever its sticker centers straddled a band edge, which made
+  // OCR's row count disagree with Gemini's and forced fusion into the
+  // degraded flatten path.
+  function clusterRowIndex(labels, imgH) {
+    const threshold = Math.max(imgH * 0.05, 24);
+    const withCy = labels.map(l => ({ l, cy: l.bbox[1] + l.bbox[3] / 2 }));
+    withCy.sort((a, b) => a.cy - b.cy);
+    const rowMap = new Map();
+    let row = -1;
+    let prevCy = null;
+    for (const { l, cy } of withCy) {
+      if (prevCy === null || cy - prevCy > threshold) row++;
+      rowMap.set(l, row);
+      prevCy = cy;
+    }
+    return rowMap;
+  }
+
   // Fuse ocr.space labels (geometry) with Gemini books (text) into a new
   // labels array in the same shape runOcr already produces.
   function fuseLabels(ocrLabels, gemBooks, imgW, imgH) {
     ocrLabels = splitWideOcrLabels(ocrLabels);
-    const rowH = Math.max(1, Math.round(imgH * 0.10));
-    const withRow = ocrLabels.map(l => ({ ...l, _frow: Math.round((l.bbox[1] + l.bbox[3] / 2) / rowH) }));
-    const rowOrder = [...new Set(withRow.map(l => l._frow))].sort((a, b) => a - b);
-    const rowMap = new Map(rowOrder.map((r, i) => [r, i]));
-    for (const l of withRow) l._frow = rowMap.get(l._frow);
+    const withRow = ocrLabels.map(l => ({ ...l }));
+    const frowMap = clusterRowIndex(withRow, imgH);
+    for (const l of withRow) l._frow = frowMap.get(l);
 
-    const oRowCount = rowOrder.length;
+    const oRowCount = withRow.length ? 1 + Math.max(...withRow.map(l => l._frow)) : 0;
     const gRowCount = gemBooks.length ? 1 + Math.max(...gemBooks.map(b => b.shelfRow || 0)) : 0;
 
     const rows = [];
@@ -1270,17 +1293,17 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
       // Flatten: one global alignment when row bucketing disagrees.
       const O = withRow.slice().sort((a, b) => a._frow - b._frow || a.bbox[0] - b.bbox[0]);
       const G = gemBooks.slice();
-      rows.push({ O, G });
+      rows.push({ O, G, flat: true });
     } else {
       for (let r = 0; r < oRowCount; r++) {
         const O = withRow.filter(l => l._frow === r).sort((a, b) => a.bbox[0] - b.bbox[0]);
         const G = gemBooks.filter(b => (b.shelfRow || 0) === r);
-        rows.push({ O, G });
+        rows.push({ O, G, flat: false });
       }
     }
 
     const fused = [];
-    for (const { O, G } of rows) {
+    for (const { O, G, flat } of rows) {
       if (!O.length && !G.length) continue;
       const oTexts = O.map(l => l.text);
       const gTexts = G.map(g => g.spine_label || '');
@@ -1313,7 +1336,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
       // Gemini-only spines: only synthesize when confident and the row has
       // enough matched anchors to place them geometrically.
       if (gOnly.length && pairs.length >= 2) {
-        const matchedByGPos = pairs.map(([oi, gi]) => ({ gi, cx: O[oi].bbox[0] + O[oi].bbox[2] / 2 })).sort((a, b) => a.gi - b.gi);
+        const matchedByGPos = pairs.map(([oi, gi]) => ({ oi, gi, cx: O[oi].bbox[0] + O[oi].bbox[2] / 2 })).sort((a, b) => a.gi - b.gi);
         const ws = pairs.map(([oi]) => O[oi].bbox[2]);
         const hs = pairs.map(([oi]) => O[oi].bbox[3]);
         const ys = pairs.map(([oi]) => O[oi].bbox[1]);
@@ -1347,6 +1370,44 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
           }
           const group = confident.slice(k, k2);
           const count = group.length;
+
+          // Flatten path: anchors bracketing a gOnly candidate may belong to
+          // different physical shelf rows (that's exactly why row bucketing
+          // disagreed and forced the flatten in the first place), so the
+          // row's global median y/h can land a synthesized box on the wrong
+          // shelf. When both brackets exist AND their OCR anchors agree on
+          // _frow, we have trustworthy local geometry — use the mean of the
+          // two anchors' bbox[1]/bbox[3] instead of the global median so the
+          // box actually sits on that shelf. When the brackets disagree (or
+          // one is missing, e.g. an entire physical shelf OCR missed
+          // outright), there's no better local geometry available; fall
+          // back to the row's median placement rather than dropping the
+          // candidate — an approximately-placed confident Gemini read still
+          // beats losing it, and downstream scoring already demotes synth
+          // entries (score 0.7, below the "high confidence" cutoff).
+          if (flat) {
+            let gy = medY, gh = medH;
+            if (left0 && right0 && O[left0.oi]._frow === O[right0.oi]._frow) {
+              gy = (O[left0.oi].bbox[1] + O[right0.oi].bbox[1]) / 2;
+              gh = (O[left0.oi].bbox[3] + O[right0.oi].bbox[3]) / 2;
+            }
+            group.forEach((gi, idx) => {
+              const g = G[gi];
+              let cx;
+              if (left0 && right0) cx = left0.cx + (right0.cx - left0.cx) * (idx + 1) / (count + 1);
+              else if (left0) cx = left0.cx + medGap * (idx + 1);
+              else if (right0) cx = right0.cx - medGap * (count - idx);
+              else return;
+              const bx = Math.max(0, Math.min(imgW - medW, cx - medW / 2));
+              rowOut.push({
+                text: g.spine_label, bbox: [bx, gy, medW, gh], score: 0.7, src: 'gemini-synth', synthBox: true,
+                title: g.title || null, title_score: 0.9,
+              });
+            });
+            k = k2;
+            continue;
+          }
+
           // Interior groups (bracketed on both sides) have a bounded, known
           // span to redistribute across. One-sided groups (off the start/end
           // of the row) extrapolate past the last real anchor using the
@@ -1555,22 +1616,19 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     // needs a title to break it — cheap, parallel, ties only. If Gemini didn't
     // run or found no titles, this simply no-ops and tied books fall into the
     // existing tiedSlots handling (any order within a tie group is OK).
-    if (needsTitles && labels.some(l => l.title)) {
+    // Fiction ties are exempt groups (ordering ignores titles for fiction),
+    // so verifying their titles buys nothing — skip OL entirely for fiction.
+    if (needsTitles && tieSect !== 'fiction' && labels.some(l => l.title)) {
       await verifyTitlesOpenLibrary(labels, tieSect, signal);
     }
 
-    // Assign shelfRow (port of server-side sort + bucket_map logic)
-    const rowH = Math.max(1, Math.round(imgH * 0.10));
-    for (const lbl of labels) {
-      const [, by,, bh] = lbl.bbox;
-      lbl._row = Math.round((by + bh / 2) / rowH);
-    }
+    // Assign shelfRow via gap-based clustering (see clusterRowIndex) instead
+    // of fixed-height banding, so a shelf's stickers stay one row even when
+    // their centers straddle where a fixed band edge would have fallen.
+    const rowMap = clusterRowIndex(labels, imgH);
+    for (const lbl of labels) lbl._row = rowMap.get(lbl);
     labels.sort((a, b) => a._row - b._row || a.bbox[0] - b.bbox[0]);
-    const rowMap = new Map();
-    for (const lbl of labels) {
-      if (!rowMap.has(lbl._row)) rowMap.set(lbl._row, rowMap.size);
-    }
-    for (const lbl of labels) lbl.shelfRow = rowMap.get(lbl._row) ?? 0;
+    for (const lbl of labels) lbl.shelfRow = lbl._row;
 
     return labels.map(l => ({
       text:           l.text,
@@ -1643,7 +1701,11 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     // OCR results that are already sitting in memory.
     const GRACE_TIMEOUT = Symbol('gemini-grace-timeout');
     let graceTimer;
-    const graceP = new Promise(r => { graceTimer = setTimeout(() => r(GRACE_TIMEOUT), GEMINI_GRACE_MS); });
+    // Cap the grace window so a slow OCR round trip can't push first render
+    // past the 5s budget: shrink the remaining grace to whatever's left of a
+    // 4.3s deadline from the start of runOcr, floored at 250ms.
+    const graceMs = Math.max(250, Math.min(GEMINI_GRACE_MS, 4300 - (performance.now() - t0)));
+    const graceP = new Promise(r => { graceTimer = setTimeout(() => r(GRACE_TIMEOUT), graceMs); });
     const raced = geminiEnabled ? await Promise.race([geminiP, graceP]) : null;
     clearTimeout(graceTimer);
     const gemOnTime = raced === GRACE_TIMEOUT ? null : raced;
@@ -2069,6 +2131,31 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     popBoxPulse(book);
   }
 
+  // The canvas element's CSS box (getBoundingClientRect) is *not* the same
+  // as the rectangle its image content actually occupies: #snapshot/camFreeze
+  // use object-fit: contain and are sized to fill their container, so a
+  // portrait photo inside a wider container gets pillarboxed (bars on the
+  // sides) while a landscape photo in a taller container gets letterboxed
+  // (bars top/bottom). Any mapping between screen coordinates and image/box
+  // coordinates must go through this sub-rectangle, not the raw CSS box —
+  // otherwise taps land on the wrong book and the pop-highlight is
+  // mispositioned whenever the photo's aspect ratio doesn't match its
+  // container's (the common case for portrait shelf photos on desktop).
+  function canvasContentRect(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    if (!canvas.width || !canvas.height || !rect.width || !rect.height) {
+      return { left: rect.left, top: rect.top, width: rect.width, height: rect.height, scale: 1 };
+    }
+    const scale  = Math.min(rect.width / canvas.width, rect.height / canvas.height);
+    const width  = canvas.width  * scale;
+    const height = canvas.height * scale;
+    return {
+      left: rect.left + (rect.width  - width)  / 2,
+      top:  rect.top  + (rect.height - height) / 2,
+      width, height, scale,
+    };
+  }
+
   const boxPulse   = document.getElementById('boxPulse');
   const arBoxPulse = document.getElementById('arBoxPulse');
   function popBoxPulse(book) {
@@ -2079,7 +2166,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     }
     const canvas = activeCanvas(), container = activeContainer();
     const [bx, by, bw, bh] = book._bbox;
-    const cRect = canvas.getBoundingClientRect();
+    const cRect = canvasContentRect(canvas);
     const pRect = container.getBoundingClientRect();
     const sx = cRect.width  / lastApiDims.sentW;
     const sy = cRect.height / lastApiDims.sentH;
@@ -2128,9 +2215,16 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
   }
 
   function handleCanvasTap(canvas, e) {
-    const rect = canvas.getBoundingClientRect();
-    const tapX = (e.clientX - rect.left) * (canvas.width  / rect.width);
-    const tapY = (e.clientY - rect.top)  * (canvas.height / rect.height);
+    const cr = canvasContentRect(canvas);
+    const tapX = (e.clientX - cr.left) / cr.scale;
+    const tapY = (e.clientY - cr.top)  / cr.scale;
+    // Taps that land in the letterbox/pillarbox bars (outside the actual
+    // image content) can't hit any book — bail before hit-testing so they
+    // don't get mapped into extrapolated, meaningless image coordinates.
+    if (tapX < 0 || tapY < 0 || tapX > canvas.width || tapY > canvas.height) {
+      activePulseEl().classList.remove('show');
+      return;
+    }
     const hit = hitTestBook(tapX, tapY, canvas.width, canvas.height);
     if (hit) {
       highlightArrow(hit);
@@ -2208,7 +2302,12 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     while (tokens.length > 1 && /^(jr|sr|ii|iii|iv|v|esq)\.?$/i.test(tokens[tokens.length - 1])) tokens.pop();
     if (tokens.length === 1) return { surname: lettersLower(tokens[0]), first: '' };
     const t0 = tokens[0], t1 = tokens[1];
-    if (/^[A-Z]{2,}$/.test(t0) && /^[A-Z][a-z]/.test(t1)) {
+    // Surname-first heuristic: all-caps first token followed by a token that
+    // is NOT all-caps (mixed case, all-lowercase, or an initial like "s.").
+    // Requiring [A-Z][a-z] here missed real stickers like "WACHMAN sam",
+    // which then fell through to First-Last parsing → surname "sam".
+    // "KURT VONNEGUT" (both all-caps) still takes the last-token path.
+    if (/^[A-Z]{2,}$/.test(t0) && !/^[A-Z]{2,}\.?$/.test(t1)) {
       const surname = buildMultiWordSurname(tokens.slice(0, -1), 0) || lettersLower(t0);
       return { surname, first: lettersLower(tokens[tokens.length - 1]) };
     }
@@ -2240,10 +2339,21 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
   function sortKey(book, section) {
     if (book.confidence === 'low') return null;
     const vol   = extractVolume(book);
-    const title = lettersLower((book.title || '').replace(/^the\s+|^a\s+|^an\s+/i, ''));
+    // Titles must never tie-break unless human/OL-verified: Gemini titles are
+    // frequently unverified (verifyTitlesOpenLibrary's timeout/budget-abort
+    // path keeps the raw title with title_verified=false), and unverified
+    // titles feeding compareKeys produced false "out of order" flags on
+    // same-author runs. Fiction never uses titles at all — this library does
+    // not enforce alphabetical title order within a same-author fiction run
+    // (publication-order shelving is correct), so same-author books must fall
+    // into the tied-group exemption. Nonfiction uses the title only when
+    // verified. Titles stay on the label objects for display either way.
+    const title = book.title_verified
+      ? lettersLower((book.title || '').replace(/^the\s+|^a\s+|^an\s+/i, ''))
+      : '';
     function strKey(s) {
       const a = parseSurnameAndFirst(s);
-      return a ? { kind: 'str', val: a.surname, first: a.first, vol, title } : null;
+      return a ? { kind: 'str', val: a.surname, first: a.first, vol, title: '' } : null;
     }
     if (section === 'fiction')    return book.spine_label ? strKey(book.spine_label) : null;
     if (section === 'nonfiction') { const d = parseDewey(book.spine_label); return d ? { kind: 'dewey', val: d, vol, title } : null; }
@@ -2279,6 +2389,17 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
   }
 
   function longestNonDecreasingSubseq(keys) {
+    // Guard the empty case explicitly: below, bestEnd starts at 0 assuming
+    // dp[0]/prev[0] exist, but when a shelf's books all have unparseable/
+    // low-confidence labels, checkOrderOneShelf calls this with keys=[]. dp
+    // and prev are then empty arrays, so prev[0] is undefined rather than
+    // -1, and the backtrack loop below (`i !== -1`) never terminates —
+    // undefined !== -1 forever — pegging the main thread in an infinite
+    // loop. This was the exact cause of the renderer hard-freezing after a
+    // Gemini refine landed on a dense multi-row photo: it only takes one
+    // shelf row (of any size) whose books are *all* unverifiable/low-
+    // confidence to hit this.
+    if (!keys.length) return new Set();
     const n = keys.length, dp = new Array(n).fill(1), prev = new Array(n).fill(-1);
     let bestEnd = 0;
     for (let i = 0; i < n; i++) {
@@ -2374,8 +2495,12 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     // Post-pass: sandwich / near-twin demotion
     for (let i = 0; i < checked.length; i++) {
       if (!checked[i].outOfOrder) continue;
-      let L = i - 1; while (L >= 0 && checked[L].outOfOrder) L--;
-      let R = i + 1; while (R < checked.length && checked[R].outOfOrder) R++;
+      // Skip past null-key (unverifiable) neighbors too, not just flagged
+      // ones — a truncated OCR read (VONNE next to VONNEGUT) often sits
+      // beside an unparseable read, and stopping there let the near-twin
+      // demotion below miss obvious truncation artifacts.
+      let L = i - 1; while (L >= 0 && (checked[L].outOfOrder || !keys[L])) L--;
+      let R = i + 1; while (R < checked.length && (checked[R].outOfOrder || !keys[R])) R++;
       if (L < 0 || R >= checked.length) continue;
       const kL = keys[L], kR = keys[R], kM = keys[i];
       if (!kL || !kR || !kM) continue;
@@ -2393,7 +2518,9 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
         for (const kN of [kL, kR]) {
           if (kN.kind !== 'str') continue;
           const vN = kN.val || '';
-          if (Math.min(vM.length, vN.length) >= 5 && vM !== vN && editDistance(vM, vN) <= 2) { demote = true; break; }
+          const minLen = Math.min(vM.length, vN.length);
+          if (vM !== vN && ((minLen >= 5 && editDistance(vM, vN) <= 2) ||
+                            (minLen >= 4 && editDistance(vM, vN) <= 1))) { demote = true; break; }
         }
       }
       if (demote) { checked[i].outOfOrder = false; checked[i].unverifiable = true; checked[i].idealPosition = null; }
