@@ -42,6 +42,22 @@
       gap: 14px; color: #555;
     }
     .photo-placeholder svg { opacity: .45; }
+
+    /* Pop-out highlight shown over a box when it's selected from the flagged list. */
+    .box-pulse {
+      position: absolute; pointer-events: none; border-radius: 3px;
+      border: 3px solid #fff; box-shadow: 0 0 0 2px rgba(0,0,0,.5), 0 0 14px 2px currentColor;
+      opacity: 0; transform: scale(1); transform-origin: center;
+      transition: opacity .15s ease-out;
+    }
+    .box-pulse.show { opacity: 1; animation: box-pulse-pop 900ms ease-out 1; }
+    @keyframes box-pulse-pop {
+      0%   { transform: scale(1);    opacity: 0; }
+      15%  { transform: scale(1.35); opacity: 1; }
+      40%  { transform: scale(0.95); opacity: 1; }
+      60%  { transform: scale(1.12); opacity: 1; }
+      100% { transform: scale(1);    opacity: 1; }
+    }
     .photo-placeholder p { font-size: 14px; line-height: 1.6; text-align: center; max-width: 220px; }
 
     #snapshot {
@@ -370,6 +386,7 @@
       </div>
     </div>
     <canvas id="snapshot"></canvas>
+    <div class="box-pulse" id="boxPulse"></div>
     <div class="action-bar" id="actionBar">
       <button class="btn btn-retake"  id="retakeBtn">Retake</button>
       <button class="btn btn-analyze" id="analyzeBtn" disabled>Analyze</button>
@@ -488,6 +505,7 @@
     snapshot.style.display = 'none';
     photoPlaceholder.style.display = '';
     actionBar.classList.remove('show');
+    document.getElementById('boxPulse')?.classList.remove('show');
     analyzeBtn.disabled    = true;
     analyzeBtn.textContent = 'Analyze';
     photoInput.value  = '';
@@ -1552,37 +1570,65 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     ctx.font         = `bold ${fs}px sans-serif`;
     ctx.textBaseline = 'bottom';
 
+    // Only flagged books (out of order or unverifiable) get a box — correct
+    // books are left unmarked so the photo isn't cluttered with green boxes.
     checkedBooks.forEach((book, i) => {
       if (!book._bbox) return;
+      if (!book.outOfOrder && !book.unverifiable) return;
       const [bx, by, bw, bh] = book._bbox;
       const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
-      const color = book.unverifiable ? '#facc15' : book.outOfOrder ? '#ef4444' : '#22c55e';
+      const color = book.unverifiable ? '#facc15' : '#ef4444';
 
       ctx.strokeStyle = color;
-      ctx.lineWidth   = book.outOfOrder || book.unverifiable ? lw : Math.max(1, lw - 1);
+      ctx.lineWidth   = lw;
       ctx.strokeRect(cx, cy, cw, ch);
 
-      // Number badge only for flagged (non-green) books
-      if (book.outOfOrder || book.unverifiable) {
-        const num = String(i + 1);
-        const tw  = ctx.measureText(num).width;
-        ctx.fillStyle   = color;
-        ctx.globalAlpha = 0.85;
-        ctx.fillRect(cx, cy - fs - 3, tw + 6, fs + 3);
-        ctx.globalAlpha = 1;
-        ctx.fillStyle   = '#000';
-        ctx.fillText(num, cx + 3, cy - 2);
-      }
+      const num = String(i + 1);
+      const tw  = ctx.measureText(num).width;
+      ctx.fillStyle   = color;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(cx, cy - fs - 3, tw + 6, fs + 3);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle   = '#000';
+      ctx.fillText(num, cx + 3, cy - 2);
     });
 
     ctx.restore();
   }
 
-  // Highlight one book in the flagged list.
+  // Highlight one book in the flagged list, and pop its box on the photo so
+  // it's easy to find (works whether triggered by tapping the list or the photo).
   function highlightArrow(book) {
     document.querySelectorAll('.flagged-item').forEach(r => r.classList.remove('active'));
     const row = _flaggedRowMap.get(book);
     if (row) { row.classList.add('active'); row.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    popBoxPulse(book);
+  }
+
+  const boxPulse = document.getElementById('boxPulse');
+  function popBoxPulse(book) {
+    if (!book?._bbox || !lastApiDims || (!book.outOfOrder && !book.unverifiable)) {
+      boxPulse.classList.remove('show');
+      return;
+    }
+    const [bx, by, bw, bh] = book._bbox;
+    const sRect = snapshot.getBoundingClientRect();
+    const pRect = photoArea.getBoundingClientRect();
+    const sx = sRect.width  / lastApiDims.sentW;
+    const sy = sRect.height / lastApiDims.sentH;
+    const left = (sRect.left - pRect.left) + bx * sx;
+    const top  = (sRect.top  - pRect.top)  + by * sy;
+
+    boxPulse.style.color  = book.unverifiable ? '#facc15' : '#ef4444';
+    boxPulse.style.left   = `${left}px`;
+    boxPulse.style.top    = `${top}px`;
+    boxPulse.style.width  = `${bw * sx}px`;
+    boxPulse.style.height = `${bh * sy}px`;
+
+    // Restart the CSS animation even if the same book is tapped again.
+    boxPulse.classList.remove('show');
+    void boxPulse.offsetWidth;
+    boxPulse.classList.add('show');
   }
 
   // ── Tap box to inspect ───────────────────────────────────────────────────
@@ -1612,6 +1658,8 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
           row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
       }
+    } else {
+      boxPulse.classList.remove('show');
     }
   });
 
