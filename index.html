@@ -338,6 +338,28 @@
     .cam-shutter { width: 46px; height: 46px; border-radius: 50%; border: 3px solid rgba(255,255,255,.9); background: #fff; cursor: pointer; flex-shrink: 0; transition: transform .1s ease; }
     .cam-shutter:active { transform: scale(.94); }
     .cam-close { position: absolute; top: max(12px, env(safe-area-inset-top)); left: max(12px, env(safe-area-inset-left)); z-index: 3; width: 40px; height: 40px; border-radius: 50%; border: none; background: rgba(0,0,0,.5); color: #fff; font-size: 24px; line-height: 1; cursor: pointer; }
+
+    /* AR capture: freeze-frame + overlay shown in place of the live video
+       while a photo is analyzed and its results are shown. */
+    #camFreeze { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: none; z-index: 1; background: #000; transition: filter .25s ease-out; }
+    #camFreeze.show { display: block; }
+    #camFreeze.loading { animation: ar-shimmer 1.6s ease-in-out infinite; }
+    @keyframes ar-shimmer { 0%, 100% { filter: brightness(.55); } 50% { filter: brightness(.72); } }
+    .ar-sheet {
+      display: none; position: absolute; left: 0; right: 0; bottom: 0; z-index: 5;
+      flex-direction: column; background: #111; border-top: 1px solid #2c2c2c;
+      border-radius: 14px 14px 0 0; max-height: 42%; overflow-y: auto;
+      -webkit-overflow-scrolling: touch; padding-bottom: env(safe-area-inset-bottom);
+    }
+    .ar-sheet.show { display: flex; }
+    .ar-resume {
+      display: none; position: absolute; left: 50%; transform: translateX(-50%);
+      bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 6;
+      background: #fff; color: #111; border: none; border-radius: 22px;
+      padding: 10px 22px; font-size: 14px; font-weight: 700; cursor: pointer;
+      box-shadow: 0 2px 10px rgba(0,0,0,.35);
+    }
+    .ar-resume.show { display: block; }
   </style>
 </head>
 <body>
@@ -412,11 +434,15 @@
 
 <div class="camera-live" id="cameraLive">
   <video id="cameraVideo" playsinline autoplay muted></video>
+  <canvas id="camFreeze"></canvas>
+  <div class="box-pulse" id="arBoxPulse"></div>
   <div class="cam-message">Take a picture of one shelf row</div>
   <button class="cam-close" id="camClose" aria-label="Close camera">&times;</button>
   <div class="cam-controls">
     <button class="cam-shutter" id="camShutter" aria-label="Take photo"></button>
   </div>
+  <button class="ar-resume" id="arResume">&#8635; Resume camera</button>
+  <div class="ar-sheet" id="arSheet"></div>
 </div>
 
 <input type="file" id="photoInput"  accept="image/*" capture="environment" style="display:none">
@@ -555,6 +581,9 @@
   const cameraVideo = document.getElementById('cameraVideo');
   const camShutter  = document.getElementById('camShutter');
   const camClose    = document.getElementById('camClose');
+  const camFreeze   = document.getElementById('camFreeze');
+  const arSheet     = document.getElementById('arSheet');
+  const arResume    = document.getElementById('arResume');
   let cameraStream  = null;
   let camZoom       = 1;
 
@@ -584,12 +613,40 @@
     cameraLive.classList.remove('show');
     if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
     cameraVideo.srcObject = null;
+    // Clear any lingering AR-context error banner so it can't resurface as a
+    // stale child the next time cameraLive is reopened.
+    if (cameraLive.contains(document.getElementById('errorBanner'))) {
+      document.getElementById('errorBanner')?.remove();
+    }
+
+    if (arActive) {
+      // Hand off to the classic still-photo view — snapshot already holds
+      // the captured frame (and results too, if analysis finished before Close).
+      if (analysisAbort) { analysisCancelled = true; analysisAbort.abort(); }
+      hideLoading();
+      camFreeze.classList.remove('show', 'loading');
+      arBoxPulse.classList.remove('show');
+      arSheet.classList.remove('show'); arSheet.innerHTML = '';
+      arResume.classList.remove('show');
+      arActive = false;
+      photoPlaceholder.style.display = 'none';
+      snapshot.style.display = 'block';
+      if (lastRawBooks && lastRawBooks.length) {
+        showResults(lastRawBooks, getSection());
+      } else {
+        actionBar.classList.add('show');
+        analyzeBtn.disabled = false;
+      }
+    }
   }
 
-  function captureFromCamera() {
+  // Pure math: what region of the video frame is currently on screen, in
+  // video-pixel space, accounting for the cover-fit + pinch zoom. Returns
+  // null if the camera isn't ready yet. Shared by the AR capture flow below.
+  function computeCaptureRect() {
     const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
     const dispW = cameraLive.clientWidth, dispH = cameraLive.clientHeight;
-    if (!vw || !vh) { showErrorBanner("Camera isn't ready — try again.", () => openLiveCamera()); return; }
+    if (!vw || !vh) return null;
     const cover = Math.max(dispW / vw, dispH / vh);
     const eff   = cover * camZoom;
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -597,19 +654,7 @@
     const toVY  = py => vh / 2 + (py - dispH / 2) / eff;
     const sx  = clamp(toVX(0),     0, vw), sx2 = clamp(toVX(dispW), 0, vw);
     const sy  = clamp(toVY(0),     0, vh), sy2 = clamp(toVY(dispH), 0, vh);
-    const sw  = Math.max(1, sx2 - sx), sh = Math.max(1, sy2 - sy);
-    const sc  = Math.min(1, MAX_CANVAS_DIM / Math.max(sw, sh));
-    snapshot.width  = Math.round(sw * sc);
-    snapshot.height = Math.round(sh * sc);
-    snapshot.getContext('2d').drawImage(cameraVideo, sx, sy, sw, sh, 0, 0, snapshot.width, snapshot.height);
-    closeLiveCamera();
-    saveCleanPhoto();
-    photoPlaceholder.style.display = 'none';
-    snapshot.style.display = 'block';
-    actionBar.classList.add('show');
-    analyzeBtn.disabled = false;
-    pendingEncode = encodeForOCR();
-    pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
+    return { sx, sy, sw: Math.max(1, sx2 - sx), sh: Math.max(1, sy2 - sy) };
   }
 
   // Pinch-to-zoom
@@ -618,8 +663,9 @@
   cameraLive.addEventListener('touchstart', e => { if (e.touches.length === 2) { pinchDist = touchDist(e.touches); pinchZoom = camZoom; } }, { passive: false });
   cameraLive.addEventListener('touchmove',  e => { if (e.touches.length === 2 && pinchDist) { e.preventDefault(); setZoom(pinchZoom * touchDist(e.touches) / pinchDist); } }, { passive: false });
 
-  camShutter.addEventListener('click', captureFromCamera);
+  camShutter.addEventListener('click', arCapture);
   camClose.addEventListener('click', closeLiveCamera);
+  arResume.addEventListener('click', arResumeCamera);
   uploadPicBtn.addEventListener('click', () => uploadInput.click());
   retakeBtn.addEventListener('click', retake);
   photoInput.addEventListener('change',  () => { if (photoInput.files[0])  loadPhoto(photoInput.files[0]); });
@@ -1468,7 +1514,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     icon.innerHTML = state === 'active' ? _dotsHtml() : STAGE_ICON[state];
   }
 
-  function showLoading() {
+  function showLoading(parent = photoArea) {
     const overlay = document.createElement('div');
     overlay.id = 'loadingOverlay'; overlay.className = 'loading-overlay';
     const rows = LOADING_STAGES.map((label, i) => `
@@ -1478,7 +1524,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
       </div>`).join('');
     overlay.innerHTML = `<div class="stage-list">${rows}</div>
       <button class="loading-cancel" id="loadingCancel" style="margin-top:8px">Cancel</button>`;
-    photoArea.appendChild(overlay);
+    parent.appendChild(overlay);
     document.getElementById('loadingCancel').onclick = cancelAnalysis;
     resetStageTo(0);
   }
@@ -1500,9 +1546,15 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     analysisCancelled = true;
     analysisAbort?.abort();
     hideLoading();
-    analyzeBtn.disabled    = false;
-    analyzeBtn.textContent = 'Analyze';
-    actionBar.classList.add('show');
+    if (arActive) {
+      camFreeze.classList.remove('loading', 'show');
+      arActive = false;
+      cameraVideo.play().catch(() => {});
+    } else {
+      analyzeBtn.disabled    = false;
+      analyzeBtn.textContent = 'Analyze';
+      actionBar.classList.add('show');
+    }
   }
 
   // ── Main pipeline ─────────────────────────────────────────────────────────
@@ -1568,6 +1620,94 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     analyzeBtn.textContent = 'Analyze';
   }
 
+  // ── AR capture: freeze the live camera in place, analyze, overlay results ──
+  // Mirrors analyzeShelf's pipeline above but renders into the camera overlay
+  // (camFreeze/arSheet) instead of the classic still-photo view, and never
+  // closes the camera — arResumeCamera()/closeLiveCamera() are the only exits.
+  async function arCapture() {
+    const rect = computeCaptureRect();
+    if (!rect) { showErrorBanner("Camera isn't ready — try again.", () => {}, cameraLive); return; }
+    const { sx, sy, sw, sh } = rect;
+    const sc = Math.min(1, MAX_CANVAS_DIM / Math.max(sw, sh));
+    snapshot.width  = Math.round(sw * sc);
+    snapshot.height = Math.round(sh * sc);
+    snapshot.getContext('2d').drawImage(cameraVideo, sx, sy, sw, sh, 0, 0, snapshot.width, snapshot.height);
+    saveCleanPhoto();
+    pendingEncode = encodeForOCR();
+    pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
+
+    // Freeze the camera view in place: pause the live video and draw the
+    // exact same crop into camFreeze, sized to the on-screen video box.
+    cameraVideo.pause();
+    const dpr = window.devicePixelRatio || 1;
+    camFreeze.width  = Math.max(1, Math.round(cameraLive.clientWidth  * dpr));
+    camFreeze.height = Math.max(1, Math.round(cameraLive.clientHeight * dpr));
+    camFreeze.getContext('2d').drawImage(cameraVideo, sx, sy, sw, sh, 0, 0, camFreeze.width, camFreeze.height);
+    camFreeze.classList.add('show', 'loading');
+    arActive = true;
+
+    analysisCancelled = false;
+    analysisAbort     = new AbortController();
+    showLoading(cameraLive);
+
+    // Yield two frames so the overlay paints before encoding blocks the thread.
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    let encoded;
+    try {
+      encoded = await (pendingEncode ?? encodeForOCR());
+      pendingEncode = null;
+    } catch (err) {
+      if (analysisCancelled) return;
+      hideLoading();
+      camFreeze.classList.remove('loading');
+      showErrorBanner('Could not prepare the photo. Try again.', arResumeCamera, cameraLive);
+      return;
+    }
+
+    advanceStage();  // → "Reading & cross-checking labels"
+
+    let ocrData;
+    try {
+      ocrData = await runOcr(encoded, analysisAbort.signal, () => {
+        if (!analysisCancelled) advanceStage();  // → "Verifying titles"
+      });
+    } catch (err) {
+      if (analysisCancelled) return;
+      hideLoading();
+      camFreeze.classList.remove('loading');
+      showErrorBanner(friendlyErrorMessage(err), arResumeCamera, cameraLive);
+      return;
+    }
+
+    if (analysisCancelled) return;
+
+    advanceStage();  // → "Checking order"
+
+    lastRawBooks = labelsToBooks(ocrData.labels);
+    lastApiDims  = { sentW: ocrData.imageSize[0], sentH: ocrData.imageSize[1] };
+
+    const detected = autoDetectSection(lastRawBooks);
+    if (detected) setActiveTab(detected);
+
+    hideLoading();
+    camFreeze.classList.remove('loading');
+    showResults(lastRawBooks, getSection(), { ar: true });
+    arResume.classList.add('show');
+  }
+
+  // "Resume camera" button, and the retry action on AR-mode errors: drop the
+  // frozen frame/results overlay and go back to a live viewfinder.
+  function arResumeCamera() {
+    document.getElementById('errorBanner')?.remove();
+    camFreeze.classList.remove('show', 'loading');
+    arBoxPulse.classList.remove('show');
+    arSheet.classList.remove('show'); arSheet.innerHTML = '';
+    arResume.classList.remove('show');
+    arActive = false;
+    cameraVideo.play().catch(() => {});
+  }
+
   function friendlyErrorMessage(err) {
     if (err.name === 'AbortError' || err.name === 'TimeoutError')
       return 'Reading took too long. Try again with the shelf closer and better lit.';
@@ -1578,23 +1718,26 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     return `Analysis failed: ${err.message}`;
   }
 
-  function showErrorBanner(message, onRetry) {
+  function showErrorBanner(message, onRetry, parent = photoArea) {
     document.getElementById('errorBanner')?.remove();
     const banner = document.createElement('div');
     banner.id = 'errorBanner'; banner.className = 'error-banner';
     banner.innerHTML = `<span class="error-banner-msg">${escapeHtml(message)}</span>
       <button class="error-banner-retry" id="errBannerRetry">Retry</button>`;
-    photoArea.appendChild(banner);
+    parent.appendChild(banner);
     document.getElementById('errBannerRetry').onclick = () => { banner.remove(); onRetry(); };
   }
 
   // ── Bounding box drawing ─────────────────────────────────────────────────
-  function drawBoundingBoxes(checkedBooks, sentW, sentH) {
-    const ctx = snapshot.getContext('2d');
-    const sx  = snapshot.width  / sentW;
-    const sy  = snapshot.height / sentH;
-    const lw  = Math.max(2, Math.round(snapshot.width / 450));
-    const fs  = Math.max(11, Math.round(snapshot.width / 65));
+  // target: canvas to draw on (defaults to the classic photo view's snapshot
+  // canvas; AR mode passes camFreeze instead). opts.bands: also fill a tall
+  // "spine band" behind each box, for the AR overlay (see arCapture).
+  function drawBoundingBoxes(checkedBooks, sentW, sentH, target = snapshot, opts = {}) {
+    const ctx = target.getContext('2d');
+    const sx  = target.width  / sentW;
+    const sy  = target.height / sentH;
+    const lw  = Math.max(2, Math.round(target.width / 450));
+    const fs  = Math.max(11, Math.round(target.width / 65));
 
     ctx.save();
     ctx.font         = `bold ${fs}px sans-serif`;
@@ -1602,16 +1745,46 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
 
     // Only flagged books (out of order or unverifiable) get a box — correct
     // books are left unmarked so the photo isn't cluttered with green boxes.
-    checkedBooks.forEach((book, i) => {
-      if (!book._bbox) return;
-      if (!book.outOfOrder && !book.unverifiable) return;
+    const flagged = checkedBooks.filter(b => b._bbox && (b.outOfOrder || b.unverifiable));
+
+    if (opts.bands) {
+      // Group by shelf row so each row's band top can be computed from its own
+      // sticker heights, then draw all bands first so boxes/badges sit on top.
+      const rows = new Map();
+      for (const book of flagged) {
+        const row = book.shelfRow ?? 0;
+        if (!rows.has(row)) rows.set(row, []);
+        rows.get(row).push(book);
+      }
+      for (const rowBooks of rows.values()) {
+        const bys = rowBooks.map(b => b._bbox[1]);
+        const bhs = rowBooks.map(b => b._bbox[3]).sort((a, b) => a - b);
+        const medBh = bhs[Math.floor(bhs.length / 2)];
+        const rowTop = Math.max(0, Math.min(...bys) - 6 * medBh);
+        for (const book of rowBooks) {
+          const [bx, by, bw, bh] = book._bbox;
+          const top    = Math.max(rowTop, by - 6 * bh);
+          const bottom = by + bh;
+          const color  = book.unverifiable ? '#facc15' : '#ef4444';
+          ctx.fillStyle   = color;
+          ctx.globalAlpha = 0.16;
+          ctx.fillRect(bx * sx, top * sy, bw * sx, (bottom - top) * sy);
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+
+    flagged.forEach((book) => {
+      const i = checkedBooks.indexOf(book);
       const [bx, by, bw, bh] = book._bbox;
       const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
       const color = book.unverifiable ? '#facc15' : '#ef4444';
 
       ctx.strokeStyle = color;
       ctx.lineWidth   = lw;
+      if (book._src === 'gemini-synth') ctx.setLineDash([6, 4]);
       ctx.strokeRect(cx, cy, cw, ch);
+      ctx.setLineDash([]);
 
       const num = String(i + 1);
       const tw  = ctx.measureText(num).width;
@@ -1626,72 +1799,98 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     ctx.restore();
   }
 
+  // Which photo/panel/pulse-box trio is currently on screen — the classic
+  // still-photo view, or the AR camera overlay. Kept as one flag so every
+  // helper below (highlightArrow, popBoxPulse, tap handlers) picks the right
+  // set of elements without threading extra params through every call site.
+  let arActive = false;
+  function activeCanvas()  { return arActive ? camFreeze : snapshot; }
+  function activeContainer() { return arActive ? cameraLive : photoArea; }
+  function activePanel()   { return arActive ? arSheet : document.getElementById('flaggedList'); }
+  function activePulseEl() { return arActive ? arBoxPulse : boxPulse; }
+
   // Highlight one book in the flagged list, and pop its box on the photo so
   // it's easy to find (works whether triggered by tapping the list or the photo).
   function highlightArrow(book) {
-    document.querySelectorAll('.flagged-item').forEach(r => r.classList.remove('active'));
+    activePanel().querySelectorAll('.flagged-item').forEach(r => r.classList.remove('active'));
     const row = _flaggedRowMap.get(book);
     if (row) { row.classList.add('active'); row.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
     popBoxPulse(book);
   }
 
-  const boxPulse = document.getElementById('boxPulse');
+  const boxPulse   = document.getElementById('boxPulse');
+  const arBoxPulse = document.getElementById('arBoxPulse');
   function popBoxPulse(book) {
+    const pulse = activePulseEl();
     if (!book?._bbox || !lastApiDims || (!book.outOfOrder && !book.unverifiable)) {
-      boxPulse.classList.remove('show');
+      pulse.classList.remove('show');
       return;
     }
+    const canvas = activeCanvas(), container = activeContainer();
     const [bx, by, bw, bh] = book._bbox;
-    const sRect = snapshot.getBoundingClientRect();
-    const pRect = photoArea.getBoundingClientRect();
-    const sx = sRect.width  / lastApiDims.sentW;
-    const sy = sRect.height / lastApiDims.sentH;
-    const left = (sRect.left - pRect.left) + bx * sx;
-    const top  = (sRect.top  - pRect.top)  + by * sy;
+    const cRect = canvas.getBoundingClientRect();
+    const pRect = container.getBoundingClientRect();
+    const sx = cRect.width  / lastApiDims.sentW;
+    const sy = cRect.height / lastApiDims.sentH;
+    const left = (cRect.left - pRect.left) + bx * sx;
+    const top  = (cRect.top  - pRect.top)  + by * sy;
 
-    boxPulse.style.color  = book.unverifiable ? '#facc15' : '#ef4444';
-    boxPulse.style.left   = `${left}px`;
-    boxPulse.style.top    = `${top}px`;
-    boxPulse.style.width  = `${bw * sx}px`;
-    boxPulse.style.height = `${bh * sy}px`;
+    pulse.style.color  = book.unverifiable ? '#facc15' : '#ef4444';
+    pulse.style.left   = `${left}px`;
+    pulse.style.top    = `${top}px`;
+    pulse.style.width  = `${bw * sx}px`;
+    pulse.style.height = `${bh * sy}px`;
 
     // Restart the CSS animation even if the same book is tapped again.
-    boxPulse.classList.remove('show');
-    void boxPulse.offsetWidth;
-    boxPulse.classList.add('show');
+    pulse.classList.remove('show');
+    void pulse.offsetWidth;
+    pulse.classList.add('show');
   }
 
   // ── Tap box to inspect ───────────────────────────────────────────────────
-  snapshot.addEventListener('click', e => {
-    if (!lastCheckedBooks.length || !lastApiDims) return;
-    const rect = snapshot.getBoundingClientRect();
-    const tapX = (e.clientX - rect.left) * (snapshot.width  / rect.width);
-    const tapY = (e.clientY - rect.top)  * (snapshot.height / rect.height);
-    const sx = snapshot.width  / lastApiDims.sentW;
-    const sy = snapshot.height / lastApiDims.sentH;
-
-    const hit = lastCheckedBooks.find(b => {
+  // canvasW/canvasH are the target canvas's internal pixel dimensions (its
+  // .width/.height, not its on-screen CSS size) — tapX/tapY must already be
+  // in that same space (see the click listeners below).
+  function hitTestBook(tapX, tapY, canvasW, canvasH) {
+    if (!lastCheckedBooks.length || !lastApiDims) return null;
+    const sx = canvasW / lastApiDims.sentW;
+    const sy = canvasH / lastApiDims.sentH;
+    return lastCheckedBooks.find(b => {
       if (!b._bbox) return false;
       const [bx, by, bw, bh] = b._bbox;
       return tapX >= bx * sx && tapX <= (bx + bw) * sx &&
              tapY >= by * sy && tapY <= (by + bh) * sy;
-    });
+    }) || null;
+  }
+
+  // Expand a flagged book's detail row within a given panel (scoped so the
+  // classic list and the AR sheet never interfere with each other).
+  function openBookDetail(book, panel) {
+    const row = _flaggedRowMap.get(book);
+    if (!row) return;
+    const detail = row.nextElementSibling;
+    if (detail?.classList.contains('flagged-item-detail')) {
+      panel.querySelectorAll('.flagged-item-detail').forEach(d => d.classList.remove('open'));
+      detail.classList.add('open');
+      row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+
+  function handleCanvasTap(canvas, e) {
+    const rect = canvas.getBoundingClientRect();
+    const tapX = (e.clientX - rect.left) * (canvas.width  / rect.width);
+    const tapY = (e.clientY - rect.top)  * (canvas.height / rect.height);
+    const hit = hitTestBook(tapX, tapY, canvas.width, canvas.height);
     if (hit) {
       highlightArrow(hit);
-      // Expand the detail row in the flagged list for this book (if flagged)
-      const row = _flaggedRowMap.get(hit);
-      if (row) {
-        const detail = row.nextElementSibling;
-        if (detail?.classList.contains('flagged-item-detail')) {
-          document.querySelectorAll('.flagged-item-detail').forEach(d => d.classList.remove('open'));
-          detail.classList.add('open');
-          row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        }
-      }
+      openBookDetail(hit, activePanel());
     } else {
-      boxPulse.classList.remove('show');
+      activePulseEl().classList.remove('show');
     }
-  });
+  }
+
+  snapshot.addEventListener('click', e => { if (!arActive) handleCanvasTap(snapshot, e); });
+  camFreeze.addEventListener('click', e => { if (arActive)  handleCanvasTap(camFreeze, e); });
 
   // ── Ordering logic (identical to shelfcheck/index.html) ──────────────────
   const SURNAME_PREFIXES = new Set([
@@ -1975,25 +2174,35 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     try { localStorage.setItem('shelfcheck.section', section); } catch {}
   }
 
-  function showResults(books, section) {
+  // opts.ar: render into the camera overlay (camFreeze + arSheet, with spine
+  // bands) instead of the classic still-photo view (snapshot + flaggedList).
+  function showResults(books, section, opts = {}) {
     const checked = checkOrder(books, section);
     lastCheckedBooks = checked;
+    const ar = !!opts.ar;
 
-    document.getElementById('resultsOverlay')?.remove();
-    actionBar.classList.remove('show');
+    if (!ar) {
+      document.getElementById('resultsOverlay')?.remove();
+      actionBar.classList.remove('show');
+      restoreCleanPhoto();   // redraw the clean photo before overlaying boxes
+    }
 
-    // Redraw the clean photo then overlay flagged boxes
-    restoreCleanPhoto();
-    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH);
+    const target = ar ? camFreeze : snapshot;
+    const panel  = ar ? arSheet   : document.getElementById('flaggedList');
+    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH, target, { bands: ar });
 
     const total    = checked.length;
     const outCount = checked.filter(b => b.outOfOrder).length;
     const unvCount = checked.filter(b => b.unverifiable).length;
 
-    if (total === 0) { showNoBooksBadge(); showFlaggedList([]); return; }
+    if (total === 0) {
+      if (!ar) showNoBooksBadge();
+      showFlaggedList([], panel);
+      return;
+    }
 
-    showSummaryBadge(total, outCount, unvCount);
-    showFlaggedList(checked);
+    if (!ar) showSummaryBadge(total, outCount, unvCount);
+    showFlaggedList(checked, panel);
   }
 
   function showNoBooksBadge() {
@@ -2016,8 +2225,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
     photoArea.appendChild(overlay);
   }
 
-  function showFlaggedList(checked) {
-    const panel = document.getElementById('flaggedList');
+  function showFlaggedList(checked, panel = document.getElementById('flaggedList')) {
     const flagged = checked.filter(b => b.outOfOrder || b.unverifiable);
     panel.innerHTML = '';
     _flaggedRowMap.clear();
