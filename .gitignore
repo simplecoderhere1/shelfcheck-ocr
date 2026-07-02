@@ -3,3 +3,13 @@ server/__pycache__/
 server/*.pyc
 server/.env
 *.DS_Store
+
+# Run artifacts
+backend.err
+backend.log
+*.log
+*.pid
+test_env/
+__pycache__/
+*.pyc
+.env
