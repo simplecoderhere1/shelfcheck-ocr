@@ -335,8 +335,12 @@
         <span>Debug Mode</span>
         <div class="settings-toggle" id="debugToggleSwitch"></div>
       </div>
+      <div class="settings-item" id="geminiToggle">
+        <span>AI cross-check (Gemini)</span>
+        <div class="settings-toggle" id="geminiToggleSwitch"></div>
+      </div>
       <div style="padding:10px 16px;border-top:1px solid #2c2c2c">
-        <div style="font-size:11px;color:#555;line-height:1.5">OCR via ocr.space Engine 2<br>through Cloudflare Worker proxy</div>
+        <div style="font-size:11px;color:#555;line-height:1.5">OCR via ocr.space + Gemini<br>through Cloudflare Worker proxies</div>
       </div>
     </div>
   </div>
@@ -416,6 +420,13 @@
   // Replace this URL with your own Worker URL after deploying worker/index.js.
   const WORKER_URL = 'https://shelfcheck-ocr-proxy.krish-sundareswar.workers.dev';
   const OCR_TIMEOUT_MS = 60000;
+
+  // Gemini is used as a pure text cross-checker (never asked for boxes — output
+  // tokens dominate vision-LLM latency, so bbox output would blow the time budget).
+  // Shared proxy worker from the sibling shelfcheck app; see README for fallback.
+  const GEMINI_URL = 'https://selfcheck-proxy.krish-sundareswar.workers.dev/';
+  const GEMINI_TIMEOUT_MS = 15000;
+  let geminiEnabled = (localStorage.getItem('shelfcheck.gemini') ?? '1') === '1';
 
   // ── State ────────────────────────────────────────────────────────────────
   const MAX_CANVAS_DIM = 4096;   // keep native resolution — nonfiction tiles need it
@@ -661,6 +672,124 @@
     return data;
   }
 
+  // ── Gemini cross-check (pure text; never asked for boxes — see note above) ─
+
+  // Convert a Blob to a base64 string (no data: prefix) for Gemini inline_data.
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result.split(',')[1]);
+      reader.onerror = () => reject(new Error('image read failed'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function buildGeminiPrompt(section) {
+    const orderNote = 'Order matters: within each shelf row, list the books strictly in left-to-right physical order. Do not skip spines; if a spine\'s sticker is unreadable, still emit an entry with null.';
+    if (section === 'nonfiction') {
+      return `This is a library NONFICTION shelf photo. There may be multiple shelves.
+Read every book spine left-to-right, top shelf first, then lower shelves.
+${orderNote}
+Return ONLY a JSON array of arrays, one per book spine.
+Each inner array has exactly 4 elements:
+0: full text on the white sticker at the bottom of the spine (e.g. "973.7 HAR", "KIN"), or null if unreadable.
+1: book title from the spine, or null if unreadable.
+2: 1 if you read the white sticker clearly, 0 if unsure.
+3: shelf row index — 0 for the top shelf, 1 for the second shelf from top, 2 for the third, etc.
+CRITICAL for element 0: read the sticker character-by-character exactly as printed. The cutter letters come from the AUTHOR'S last name, NOT from the title. Never infer or guess the cutter from the title — e.g. "The New Organic Grower" by Coleman has sticker "635.04 COL", not "635.04 THE". If you cannot read it clearly, return null.
+If a sticker is partially cut off by the edge of the image or another book, DO NOT guess the missing letters or numbers. Return null.
+Never copy a neighbor's label.
+IMPORTANT for element 2: return 1 ONLY if you can read every character of the sticker with certainty. If ANY character is unclear, blurry, shadowed, or you are guessing even one letter, return 0. A wrong sticker causes incorrect shelving flags — when in doubt, return 0.
+Example: [["973.7 HAR","Lincoln",1,0],["KIN","The Stand",1,0],["635.04 COL","New Organic Grower",1,1]]
+Example of unreadable or cropped sticker: [null, "Harry Potter", 0, 0]`;
+    }
+    return `This is a library FICTION shelf photo. There may be multiple shelves.
+Read every book spine left-to-right, top shelf first, then lower shelves.
+${orderNote}
+Return ONLY a JSON array of arrays, one per book spine.
+Each inner array has exactly 4 elements:
+0: full text on the white sticker at the bottom of the spine (e.g. "BLACK, Cara", "BLACK, Cara 5"), or null if unreadable.
+1: book title from the spine, or null if unreadable.
+2: 1 if you read the white sticker clearly, 0 if unsure.
+3: shelf row index — 0 for the top shelf, 1 for the second shelf from top, 2 for the third, etc.
+Rules: the white bottom sticker is the primary sort key — read it first. Return null and 0 for element 2 if you cannot read the sticker. Never copy a neighbor's text.
+If a sticker is partially cut off by the edge of the image or another book, DO NOT guess the missing letters or numbers. Return null.
+IMPORTANT for element 2: return 1 ONLY if you can read every character of the sticker with certainty. If ANY character is unclear, blurry, shadowed, or you are guessing even one letter, return 0. A wrong sticker causes incorrect shelving flags — when in doubt, return 0.
+Example: [["BLACK, Cara","Murder in Clichy",1,0],["KING, Stephen","The Stand",1,0],["ADAMS, Douglas","Hitchhiker",1,1]]
+Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
+  }
+
+  // Expand the 4-element wire format [spine_label, title, confidence, shelf_row].
+  function expandGeminiBook(arr) {
+    return {
+      spine_label: arr[0] ?? null,
+      title:       arr[1] ?? null,
+      confidence:  Number(arr[2]) === 1 ? 'high' : 'low',
+      shelfRow:    Number.isInteger(arr[3]) ? arr[3] : (typeof arr[3] === 'number' ? Math.round(arr[3]) : 0),
+    };
+  }
+
+  // Call Gemini as a pure text reader (image in, short JSON out, no boxes).
+  // Any failure (429, timeout, parse error) must be caught by the caller and
+  // treated as "no cross-check available" — this function throws freely.
+  async function callGeminiSpines(b64, section, externalSignal) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+    const onExternalAbort = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+    let res;
+    try {
+      res = await fetch(GEMINI_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          generationConfig: {
+            temperature: 0,
+            response_mime_type: 'application/json',
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+          contents: [{ parts: [
+            { text: buildGeminiPrompt(section) },
+            { inline_data: { mime_type: 'image/jpeg', data: b64 } },
+          ] }],
+        }),
+      });
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+    }
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      const err = new Error(`Gemini ${res.status}: ${t.slice(0, 200)}`);
+      err.status = res.status;
+      throw err;
+    }
+    const json = await res.json();
+    const cand = json.candidates?.[0];
+    if (!cand) throw new Error('Gemini returned no candidate');
+    if (cand.finishReason && cand.finishReason !== 'STOP') {
+      throw new Error(`Gemini stopped unexpectedly (${cand.finishReason})`);
+    }
+    const raw = (cand.content?.parts || []).map(p => p.text || '').join('');
+    if (!raw) throw new Error('Gemini returned no text');
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      try {
+        parsed = JSON.parse(raw.replace(/^```(json)?/, '').replace(/```$/, '').trim());
+      } catch {
+        throw new Error('could not parse Gemini output');
+      }
+    }
+    if (!Array.isArray(parsed)) throw new Error('unexpected Gemini output format');
+    return parsed.filter(Array.isArray).map(expandGeminiBook);
+  }
+
   // Extract text lines with bboxes from ocr.space TextOverlay.
   function parseOcrOverlay(data) {
     const lines = [];
@@ -861,36 +990,205 @@
     return out;
   }
 
+  // retained: parity-test extraction anchor (also no longer called directly —
+  // titles now come from Gemini — but the comment below is parity_check.mjs's
+  // end-of-slice marker, so both stay byte-identical).
   // Map a bbox from the 90°-CW rotated image back to original image coordinates.
   function mapBackRotated(rx, ry, rw, rh, origH) {
     return [ry, Math.max(0, origH - rx - rw), rh, rw];
   }
 
-  // Assign title fragments to the nearest label (port of server _attach_titles).
-  function attachTitlesJS(labels, titleCands) {
-    if (!labels.length) return;
-    const centers = labels.map(l => l.bbox[0] + l.bbox[2] / 2).sort((a, b) => a - b);
-    const gaps = centers.slice(1).map((c, i) => c - centers[i]).filter(g => g > 1);
-    const spacing = gaps.length ? gaps.sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : Infinity;
-    const maxDist = isFinite(spacing) ? spacing * 0.7 : Infinity;
-    const owned = new Map();
-    for (const tc of titleCands) {
-      const tx = tc.bbox[0] + tc.bbox[2] / 2;
-      let bestI = -1, bestDist = Infinity;
-      for (let i = 0; i < labels.length; i++) {
-        const dist = Math.abs((labels[i].bbox[0] + labels[i].bbox[2] / 2) - tx);
-        if (dist < bestDist) { bestDist = dist; bestI = i; }
-      }
-      if (bestI < 0 || bestDist > maxDist) continue;
-      if (!owned.has(bestI)) owned.set(bestI, []);
-      owned.get(bestI).push(tc);
-    }
-    for (const [i, frags] of owned) {
-      frags.sort((a, b) => a.bbox[1] - b.bbox[1]);
-      labels[i].title       = frags.map(f => f.text).join(' ');
-      labels[i].title_score = Math.min(...frags.map(f => f.score));
-    }
+  // ── Gemini fusion (pure; extracted by fusion_test.mjs) ──────────────────────
+  // Fuses Gemini's superior text reads onto ocr.space's precise word boxes.
+  // Any disagreement or Gemini-only find is demoted to score 0.6 (< the 0.65
+  // "high confidence" threshold in labelsToBooks), so a fusion mistake can only
+  // ever produce a yellow "check this" box, never a false red misshelving flag.
+
+  function fuseNorm(s) {
+    return String(s || '').toUpperCase().replace(/[^A-Z0-9. ]/g, ' ').replace(/\s+/g, ' ').trim();
   }
+
+  function fuseEditDist(a, b) {
+    const m = a.length, n = b.length;
+    const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        dp[i][j] = a[i - 1] === b[j - 1]
+          ? dp[i - 1][j - 1]
+          : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+    return dp[m][n];
+  }
+
+  function fuseParse(t) {
+    const numM = /\d{1,3}(?:\.\d+)?/.exec(t);
+    const num = numM ? numM[0] : null;
+    let cut = null;
+    if (num) {
+      const after = t.slice(numM.index + numM[0].length);
+      const cutM = /[A-Z]{2,}/.exec(after);
+      cut = cutM ? cutM[0] : null;
+    }
+    const surM = /[A-Z]{2,}/.exec(t);
+    const sur = surM ? surM[0] : null;
+    return { num, cut, sur };
+  }
+
+  function fuseSim(a, b) {
+    const A = fuseNorm(a), B = fuseNorm(b);
+    if (!A || !B) return 0;
+    if (A === B) return 1;
+    const pa = fuseParse(A), pb = fuseParse(B);
+    if (pa.num && pb.num) {
+      let s = 0;
+      if (pa.num === pb.num || pa.num.startsWith(pb.num) || pb.num.startsWith(pa.num)) s = 0.6;
+      else if (fuseEditDist(pa.num, pb.num) <= 1) s = 0.3;
+      else return 0;
+      if (pa.cut && pb.cut) {
+        if (pa.cut === pb.cut) s += 0.4;
+        else if (fuseEditDist(pa.cut, pb.cut) <= 1) s += 0.25;
+      }
+      return Math.min(1, s);
+    }
+    if (!pa.num && !pb.num) {
+      if (pa.sur && pa.sur === pb.sur) return 0.9;
+      if (pa.sur && pb.sur && fuseEditDist(pa.sur, pb.sur) <= 1) return 0.7;
+      if (pa.sur && pb.sur && pa.sur.length >= 5 && pb.sur.length >= 5 && fuseEditDist(pa.sur, pb.sur) <= 2) return 0.5;
+      return 0;
+    }
+    return 0;
+  }
+
+  // Needleman-Wunsch global alignment of two ordered sequences of texts.
+  function fuseAlignRow(oTexts, gTexts) {
+    const n = oTexts.length, m = gTexts.length;
+    const GAP = -0.05, MATCH_MIN = 0.5;
+    const S = Array.from({ length: n + 1 }, () => new Float64Array(m + 1));
+    for (let i = 1; i <= n; i++) S[i][0] = i * GAP;
+    for (let j = 1; j <= m; j++) S[0][j] = j * GAP;
+    const simCache = Array.from({ length: n }, () => new Float64Array(m));
+    for (let i = 0; i < n; i++) for (let j = 0; j < m; j++) simCache[i][j] = fuseSim(oTexts[i], gTexts[j]);
+    for (let i = 1; i <= n; i++) {
+      for (let j = 1; j <= m; j++) {
+        const sim = simCache[i - 1][j - 1];
+        const diag = sim >= MATCH_MIN ? S[i - 1][j - 1] + sim : -Infinity;
+        S[i][j] = Math.max(diag, S[i - 1][j] + GAP, S[i][j - 1] + GAP);
+      }
+    }
+    const pairs = [], oOnly = [], gOnly = [];
+    let i = n, j = m;
+    while (i > 0 || j > 0) {
+      const sim = (i > 0 && j > 0) ? simCache[i - 1][j - 1] : -1;
+      const diag = (i > 0 && j > 0 && sim >= MATCH_MIN) ? S[i - 1][j - 1] + sim : -Infinity;
+      if (i > 0 && j > 0 && S[i][j] === diag) {
+        pairs.push([i - 1, j - 1]); i--; j--;
+      } else if (i > 0 && S[i][j] === S[i - 1][j] + GAP) {
+        oOnly.push(i - 1); i--;
+      } else {
+        gOnly.push(j - 1); j--;
+      }
+    }
+    pairs.reverse(); oOnly.reverse(); gOnly.reverse();
+    return { pairs, oOnly, gOnly };
+  }
+
+  // Fuse ocr.space labels (geometry) with Gemini books (text) into a new
+  // labels array in the same shape runOcr already produces.
+  function fuseLabels(ocrLabels, gemBooks, imgW, imgH) {
+    const rowH = Math.max(1, Math.round(imgH * 0.10));
+    const withRow = ocrLabels.map(l => ({ ...l, _frow: Math.round((l.bbox[1] + l.bbox[3] / 2) / rowH) }));
+    const rowOrder = [...new Set(withRow.map(l => l._frow))].sort((a, b) => a - b);
+    const rowMap = new Map(rowOrder.map((r, i) => [r, i]));
+    for (const l of withRow) l._frow = rowMap.get(l._frow);
+
+    const oRowCount = rowOrder.length;
+    const gRowCount = gemBooks.length ? 1 + Math.max(...gemBooks.map(b => b.shelfRow || 0)) : 0;
+
+    const rows = [];
+    if (oRowCount !== gRowCount) {
+      // Flatten: one global alignment when row bucketing disagrees.
+      const O = withRow.slice().sort((a, b) => a._frow - b._frow || a.bbox[0] - b.bbox[0]);
+      const G = gemBooks.slice();
+      rows.push({ O, G });
+    } else {
+      for (let r = 0; r < oRowCount; r++) {
+        const O = withRow.filter(l => l._frow === r).sort((a, b) => a.bbox[0] - b.bbox[0]);
+        const G = gemBooks.filter(b => (b.shelfRow || 0) === r);
+        rows.push({ O, G });
+      }
+    }
+
+    const fused = [];
+    for (const { O, G } of rows) {
+      if (!O.length && !G.length) continue;
+      const oTexts = O.map(l => l.text);
+      const gTexts = G.map(g => g.spine_label || '');
+      const { pairs, oOnly, gOnly } = fuseAlignRow(oTexts, gTexts);
+
+      const rowOut = [];
+      const matchedGIdx = new Set();
+      for (const [oi, gi] of pairs) {
+        const o = O[oi], g = G[gi];
+        matchedGIdx.add(gi);
+        let text, score, src;
+        if (fuseNorm(o.text) === fuseNorm(g.spine_label)) {
+          text = o.text; score = 0.95; src = 'both';
+        } else if (g.confidence === 'high') {
+          text = g.spine_label; score = 0.9; src = 'gemini';
+        } else {
+          text = o.text; score = 0.6; src = 'ocr?';
+        }
+        rowOut.push({
+          text, bbox: o.bbox, score, src,
+          title: g.title || null,
+          title_score: g.confidence === 'high' ? 0.9 : 0.5,
+        });
+      }
+      for (const oi of oOnly) {
+        const o = O[oi];
+        rowOut.push({ text: o.text, bbox: o.bbox, score: 0.6, src: 'ocr-only', title: null, title_score: null });
+      }
+
+      // Gemini-only spines: only synthesize when confident and the row has
+      // enough matched anchors to place them geometrically.
+      if (gOnly.length && pairs.length >= 2) {
+        const matchedByGPos = pairs.map(([oi, gi]) => ({ gi, cx: O[oi].bbox[0] + O[oi].bbox[2] / 2 })).sort((a, b) => a.gi - b.gi);
+        const ws = pairs.map(([oi]) => O[oi].bbox[2]);
+        const hs = pairs.map(([oi]) => O[oi].bbox[3]);
+        const ys = pairs.map(([oi]) => O[oi].bbox[1]);
+        const medW = ws.slice().sort((a, b) => a - b)[Math.floor(ws.length / 2)];
+        const medH = hs.slice().sort((a, b) => a - b)[Math.floor(hs.length / 2)];
+        const medY = ys.slice().sort((a, b) => a - b)[Math.floor(ys.length / 2)];
+        const gaps = matchedByGPos.slice(1).map((p, i) => p.cx - matchedByGPos[i].cx).filter(g => g > 1);
+        const medGap = gaps.length ? gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : medW * 1.5;
+
+        for (const gi of gOnly) {
+          const g = G[gi];
+          if (!g.spine_label || g.confidence !== 'high') continue;
+          let left = null, right = null;
+          for (const p of matchedByGPos) { if (p.gi < gi) left = p; if (p.gi > gi && !right) right = p; }
+          let cx;
+          if (left && right) cx = left.cx + (right.cx - left.cx) * (gi - left.gi) / (right.gi - left.gi);
+          else if (left) cx = left.cx + medGap * (gi - left.gi);
+          else if (right) cx = right.cx - medGap * (right.gi - gi);
+          else continue;
+          if (rowOut.some(o => Math.abs((o.bbox[0] + o.bbox[2] / 2) - cx) < medW / 2)) continue;
+          const bx = Math.max(0, Math.min(imgW - medW, cx - medW / 2));
+          rowOut.push({
+            text: g.spine_label, bbox: [bx, medY, medW, medH], score: 0.7, src: 'gemini-synth', synthBox: true,
+            title: g.title || null, title_score: 0.9,
+          });
+        }
+      }
+
+      rowOut.sort((a, b) => a.bbox[0] - b.bbox[0]);
+      fused.push(...rowOut);
+    }
+    return fused;
+  }
+  // ── End Gemini fusion ────────────────────────────────────────────────────
 
   // Build full-resolution left/right tile blobs for nonfiction OCR.
   // Sticker text is tiny; sending native-resolution halves instead of one
@@ -921,23 +1219,6 @@
       tiles.push({ blob, xoff: c.x });
     }
     return { tiles, canvas: full };
-  }
-
-  // Build the rotated blob and canvas (90° CW) from the encoded original.
-  function makeRotatedBlob(encoded, quality = 0.85) {
-    const { canvas: origCanvas, sentW, sentH } = encoded;
-    const rotCanvas = document.createElement('canvas');
-    rotCanvas.width = sentH; rotCanvas.height = sentW;
-    const ctx = rotCanvas.getContext('2d');
-    ctx.translate(sentH, 0);
-    ctx.rotate(Math.PI / 2);
-    ctx.drawImage(origCanvas, 0, 0);
-    return new Promise((resolve, reject) => {
-      rotCanvas.toBlob(blob => {
-        if (!blob) { reject(new Error('rotated image encoding failed')); return; }
-        resolve({ blob, canvas: rotCanvas });
-      }, 'image/jpeg', quality);
-    });
   }
 
   // Returns true if any two labels share the same primary sort key and therefore
@@ -1020,14 +1301,14 @@
   // Calls onCall1Done() between the two proxy calls so the UI can advance stages.
   async function runOcr(encoded, signal, onCall1Done) {
     const t0 = performance.now();
-    const MIN_BOX_W = 8;
     const section = getSection();
 
-    // Fire all OCR calls in parallel so total latency is one round-trip.
-    // The rotated call (titles) may end up unused; its failure is non-fatal.
-    const call2P = makeRotatedBlob(encoded)
-      .then(({ blob, canvas }) => callOcrProxy(blob, signal).then(data => ({ data, canvas })))
-      .catch(() => null);
+    // Gemini cross-check also fires immediately, in parallel with everything
+    // else. Any failure (429, timeout, bad JSON) degrades to null — the whole
+    // pipeline then behaves exactly as it did before Gemini existed.
+    const geminiP = geminiEnabled
+      ? blobToBase64(encoded.blob).then(b64 => callGeminiSpines(b64, section, signal)).catch(() => null)
+      : Promise.resolve(null);
 
     let labels, imgW, imgH;
     if (section === 'fiction') {
@@ -1054,6 +1335,11 @@
       imgW = fullCanvas.width; imgH = fullCanvas.height;
     }
 
+    // Fuse Gemini's text reads onto the ocr.space boxes before anything else
+    // (tie-checking, titles, ordering) touches the labels.
+    const gem = await geminiP;
+    if (gem && gem.length) labels = fuseLabels(labels, gem, imgW, imgH);
+
     // Only use Call 2 (titles + OL verification) when two or more labels share
     // the same primary sort key and genuinely need a title to break the tie.
     // Use auto-detected section for the tie check so we get the right key type.
@@ -1063,31 +1349,13 @@
 
     if (onCall1Done) onCall1Done();
 
-    if (needsTitles) {
-      const call2 = await call2P;   // already in flight; null if it failed
-      if (call2) {
-        const rotCtx = call2.canvas.getContext('2d');
-        const lines2 = parseOcrOverlay(call2.data);
-
-        // Rotated call is in encoded (downscaled) space; scale boxes up to the
-        // label coordinate space (full resolution when tiling was used).
-        const s = imgW / encoded.sentW;
-        const titleCands = [];
-        for (const ln of lines2) {
-          const [rx, ry, rw, rh] = ln.bbox;
-          if (rw < MIN_BOX_W) continue;
-          if (rw < rh * 0.75) continue;
-          if (hasWhiteBg(rotCtx, rx, ry, rw, rh)) continue;
-          const m = mapBackRotated(rx, ry, rw, rh, encoded.sentH);
-          titleCands.push({ ...ln, bbox: [m[0] * s, m[1] * s, m[2] * s, m[3] * s] });
-        }
-
-        attachTitlesJS(labels, titleCands);
-
-        // Verify titles against Open Library; clears unrecognised OCR text so it
-        // doesn't corrupt tiebreaking.
-        await verifyTitlesOpenLibrary(labels, tieSect, signal);
-      }
+    // Titles now come from Gemini (fused above) instead of a separate rotated
+    // ocr.space call. Only verify against Open Library when a tie genuinely
+    // needs a title to break it — cheap, parallel, ties only. If Gemini didn't
+    // run or found no titles, this simply no-ops and tied books fall into the
+    // existing tiedSlots handling (any order within a tie group is OK).
+    if (needsTitles && labels.some(l => l.title)) {
+      await verifyTitlesOpenLibrary(labels, tieSect, signal);
     }
 
     // Assign shelfRow (port of server-side sort + bucket_map logic)
@@ -1113,6 +1381,7 @@
         title:          l.title          || null,
         title_score:    l.title_score    || null,
         title_verified: l.title_verified ?? false,
+        src:            l.src            || 'ocr',
       })),
       ms: Math.round(performance.now() - t0),
       imageSize: [imgW, imgH],
@@ -1131,11 +1400,12 @@
       _bbox:          label.bbox,
       _score:         label.score,
       _title_score:   label.title_score || null,
+      _src:           label.src || 'ocr',
     }));
   }
 
   // ── Loading stages ────────────────────────────────────────────────────────
-  const LOADING_STAGES = ['Compressing image', 'Reading labels', 'Reading & verifying titles', 'Checking order'];
+  const LOADING_STAGES = ['Compressing image', 'Reading labels', 'AI cross-check', 'Checking order'];
   let _currentStage = -1;
 
   function _dotsHtml() { return '<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span>'; }
@@ -1759,6 +2029,16 @@
       badge.id = 'debugBadge'; badge.className = 'debug-badge'; badge.textContent = 'DEBUG';
       document.querySelector('.header').appendChild(badge);
     }
+    settingsMenu.classList.remove('show');
+  });
+
+  const geminiToggle = document.getElementById('geminiToggle');
+  const geminiSwitch  = document.getElementById('geminiToggleSwitch');
+  geminiSwitch.classList.toggle('on', geminiEnabled);
+  geminiToggle.addEventListener('click', () => {
+    geminiEnabled = !geminiEnabled;
+    localStorage.setItem('shelfcheck.gemini', geminiEnabled ? '1' : '0');
+    geminiSwitch.classList.toggle('on', geminiEnabled);
     settingsMenu.classList.remove('show');
   });
 
