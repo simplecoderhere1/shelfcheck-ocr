@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#1c1c1c">
   <title>ShelfCheck</title>
+  <!-- Warm up connections to both OCR proxies during page load, so the TLS/DNS
+       handshake doesn't sit on the critical path of the first Analyze tap. -->
+  <link rel="preconnect" href="https://shelfcheck-ocr-proxy.krish-sundareswar.workers.dev">
+  <link rel="preconnect" href="https://selfcheck-proxy.krish-sundareswar.workers.dev">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html { height: 100%; }
@@ -443,11 +447,13 @@
   // Shared proxy worker from the sibling shelfcheck app; see README for fallback.
   const GEMINI_URL = 'https://selfcheck-proxy.krish-sundareswar.workers.dev/';
   const GEMINI_TIMEOUT_MS = 15000;
+  const OL_TIMEOUT_MS = 4000;   // Open Library is third-party; never let one slow request stall analysis
   let geminiEnabled = (localStorage.getItem('shelfcheck.gemini') ?? '1') === '1';
 
   // ── State ────────────────────────────────────────────────────────────────
   const MAX_CANVAS_DIM = 4096;   // keep native resolution — nonfiction tiles need it
   let pendingEncode    = null;   // Promise<{blob, sentW, sentH}> — pre-encodes while user reads photo
+  let pendingTiles      = null;  // Promise<{tiles, canvas}> — pre-encoded nonfiction tiles, same idea
   let lastRawBooks     = null;
   let lastCheckedBooks = [];
   let lastApiDims      = null;   // {sentW, sentH} of the image sent to OCR
@@ -493,6 +499,7 @@
       actionBar.classList.add('show');
       analyzeBtn.disabled = false;
       pendingEncode = encodeForOCR();
+      pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
@@ -511,6 +518,7 @@
     photoInput.value  = '';
     uploadInput.value = '';
     pendingEncode    = null;
+    pendingTiles     = null;
     _cleanPhotoData  = null;
     lastApiDims      = null;
     lastRawBooks     = null;
@@ -601,6 +609,7 @@
     actionBar.classList.add('show');
     analyzeBtn.disabled = false;
     pendingEncode = encodeForOCR();
+    pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
   }
 
   // Pinch-to-zoom
@@ -1223,8 +1232,9 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
       { x: 0,                      w: Math.floor(W / 2) + ov },
       { x: Math.floor(W / 2) - ov, w: W - (Math.floor(W / 2) - ov) },
     ];
-    const tiles = [];
-    for (const c of cuts) {
+    // Encode both tiles concurrently — they're independent canvases, and this
+    // roughly halves the wall-clock cost of the quality-stepping loop below.
+    const tiles = await Promise.all(cuts.map(async c => {
       const t = document.createElement('canvas');
       t.width = c.w; t.height = H;
       t.getContext('2d').drawImage(full, c.x, 0, c.w, H, 0, 0, c.w, H);
@@ -1234,8 +1244,8 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
         if (blob && blob.size <= 1_000_000) break;
       }
       if (!blob) throw new Error('tile encoding failed');
-      tiles.push({ blob, xoff: c.x });
-    }
+      return { blob, xoff: c.x };
+    }));
     return { tiles, canvas: full };
   }
 
@@ -1298,9 +1308,20 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
         const p = parseSurnameAndFirst(lbl.text);
         if (p?.surname) params.set('author', p.surname);
       }
+      // Open Library is a third-party API with no SLA — a single slow request
+      // must never be able to hang the whole analysis. Bound each call and
+      // treat a timeout exactly like a network error: keep the raw title but
+      // mark it unverified rather than block.
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), OL_TIMEOUT_MS);
+      const onAbort = () => ctrl.abort();
+      if (signal) {
+        if (signal.aborted) ctrl.abort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
       try {
         const res = await fetch(`https://openlibrary.org/search.json?${params}`,
-          { signal, headers: { 'Accept': 'application/json' } });
+          { signal: ctrl.signal, headers: { 'Accept': 'application/json' } });
         const data = await res.json();
         if (data.numFound > 0 && data.docs[0]?.title) {
           lbl.title          = data.docs[0].title;
@@ -1310,7 +1331,10 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
           lbl.title_verified = false;
         }
       } catch {
-        lbl.title_verified = false;  // network error — keep raw title but unverified
+        lbl.title_verified = false;  // network error or timeout — keep raw title but unverified
+      } finally {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
       }
     }));
   }
@@ -1336,7 +1360,10 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
       imgW = encoded.sentW; imgH = encoded.sentH;
     } else {
       // Nonfiction stickers are tiny; OCR native-resolution L/R tiles.
-      const { tiles, canvas: fullCanvas } = await encodeTilesForOCR();
+      // Reuse the speculative pre-encode started at capture time if present —
+      // same idea as pendingEncode, hides this cost behind photo-review time.
+      const { tiles, canvas: fullCanvas } = await (pendingTiles ?? encodeTilesForOCR());
+      pendingTiles = null;
       const datas = await Promise.all(tiles.map(t => callOcrProxy(t.blob, signal)));
       const words = [];
       datas.forEach((d, i) => {
@@ -1423,7 +1450,10 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, 0]`;
   }
 
   // ── Loading stages ────────────────────────────────────────────────────────
-  const LOADING_STAGES = ['Compressing image', 'Reading labels', 'AI cross-check', 'Checking order'];
+  // Stage 1 covers ocr.space AND the parallel Gemini cross-check together (they
+  // run concurrently). Stage 2 is Open Library title verification, which only
+  // runs for tied labels and is now hard-capped at OL_TIMEOUT_MS per request.
+  const LOADING_STAGES = ['Compressing image', 'Reading & cross-checking labels', 'Verifying titles', 'Checking order'];
   let _currentStage = -1;
 
   function _dotsHtml() { return '<span class="anim-dots"><span>.</span><span>.</span><span>.</span></span>'; }
