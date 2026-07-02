@@ -418,7 +418,7 @@
   const OCR_TIMEOUT_MS = 60000;
 
   // ── State ────────────────────────────────────────────────────────────────
-  const MAX_CANVAS_DIM = 3000;
+  const MAX_CANVAS_DIM = 4096;   // keep native resolution — nonfiction tiles need it
   let pendingEncode    = null;   // Promise<{blob, sentW, sentH}> — pre-encodes while user reads photo
   let lastRawBooks     = null;
   let lastCheckedBooks = [];
@@ -682,19 +682,183 @@
     return lines;
   }
 
-  // Sample canvas pixels to determine if a region has a predominantly white background.
-  function hasWhiteBg(ctx, x, y, w, h, thresh = 175, ratio = 0.55) {
+  // Fraction of pixels in a region whose luminance is >= thresh (0..1).
+  function lightRatio(ctx, x, y, w, h, thresh = 150) {
     const cw = ctx.canvas.width, ch = ctx.canvas.height;
     x = Math.max(0, Math.round(x)); y = Math.max(0, Math.round(y));
     w = Math.min(cw - x, Math.max(1, Math.round(w)));
     h = Math.min(ch - y, Math.max(1, Math.round(h)));
-    if (w <= 0 || h <= 0) return false;
+    if (w <= 0 || h <= 0) return 0;
     const px = ctx.getImageData(x, y, w, h).data;
-    let white = 0;
+    let light = 0;
     for (let i = 0; i < px.length; i += 4) {
-      if (0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2] >= thresh) white++;
+      if (0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2] >= thresh) light++;
     }
-    return (white / (w * h)) >= ratio;
+    return light / (w * h);
+  }
+
+  // Sample canvas pixels to determine if a region has a predominantly white background.
+  function hasWhiteBg(ctx, x, y, w, h, thresh = 150, ratio = 0.55) {
+    return lightRatio(ctx, x, y, w, h, thresh) >= ratio;
+  }
+
+  // Extract individual words with bboxes from ocr.space TextOverlay.
+  function parseOcrWords(data) {
+    const words = [];
+    for (const parsed of (data.ParsedResults || [])) {
+      for (const line of (parsed.TextOverlay?.Lines || [])) {
+        for (const w of (line.Words || [])) {
+          const t = (w.WordText || '').trim();
+          if (t) words.push({ t, x: w.Left, y: w.Top, w: w.Width, h: w.Height });
+        }
+      }
+    }
+    return words;
+  }
+
+  // ── Label reconstruction ──────────────────────────────────────────────────
+  // Nonfiction spine stickers are vertical stacks of tiny horizontal words:
+  //   635 / .04 / CAR  (number anchor, optional decimal, cutter).
+  // Book-title words on spines are much larger, so sticker words are found by
+  // size, then assembled by vertical adjacency + x-alignment with a number.
+  const RX_NUM_FULL = /^\d{3}\.\d+$/;
+  const RX_NUM3     = /^\d{3}$/;
+  const RX_DEC      = /^[.,](\d+)$/;
+  const RX_CUTTER   = /^[A-Za-z]{2,4}$/;
+
+  function reconstructNonfiction(words, ctx) {
+    const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
+    const maxH = maxDim * 0.022;                       // sticker text is tiny
+    const small = words.filter(w => w.h <= maxH && w.w >= w.h * 0.6);
+    const anchors = small.filter(w => RX_NUM_FULL.test(w.t) || RX_NUM3.test(w.t));
+
+    const used = new Set();
+    const labels = [];
+    for (const a of anchors) {
+      const axc = a.x + a.w / 2;
+      let num = a.t;
+      const parts = [a];
+      let curBottom = a.y + a.h;
+
+      // decimal continuation directly below a bare NNN anchor
+      if (RX_NUM3.test(a.t)) {
+        for (const w of small) {
+          if (used.has(w) || w === a) continue;
+          const m = RX_DEC.exec(w.t);
+          if (!m) continue;
+          const wxc = w.x + w.w / 2;
+          if (Math.abs(wxc - axc) <= a.w * 1.2 && w.y - curBottom >= 0 && w.y - curBottom <= a.h * 2.5) {
+            num = a.t + '.' + m[1];
+            parts.push(w); used.add(w);
+            curBottom = w.y + w.h;
+            break;
+          }
+        }
+      }
+
+      // nearest cutter below the number
+      let best = null;
+      for (const w of small) {
+        if (used.has(w) || w === a) continue;
+        if (!RX_CUTTER.test(w.t)) continue;
+        const wxc = w.x + w.w / 2;
+        const dy = w.y - curBottom;
+        if (Math.abs(wxc - axc) <= Math.max(a.w, w.w) * 1.2 && dy >= -a.h * 0.5 && dy <= a.h * 3.0) {
+          if (!best || dy < best.dy) best = { dy, w };
+        }
+      }
+      let cutter = null;
+      if (best) { cutter = best.w.t.toUpperCase(); parts.push(best.w); used.add(best.w); }
+
+      // sticker union box must sit on a light background
+      const ux = Math.min(...parts.map(p => p.x)),  uy = Math.min(...parts.map(p => p.y));
+      const ur = Math.max(...parts.map(p => p.x + p.w)), ub = Math.max(...parts.map(p => p.y + p.h));
+      if (lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8) < 0.30) continue;
+
+      labels.push({ text: num + (cutter ? ' ' + cutter : ''), num, cut: cutter,
+                    bbox: [ux, uy, ur - ux, ub - uy], score: 0.9 });
+    }
+
+    // Consensus repair: books shelved together share a class number, and OCR
+    // truncates the decimal on some stickers.  Upgrade number X to the most
+    // common LONGER number Y that X is a prefix of, but only when Y was read
+    // in full at least twice AND more often than X (so one misread can't
+    // corrupt the shelf).
+    const counts = new Map();
+    for (const l of labels) counts.set(l.num, (counts.get(l.num) || 0) + 1);
+    for (const l of labels) {
+      const n = l.num;
+      let best = null;
+      for (const [y, c] of counts) {
+        if (y === n || !y.startsWith(n) || y.length <= n.length) continue;
+        if (c < 2 || c <= counts.get(n)) continue;
+        if (!best || c > best.c || (c === best.c && y.length > best.y.length)) best = { c, y };
+      }
+      if (best) {
+        l.num = best.y;
+        l.text = best.y + (l.cut ? ' ' + l.cut : '');
+      }
+    }
+
+    // Bare numbers without a cutter can't be ordered — drop as noise.
+    return labels.filter(l => l.cut);
+  }
+
+  // Fiction stickers are 2–3 stacked short lines: SURNAME / First (or VON /
+  // SURNAME / First).  Cluster sticker-like lines by x-overlap + vertical
+  // adjacency, join top-to-bottom.
+  function reconstructFiction(lines, ctx) {
+    const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
+    const maxH = maxDim * 0.025;
+    const cand = lines.filter(ln => {
+      const [x, y, w, h] = ln.bbox;
+      if (h > maxH || w < h * 0.75) return false;
+      return lightRatio(ctx, x - 4, y - 4, w + 8, h + 8) >= 0.35;
+    });
+
+    const n = cand.length;
+    const parent = Array.from({ length: n }, (_, i) => i);
+    const find = i => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+    const union = (i, j) => { const ri = find(i), rj = find(j); if (ri !== rj) parent[rj] = ri; };
+
+    const xOverlap = (a, b) => {
+      const [ax,, aw] = a.bbox, [bx,, bw] = b.bbox;
+      const ov = Math.min(ax + aw, bx + bw) - Math.max(ax, bx);
+      return ov / Math.max(1, Math.min(aw, bw));
+    };
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (xOverlap(cand[i], cand[j]) < 0.4) continue;
+        const [, ay,, ah] = cand[i].bbox, [, by,, bh] = cand[j].bbox;
+        const gap = Math.max(ay, by) - Math.min(ay + ah, by + bh);
+        if (gap <= Math.max(ah, bh) * 1.2) union(i, j);
+      }
+    }
+
+    const groups = new Map();
+    for (let i = 0; i < n; i++) {
+      const r = find(i);
+      if (!groups.has(r)) groups.set(r, []);
+      groups.get(r).push(cand[i]);
+    }
+
+    const out = [];
+    for (const g of groups.values()) {
+      g.sort((a, b) => a.bbox[1] - b.bbox[1]);
+      const text = g.map(l => l.text).join(' ');
+      const first = (text.trim().split(/[\s,.]+/)[0] || '');
+      const alpha = first.replace(/[^A-Za-z]/g, '');
+      if (alpha.length < 3) continue;
+      let upp = 0;
+      for (const c of alpha) if (c >= 'A' && c <= 'Z') upp++;
+      if (upp / alpha.length < 0.6) continue;
+      const ux = Math.min(...g.map(l => l.bbox[0]));
+      const uy = Math.min(...g.map(l => l.bbox[1]));
+      const ur = Math.max(...g.map(l => l.bbox[0] + l.bbox[2]));
+      const ub = Math.max(...g.map(l => l.bbox[1] + l.bbox[3]));
+      out.push({ text, bbox: [ux, uy, ur - ux, ub - uy], score: 0.9 });
+    }
+    return out;
   }
 
   // Map a bbox from the 90°-CW rotated image back to original image coordinates.
@@ -726,6 +890,37 @@
       labels[i].title       = frags.map(f => f.text).join(' ');
       labels[i].title_score = Math.min(...frags.map(f => f.score));
     }
+  }
+
+  // Build full-resolution left/right tile blobs for nonfiction OCR.
+  // Sticker text is tiny; sending native-resolution halves instead of one
+  // downscaled frame nearly doubles the pixels per sticker.
+  async function encodeTilesForOCR() {
+    const W = snapshot.width, H = snapshot.height;
+    const full = document.createElement('canvas');
+    full.width = W; full.height = H;
+    const fctx = full.getContext('2d');
+    fctx.filter = 'contrast(1.08) saturate(1.05)';
+    fctx.drawImage(snapshot, 0, 0);
+    const ov = Math.round(W * 0.05);
+    const cuts = [
+      { x: 0,                      w: Math.floor(W / 2) + ov },
+      { x: Math.floor(W / 2) - ov, w: W - (Math.floor(W / 2) - ov) },
+    ];
+    const tiles = [];
+    for (const c of cuts) {
+      const t = document.createElement('canvas');
+      t.width = c.w; t.height = H;
+      t.getContext('2d').drawImage(full, c.x, 0, c.w, H, 0, 0, c.w, H);
+      let blob = null;
+      for (const q of [0.85, 0.8, 0.75, 0.7, 0.6]) {
+        blob = await new Promise(r => t.toBlob(r, 'image/jpeg', q));
+        if (blob && blob.size <= 1_000_000) break;
+      }
+      if (!blob) throw new Error('tile encoding failed');
+      tiles.push({ blob, xoff: c.x });
+    }
+    return { tiles, canvas: full };
   }
 
   // Build the rotated blob and canvas (90° CW) from the encoded original.
@@ -825,80 +1020,78 @@
   // Calls onCall1Done() between the two proxy calls so the UI can advance stages.
   async function runOcr(encoded, signal, onCall1Done) {
     const t0 = performance.now();
-    const origH = encoded.sentH;
-    const origCtx = encoded.canvas.getContext('2d');
     const MIN_BOX_W = 8;
+    const section = getSection();
 
-    // Call 1: original image → label stickers (horizontal, white background)
-    const data1 = await callOcrProxy(encoded.blob, signal);
-    const lines1 = parseOcrOverlay(data1);
+    // Fire all OCR calls in parallel so total latency is one round-trip.
+    // The rotated call (titles) may end up unused; its failure is non-fatal.
+    const call2P = makeRotatedBlob(encoded)
+      .then(({ blob, canvas }) => callOcrProxy(blob, signal).then(data => ({ data, canvas })))
+      .catch(() => null);
 
-    const labels = [];
-    for (const ln of lines1) {
-      const [x, y, w, h] = ln.bbox;
-      if (w < MIN_BOX_W) continue;
-      if (w < h * 0.75) continue;
-      if (!hasWhiteBg(origCtx, x, y, w, h)) continue;
-      labels.push({ ...ln });
-    }
-
-    // Merge label fragments from the same physical sticker that ocr.space split
-    // across multiple overlay lines (e.g. "641.56" and "SAL" as separate entries).
-    if (labels.length > 1) {
-      labels.sort((a, b) => (a.bbox[0] + a.bbox[2]/2) - (b.bbox[0] + b.bbox[2]/2));
-      const merged = [labels[0]];
-      for (let i = 1; i < labels.length; i++) {
-        const prev = merged[merged.length - 1];
-        const prevCX = prev.bbox[0] + prev.bbox[2]/2;
-        const curCX  = labels[i].bbox[0] + labels[i].bbox[2]/2;
-        const gap    = Math.max(prev.bbox[2], labels[i].bbox[2]) * 0.55;
-        if (Math.abs(curCX - prevCX) < gap) {
-          const [x1,y1,w1,h1] = prev.bbox, [x2,y2,w2,h2] = labels[i].bbox;
-          const nx = Math.min(x1,x2), ny = Math.min(y1,y2);
-          merged[merged.length - 1] = {
-            text:  prev.text + ' ' + labels[i].text,
-            score: Math.max(prev.score, labels[i].score),
-            bbox:  [nx, ny, Math.max(x1+w1,x2+w2)-nx, Math.max(y1+h1,y2+h2)-ny],
-          };
-        } else { merged.push(labels[i]); }
+    let labels, imgW, imgH;
+    if (section === 'fiction') {
+      // Fiction stickers are large; one downscaled frame reads them fine.
+      const data1 = await callOcrProxy(encoded.blob, signal);
+      labels = reconstructFiction(parseOcrOverlay(data1), encoded.canvas.getContext('2d'));
+      imgW = encoded.sentW; imgH = encoded.sentH;
+    } else {
+      // Nonfiction stickers are tiny; OCR native-resolution L/R tiles.
+      const { tiles, canvas: fullCanvas } = await encodeTilesForOCR();
+      const datas = await Promise.all(tiles.map(t => callOcrProxy(t.blob, signal)));
+      const words = [];
+      datas.forEach((d, i) => {
+        for (const w of parseOcrWords(d)) { w.x += tiles[i].xoff; words.push(w); }
+      });
+      // Drop duplicate reads from the tile overlap zone.
+      const dedup = [];
+      for (const w of words) {
+        if (!dedup.some(s => s.t === w.t && Math.abs(s.x - w.x) < 12 && Math.abs(s.y - w.y) < 12)) {
+          dedup.push(w);
+        }
       }
-      labels.length = 0; labels.push(...merged);
+      labels = reconstructNonfiction(dedup, fullCanvas.getContext('2d'));
+      imgW = fullCanvas.width; imgH = fullCanvas.height;
     }
 
-    // Only run Call 2 (titles + OL verification) when two or more labels share
+    // Only use Call 2 (titles + OL verification) when two or more labels share
     // the same primary sort key and genuinely need a title to break the tie.
     // Use auto-detected section for the tie check so we get the right key type.
     const rawBooks = labels.map(l => ({ spine_label: l.text }));
-    const tieSect = autoDetectSection(rawBooks) || getSection();
+    const tieSect = autoDetectSection(rawBooks) || section;
     const needsTitles = hasPrimaryTies(labels, tieSect);
 
     if (onCall1Done) onCall1Done();
 
     if (needsTitles) {
-      // Call 2: rotated image → spine titles (horizontal in rotated space, non-white)
-      const { blob: rotBlob, canvas: rotCanvas } = await makeRotatedBlob(encoded);
-      const rotCtx = rotCanvas.getContext('2d');
-      const data2 = await callOcrProxy(rotBlob, signal);
-      const lines2 = parseOcrOverlay(data2);
+      const call2 = await call2P;   // already in flight; null if it failed
+      if (call2) {
+        const rotCtx = call2.canvas.getContext('2d');
+        const lines2 = parseOcrOverlay(call2.data);
 
-      const titleCands = [];
-      for (const ln of lines2) {
-        const [rx, ry, rw, rh] = ln.bbox;
-        if (rw < MIN_BOX_W) continue;
-        if (rw < rh * 0.75) continue;
-        if (hasWhiteBg(rotCtx, rx, ry, rw, rh)) continue;
-        titleCands.push({ ...ln, bbox: mapBackRotated(rx, ry, rw, rh, origH) });
+        // Rotated call is in encoded (downscaled) space; scale boxes up to the
+        // label coordinate space (full resolution when tiling was used).
+        const s = imgW / encoded.sentW;
+        const titleCands = [];
+        for (const ln of lines2) {
+          const [rx, ry, rw, rh] = ln.bbox;
+          if (rw < MIN_BOX_W) continue;
+          if (rw < rh * 0.75) continue;
+          if (hasWhiteBg(rotCtx, rx, ry, rw, rh)) continue;
+          const m = mapBackRotated(rx, ry, rw, rh, encoded.sentH);
+          titleCands.push({ ...ln, bbox: [m[0] * s, m[1] * s, m[2] * s, m[3] * s] });
+        }
+
+        attachTitlesJS(labels, titleCands);
+
+        // Verify titles against Open Library; clears unrecognised OCR text so it
+        // doesn't corrupt tiebreaking.
+        await verifyTitlesOpenLibrary(labels, tieSect, signal);
       }
-
-      attachTitlesJS(labels, titleCands);
-
-      // Verify titles against Open Library; clears unrecognised OCR text so it
-      // doesn't corrupt tiebreaking.
-      await verifyTitlesOpenLibrary(labels, tieSect, signal);
     }
 
     // Assign shelfRow (port of server-side sort + bucket_map logic)
-    const rowH = Math.max(1, Math.round(origH * 0.10));
+    const rowH = Math.max(1, Math.round(imgH * 0.10));
     for (const lbl of labels) {
       const [, by,, bh] = lbl.bbox;
       lbl._row = Math.round((by + bh / 2) / rowH);
@@ -922,7 +1115,7 @@
         title_verified: l.title_verified ?? false,
       })),
       ms: Math.round(performance.now() - t0),
-      imageSize: [encoded.sentW, encoded.sentH],
+      imageSize: [imgW, imgH],
       n: labels.length,
     };
   }
@@ -1043,7 +1236,7 @@
     advanceStage();  // → "Checking order"
 
     lastRawBooks = labelsToBooks(ocrData.labels);
-    lastApiDims  = { sentW: encoded.sentW, sentH: encoded.sentH };
+    lastApiDims  = { sentW: ocrData.imageSize[0], sentH: ocrData.imageSize[1] };
 
     // Auto-detect section from label patterns and switch tab if confident
     const detected = autoDetectSection(lastRawBooks);
@@ -1160,11 +1353,44 @@
 
   function lettersLower(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
 
+  // Multi-word surnames keep a space separator so comparison can file
+  // word-by-word (library standard): "VON ZIEGESAR" files before "VONNEGUT"
+  // because the first word "von" ends before "vonnegut" continues.
   function buildMultiWordSurname(tokens, start) {
-    let surname = ''; let i = start;
-    while (i < tokens.length - 1 && SURNAME_PREFIXES.has(tokens[i].toLowerCase())) { surname += tokens[i].toLowerCase(); i++; }
-    if (i < tokens.length) surname += tokens[i].toLowerCase();
-    return surname.replace(/[^a-z]/g, '') || null;
+    const words = []; let i = start;
+    while (i < tokens.length - 1 && SURNAME_PREFIXES.has(tokens[i].toLowerCase())) {
+      words.push(tokens[i].toLowerCase().replace(/[^a-z]/g, '')); i++;
+    }
+    if (i < tokens.length) words.push(tokens[i].toLowerCase().replace(/[^a-z]/g, ''));
+    const s = words.filter(Boolean).join(' ');
+    return s || null;
+  }
+
+  // Word-by-word alphabetical compare: a space files before any letter.
+  function compareFiling(a, b) {
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) {
+      if (a[i] === b[i]) continue;
+      if (a[i] === ' ') return -1;
+      if (b[i] === ' ') return 1;
+      return a[i] < b[i] ? -1 : 1;
+    }
+    return a.length - b.length;
+  }
+
+  // Dewey number compare: integer part numerically, then decimal digits
+  // positionally, shorter decimal first — standard shelf filing order
+  // (635 < 635.01 < 635.04 < 635.0483 < 635.1).
+  function compareDeweyNums(aStr, bStr) {
+    const [ai, af = ''] = String(aStr).split('.');
+    const [bi, bf = ''] = String(bStr).split('.');
+    const d = parseInt(ai, 10) - parseInt(bi, 10);
+    if (d !== 0) return d;
+    const n = Math.min(af.length, bf.length);
+    for (let i = 0; i < n; i++) {
+      if (af[i] !== bf[i]) return af.charCodeAt(i) - bf.charCodeAt(i);
+    }
+    return af.length - bf.length;
   }
 
   function parseSurnameAndFirst(s) {
@@ -1200,10 +1426,11 @@
     const m = s.match(/^\s*([0-9]+(?:\.[0-9]+)?|[A-Za-z]+)\s*([A-Za-z]+)?/i);
     if (!m) return null;
     const num    = isNaN(parseFloat(m[1])) ? null : parseFloat(m[1]);
+    const numStr = num === null ? null : m[1];
     const prefix = m[1].toLowerCase();
     let cut = (m[2] || '').toLowerCase();
     if (num === null) cut = (prefix + cut).replace(/[^a-z]/g, '');
-    return { num, cut, prefix };
+    return { num, numStr, cut, prefix };
   }
 
   function extractVolume(book) {
@@ -1231,15 +1458,19 @@
     if (a.kind !== b.kind) return a.kind === 'dewey' ? -1 : 1;
     let cmp;
     if (a.kind === 'str') {
-      cmp = a.val.localeCompare(b.val, undefined, { sensitivity: 'base' });
+      cmp = compareFiling(a.val, b.val);
     } else {
-      const an = a.val.num === null ? Infinity : a.val.num;
-      const bn = b.val.num === null ? Infinity : b.val.num;
-      cmp = an !== bn ? an - bn : a.val.cut.localeCompare(b.val.cut, undefined, { sensitivity: 'base' });
+      if (a.val.numStr === null || b.val.numStr === null) {
+        cmp = (a.val.numStr === null) === (b.val.numStr === null) ? 0
+            : (a.val.numStr === null ? 1 : -1);
+      } else {
+        cmp = compareDeweyNums(a.val.numStr, b.val.numStr);
+      }
+      if (cmp === 0) cmp = a.val.cut.localeCompare(b.val.cut, undefined, { sensitivity: 'base' });
     }
     if (cmp !== 0) return cmp;
     if (a.kind === 'str') {
-      cmp = (a.first || '').localeCompare(b.first || '', undefined, { sensitivity: 'base' });
+      cmp = compareFiling(a.first || '', b.first || '');
       if (cmp !== 0) return cmp;
     }
     const av = a.vol == null ? Infinity : a.vol, bv = b.vol == null ? Infinity : b.vol;
@@ -1612,7 +1843,7 @@
         });
         html += `</table></div>`;
         rd.innerHTML = html;
-        lastRawBooks = books; lastApiDims = { sentW: encoded.sentW, sentH: encoded.sentH };
+        lastRawBooks = books; lastApiDims = { sentW: data.imageSize[0], sentH: data.imageSize[1] };
       } catch (err) {
         rd.innerHTML = `<div class="debug-section-title">OCR Results</div>
           <div style="color:#f87171;font-size:13px;padding:12px 0">Error: ${escapeHtml(err.message)}</div>`;
