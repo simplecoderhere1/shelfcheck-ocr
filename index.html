@@ -1570,6 +1570,7 @@
 
     await Promise.all(toVerify.map(async i => {
       const lbl = labels[i];
+      const rawTitle = lbl.title;
       const params = new URLSearchParams({ title: lbl.title, limit: '3', fields: 'title,author_name' });
       if (section === 'fiction') {
         const p = parseSurnameAndFirst(lbl.text);
@@ -1593,9 +1594,21 @@
         const res = await fetch(`https://openlibrary.org/search.json?${params}`,
           { signal: ctrl.signal, headers: { 'Accept': 'application/json' } });
         const data = await res.json();
-        if (data.numFound > 0 && data.docs[0]?.title) {
-          lbl.title          = data.docs[0].title;
-          lbl.title_verified = true;
+        const olTitle = data.numFound > 0 ? data.docs[0]?.title : null;
+        if (olTitle) {
+          // Guard against Open Library matching a DIFFERENT book by the same
+          // author: only trust the hit for ordering when its title words
+          // actually overlap what we read off the spine. A weak match keeps
+          // the raw read for display but stays unverified, so it can never
+          // reorder a same-author run into a false misshelving flag.
+          const rTok = new Set(lettersLower(rawTitle).split(/\s+/).filter(w => w.length >= 3));
+          const oTok = lettersLower(olTitle).split(/\s+/).filter(w => w.length >= 3);
+          const overlap = oTok.length ? oTok.filter(w => rTok.has(w)).length / oTok.length : 0;
+          if (overlap >= 0.5) {
+            lbl.title = olTitle; lbl.title_verified = true;
+          } else {
+            lbl.title_verified = false;   // keep raw read for display only
+          }
         } else {
           lbl.title          = null;   // unrecognised — don't use for ordering
           lbl.title_verified = false;
@@ -1612,12 +1625,72 @@
     console.log(`[perf] verifyTitlesOpenLibrary: ${toVerify.length} call(s), ${Math.round(performance.now() - t0)}ms`);
   }
 
+  // The on-device title reader returns the whole spine line (author name mixed
+  // with the title, plus the odd stray glyph). Drop pure-symbol tokens and the
+  // author surname so Open Library's title search matches on the title words.
+  function cleanSpineTitle(raw, spineLabel) {
+    const sur = (parseSurnameAndFirst(spineLabel)?.surname || '')
+      .toUpperCase().replace(/[^A-Z]/g, '');
+    const toks = String(raw).split(/\s+/).filter(t => {
+      if (!/[A-Za-z]/.test(t)) return false;                       // stray symbols/CJK
+      if (sur && t.toUpperCase().replace(/[^A-Z]/g, '') === sur) return false;  // author surname
+      return true;
+    });
+    return toks.join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  // Read spine titles (on-device) for books that share a primary sort key and
+  // so need a title to break the tie. Only runs when a tie exists — titles are
+  // never read for the whole shelf. Populated titles are confirmed against
+  // Open Library by the caller; an unconfirmed read is dropped and never feeds
+  // ordering, so a garbled title can't create a false flag.
+  async function readTiedTitles(labels, imgW, imgH, tieSect, signal) {
+    if (!(localOcrEnabled && window.LocalOCR && LocalOCR.available() && snapshot.width)) return;
+    const groups = new Map();
+    labels.forEach((l, i) => {
+      let k;
+      if (tieSect === 'fiction') {
+        const p = parseSurnameAndFirst(l.text); if (!p) return;
+        k = p.surname + '\x00' + (p.first || '');
+      } else {
+        const d = parseDewey(l.text); if (!d) return;
+        k = String(d.num ?? '') + '\x00' + (d.cut || '');
+      }
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(i);
+    });
+    const tied = [];
+    for (const idxs of groups.values()) if (idxs.length >= 2) tied.push(...idxs);
+    if (!tied.length) return;
+    const fx = snapshot.width / imgW, fy = snapshot.height / imgH;
+    const t0 = performance.now();
+    let got = 0, read = 0;
+    // Hard time budget: reading titles is ~0.4s each, and a shelf can carry
+    // dozens of tied books. This runs in the background refine (never blocks
+    // first render), but still cap it so it can't run for half a minute. Tie
+    // groups not reached simply stay tie-safe (any order, no flag).
+    const TITLE_BUDGET_MS = 6000;
+    for (const i of tied) {
+      if (signal?.aborted || performance.now() - t0 > TITLE_BUDGET_MS) break;
+      const b = labels[i].bbox;
+      if (!b || labels[i].title) continue;
+      read++;
+      const tt = await LocalOCR.readTitle(snapshot, [b[0] * fx, b[1] * fy, b[2] * fx, b[3] * fy])
+        .catch(() => null);
+      if (tt && tt.title) {
+        const cleaned = cleanSpineTitle(tt.title, labels[i].text);
+        if (cleaned.length >= 3) { labels[i].title = cleaned; got++; }
+      }
+    }
+    console.log(`[perf] finishLabels: read ${got}/${read} spine title(s) (${tied.length} tied) in ${Math.round(performance.now() - t0)}ms`);
+  }
+
   // Fuse (if gem is provided), tie-check, verify tied titles against Open
   // Library, and assign shelfRow — the tail of the pipeline shared by both
   // the immediate (OCR-only or Gemini-on-time) render and the later refine
   // pass once a slow Gemini call finally resolves. Mutates/sorts `labels`
   // in place except when fuseLabels swaps in a brand-new fused array.
-  async function finishLabels(labels, imgW, imgH, gem, section, signal) {
+  async function finishLabels(labels, imgW, imgH, gem, section, signal, opts = {}) {
     // Fuse Gemini's text reads onto the ocr.space boxes before anything else
     // (tie-checking, titles, ordering) touches the labels.
     if (gem && gem.length) {
@@ -1644,6 +1717,12 @@
     // title A-Z; see sortKey), so verify fiction ties against OL too. Only
     // OL-verified titles feed ordering; a budget-abort/timeout leaves the title
     // unverified so the tie stays a no-flag exempt group.
+    // Title reading is slow (~0.4s per tied book) and only refines ordering
+    // within same-key groups, so it runs solely in the background refine pass
+    // (opts.readTitles) — never on the blocking first render.
+    if (needsTitles && opts.readTitles) {
+      await readTiedTitles(labels, imgW, imgH, tieSect, signal);
+    }
     if (needsTitles && labels.some(l => l.title)) {
       await verifyTitlesOpenLibrary(labels, tieSect, signal);
     }
@@ -1934,7 +2013,7 @@
       console.log(`[perf] runOcr: local-first render ready at ${Math.round(performance.now() - t0)}ms`);
       const refine = ocrP.then(async ({ labels: oLabels, imgW: oW, imgH: oH }) => {
         const gemPx = mapGemToPixels(first.g, oW, oH);
-        const refined = await finishLabels(oLabels.map(l => ({ ...l })), oW, oH, gemPx, section, signal);
+        const refined = await finishLabels(oLabels.map(l => ({ ...l })), oW, oH, gemPx, section, signal, { readTitles: true });
         return { labels: refined, imageSize: [oW, oH], n: refined.length };
       }).catch(() => null);
       return {
@@ -1976,9 +2055,17 @@
       refine = localP.then(async gem => {
         if (!gem || !gem.length) return null;
         const gemPx = mapGemToPixels(gem, imgW, imgH);
-        const refinedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gemPx, section, signal);
+        const refinedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gemPx, section, signal, { readTitles: true });
         return { labels: refinedLabels, imageSize: [imgW, imgH], n: refinedLabels.length };
       }).catch(() => null);
+    } else if (gemOnTime) {
+      // Local already fused into the first render, so there's no engine still
+      // in flight — but tied books still need their titles read to refine the
+      // order. Schedule that as a background title-only refine.
+      refine = (async () => {
+        const refinedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gemOnTime, section, signal, { readTitles: true });
+        return { labels: refinedLabels, imageSize: [imgW, imgH], n: refinedLabels.length };
+      })().catch(() => null);
     }
 
     return {

@@ -244,7 +244,7 @@
   // background) up to the bucket width; CTC emits blanks over the padding.
   const REC_WIDTH_BUCKETS = [64, 96, 128, 160, 224, 320, 480, 640];
 
-  function recPreprocess(src, box) {
+  function recPreprocess(src, box, allowDark) {
     const [bx, by, bw, bh] = box;
     const x = Math.max(0, Math.round(bx)), y = Math.max(0, Math.round(by));
     const w = Math.min(src.width - x, Math.round(bw));
@@ -275,8 +275,9 @@
     // Sticker text sits on a white/light label; spine-title text does not.
     // Rejecting dark-background lines is what keeps junk like publisher
     // names out of the results (precision), at negligible recall cost.
+    // The title-reading pass sets allowDark to keep coloured-spine text.
     const lightFrac = light / natPx;
-    if (lightFrac < 0.30) return null;
+    if (!allowDark && lightFrac < 0.30) return null;
     return { data, tw };
   }
 
@@ -496,5 +497,92 @@
     return { text: parts.join(' ').replace(/\s+/g, ' ').trim(), conf: confMin };
   }
 
-  window.LocalOCR = { available, preload, run, readRegion, get ep() { return activeEP; } };
+  // ---- title reading ------------------------------------------------------
+
+  // Rotate a canvas 90 degrees. Spine titles are printed vertically, so the
+  // rec model (which expects horizontal lines) needs the strip turned upright.
+  function rotate90(srcCanvas, clockwise) {
+    const w = srcCanvas.width, h = srcCanvas.height;
+    const out = document.createElement('canvas');
+    out.width = h; out.height = w;
+    const ctx = out.getContext('2d', { willReadFrequently: true });
+    ctx.imageSmoothingQuality = 'high';
+    if (clockwise) { ctx.translate(h, 0); ctx.rotate(Math.PI / 2); }
+    else { ctx.translate(0, w); ctx.rotate(-Math.PI / 2); }
+    ctx.drawImage(srcCanvas, 0, 0);
+    return out;
+  }
+
+  // Full det+rec over an arbitrary canvas, returning recognized lines. Unlike
+  // run(), no sticker-size filter — the title-reading pass wants the large
+  // spine text run() deliberately discards. allowDark keeps coloured-spine
+  // text past the light-background filter.
+  async function recognizeLines(canvas, allowDark, maxLines) {
+    const { data, nw, nh } = detPreprocess(canvas);
+    const detOut = await detSess.run({ x: new ort.Tensor('float32', data, [1, 3, nh, nw]) });
+    const prob = detOut[detSess.outputNames[0]].data;
+    const boxes = detPostprocess(prob, nw, nh, canvas.width, canvas.height)
+      .filter(b => b[3] >= 8 && b[2] >= 8)
+      .sort((a, b) => b[2] * b[3] - a[2] * a[3])   // largest first: title text
+      .slice(0, maxLines || 8);
+    const recs = [];
+    for (const b of boxes) {
+      const pre = recPreprocess(canvas, b, allowDark);
+      if (!pre) continue;
+      const out = await recSess.run({ x: new ort.Tensor('float32', pre.data, [1, 3, REC_HEIGHT, pre.tw]) });
+      const t = out[recSess.outputNames[0]];
+      const [, T, C] = t.dims;
+      const { text, conf } = ctcDecode(t.data, T, C);
+      if (text && conf > REC_MIN_CONF) recs.push({ text, conf, box: b });
+    }
+    return recs;
+  }
+
+  // Read the title/author text off the spine above a sticker. boxPx is the
+  // sticker bbox in source pixels; the spine strip is that x-range extended
+  // upward. Tries both 90-degree rotations and keeps whichever orientation
+  // yields more confident characters. Returns { title, conf } or null.
+  async function readTitle(src, boxPx) {
+    await preload();
+    const [sx, sy, sw, sh] = boxPx;
+    const padX = sw * 0.25;
+    const x = Math.max(0, Math.round(sx - padX));
+    const w = Math.min(src.width - x, Math.round(sw + 2 * padX));
+    // the spine rises from the sticker; cap the strip so it can't run off into
+    // the shelf above (extra background just yields no det boxes anyway)
+    const upH = Math.min(sy, Math.max(sw * 5, sh * 12));
+    const y = Math.max(0, Math.round(sy - upH));
+    const h = Math.round(sy - y);
+    if (w < 12 || h < 40) return null;
+    const scale = Math.min(3, 1400 / Math.max(w, h));
+    const cw0 = Math.max(16, Math.round(w * scale));
+    const ch0 = Math.max(16, Math.round(h * scale));
+    const crop = document.createElement('canvas');
+    crop.width = cw0; crop.height = ch0;
+    const cctx = crop.getContext('2d', { willReadFrequently: true });
+    cctx.imageSmoothingQuality = 'high';
+    cctx.drawImage(src, x, y, w, h, 0, 0, cw0, ch0);
+    // English spine text conventionally reads bottom-to-top (rotate clockwise
+    // to make it upright), so try that first and only pay for the other
+    // orientation when the first read is weak — halves the average cost.
+    let best = null;
+    for (const clockwise of [true, false]) {
+      const rot = rotate90(crop, clockwise);
+      const recs = await recognizeLines(rot, true, 5);
+      if (recs.length) {
+        recs.sort((a, b) => (a.box[1] + a.box[3] / 2) - (b.box[1] + b.box[3] / 2) || a.box[0] - b.box[0]);
+        const text = recs.map(r => r.text).join(' ').replace(/\s+/g, ' ').trim();
+        const conf = recs.reduce((s, r) => s + r.conf, 0) / recs.length;
+        const score = conf * text.replace(/[^A-Za-z0-9]/g, '').length;
+        if (!best || score > best.score) best = { title: text, conf, score };
+      }
+      // a confident, several-character read is almost certainly the right way
+      // up — skip the second orientation
+      if (best && best.conf >= 0.85 && best.score >= 8) break;
+    }
+    if (!best || best.title.replace(/[^A-Za-z0-9]/g, '').length < 3) return null;
+    return { title: best.title, conf: best.conf };
+  }
+
+  window.LocalOCR = { available, preload, run, readRegion, readTitle, get ep() { return activeEP; } };
 })();
