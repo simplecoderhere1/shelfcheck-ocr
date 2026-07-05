@@ -162,7 +162,7 @@
     }
     .timing-badge b { color: #f87171; }
 
-    /* Small non-blocking pill: OCR results are shown, Gemini is still refining */
+    /* Small non-blocking pill: first results are shown, the other engine is still refining */
     .refining-badge {
       position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
       z-index: 39; background: rgba(20,20,20,.9); border: 1px solid #333;
@@ -382,6 +382,10 @@
     }
     .ar-resume.show { display: block; }
   </style>
+  <!-- COOP/COEP shim: enables crossOriginIsolated on GitHub Pages so the
+       local OCR engine can use multi-threaded WASM (one reload, first visit only). -->
+  <script src="coi-serviceworker.min.js"></script>
+  <script src="ocr_local.js" defer></script>
 </head>
 <body>
 
@@ -399,11 +403,11 @@
         <div class="settings-toggle" id="debugToggleSwitch"></div>
       </div>
       <div class="settings-item" id="geminiToggle" role="menuitemcheckbox" aria-checked="true" tabindex="0">
-        <span>AI cross-check (Gemini)</span>
+        <span>On-device AI OCR</span>
         <div class="settings-toggle" id="geminiToggleSwitch"></div>
       </div>
       <div style="padding:10px 16px;border-top:1px solid #2c2c2c">
-        <div style="font-size:11px;color:#555;line-height:1.5">OCR via ocr.space + Gemini<br>through Cloudflare Worker proxies</div>
+        <div style="font-size:11px;color:#555;line-height:1.5">On-device AI OCR (PP-OCR)<br>+ ocr.space via Cloudflare proxy</div>
       </div>
     </div>
   </div>
@@ -489,22 +493,20 @@
   const WORKER_URL = 'https://shelfcheck-ocr-proxy.krish-sundareswar.workers.dev';
   const OCR_TIMEOUT_MS = 20000;
 
-  // Gemini is used as a pure text cross-checker (never asked for boxes — output
-  // tokens dominate vision-LLM latency, so bbox output would blow the time budget).
-  // Shared proxy worker from the sibling shelfcheck app; see README for fallback.
-  const GEMINI_URL = 'https://selfcheck-proxy.krish-sundareswar.workers.dev/';
-  // Generous on purpose: Gemini never blocks the first render (it races a
-  // short grace window, then refines in the background), and on dense
-  // multi-row shelves its round trip measures 14-16s — a 15s timeout made
-  // the background refine fail on a coin flip.
-  const GEMINI_TIMEOUT_MS = 30000;
+  // Local OCR (ocr_local.js): PP-OCRv6 det+rec running in the browser via
+  // onnxruntime-web (WebGPU with WASM fallback). Fully free, no quota, no
+  // network after the one-time ~31MB model download (Cache API). Validated at
+  // 96% recall on the 10-image ground truth (test_items/bench_js_port.py).
+  // It races ocr.space on every scan: first success renders, the other fuses
+  // in as a background refine, and a scan only fails when BOTH are down.
   const OL_TIMEOUT_MS = 4000;   // Open Library is third-party; never let one slow request stall analysis
-  let geminiEnabled = (localStorage.getItem('shelfcheck.gemini') ?? '1') === '1';
+  let localOcrEnabled = (localStorage.getItem('shelfcheck.localocr') ?? '1') === '1';
 
   // ── State ────────────────────────────────────────────────────────────────
   const MAX_CANVAS_DIM = 4096;   // keep native resolution — nonfiction tiles need it
   let pendingEncode    = null;   // Promise<{blob, sentW, sentH}> — pre-encodes while user reads photo
   let pendingTiles      = null;  // Promise<{tiles, canvas}> — pre-encoded nonfiction tiles, same idea
+  let pendingLocal      = null;  // Promise<books|null> — speculative local OCR, same idea
   let lastRawBooks     = null;
   let lastCheckedBooks = [];
   let lastApiDims      = null;   // {sentW, sentH} of the image sent to OCR
@@ -512,7 +514,7 @@
   let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
   let analysisCancelled = false;
   let analysisAbort     = null;
-  let analysisGeneration = 0;   // bumped on every new analysis/retake so a late Gemini refine can't clobber stale UI
+  let analysisGeneration = 0;   // bumped on every new analysis/retake so a late refine can't clobber stale UI
 
   // ── Section toggle ────────────────────────────────────────────────────────
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -561,6 +563,12 @@
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
       pendingEncode = encodeForOCR();
       pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
+      // Speculatively run the local engine while the user reviews the photo —
+      // det + rec (and any first-scan GPU shader compile) hide behind the
+      // review pause, so Analyze usually has local results waiting in memory.
+      if (localOcrEnabled && window.LocalOCR && LocalOCR.available()) {
+        pendingLocal = callLocalOcr(snapshot, null).catch(() => null);
+      }
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
@@ -580,11 +588,12 @@
     uploadInput.value = '';
     pendingEncode    = null;
     pendingTiles     = null;
+    pendingLocal     = null;
     _cleanPhotoData  = null;
     lastApiDims      = null;
     lastRawBooks     = null;
     lastCheckedBooks = [];
-    analysisGeneration++;   // invalidate any in-flight Gemini refine
+    analysisGeneration++;   // invalidate any in-flight refine
     hideRefiningBadge();
     document.getElementById('errorBanner')?.remove();
   }
@@ -784,223 +793,60 @@
     return data;
   }
 
-  // ── Gemini cross-check (pure text; never asked for boxes — see note above) ─
-
-  // Convert a Blob to a base64 string (no data: prefix) for Gemini inline_data.
-  function blobToBase64(blob) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onloadend = () => resolve(reader.result.split(',')[1]);
-      reader.onerror = () => reject(new Error('image read failed'));
-      reader.readAsDataURL(blob);
-    });
+  // ── Local OCR wrapper ────────────────────────────────────────────────────
+  // Runs the in-browser engine (ocr_local.js) on the full-res snapshot and
+  // adapts its output to the boxed-book shape the fusion pipeline expects
+  // (the same shape the old Gemini tile path produced): spine_label +
+  // bboxFrac fractions of the source canvas, projected into whatever pixel
+  // space the render target uses by mapGemToPixels.
+  // Keep only labels that look like call-number stickers — the same rule the
+  // OCR reconstruction applies (nonfiction needs a Dewey number; fiction needs
+  // an uppercase surname-ish first token). White book spines otherwise leak
+  // publisher/title text into the results and poison the ordering check.
+  function localLabelPlausible(text, section) {
+    if (section === 'nonfiction') return /\d{3}/.test(text);
+    const t0 = String(text).trim().split(/\s+/)[0] || '';
+    const letters = t0.replace(/[^A-Za-z]/g, '');
+    if (letters.length < 3) return false;
+    return letters.replace(/[^A-Z]/g, '').length / letters.length >= 0.6;
   }
 
-  function buildGeminiPrompt(section) {
-    const orderNote = 'Order matters: within each shelf row, list the books strictly in left-to-right physical order. Do not skip spines; if a spine\'s sticker is unreadable, still emit an entry with null.';
+  // Clean up raw rec text: OCR confuses commas/spaced dots inside Dewey
+  // numbers, and a malformed number both mis-sorts and blocks cross-engine
+  // confirmation.
+  function normalizeLocalText(t, section) {
+    let s = String(t).replace(/\s+/g, ' ').trim();
     if (section === 'nonfiction') {
-      return `This is a library NONFICTION shelf photo. There may be multiple shelves.
-Read every book spine left-to-right, top shelf first, then lower shelves.
-${orderNote}
-Return ONLY a JSON array of arrays, one per book spine.
-Each inner array has exactly 4 elements:
-0: full text on the white sticker at the bottom of the spine (e.g. "973.7 HAR", "KIN"), or null if unreadable.
-1: book title from the spine, or null if unreadable.
-2: 1 if you read the white sticker clearly, 0 if unsure.
-3: box_2d of the WHITE STICKER as [ymin, xmin, ymax, xmax] in 0-1000 normalized image coordinates. Always give the box, even when element 0 is null.
-CRITICAL for element 0: read the sticker character-by-character exactly as printed. The cutter letters come from the AUTHOR'S last name, NOT from the title. Never infer or guess the cutter from the title — e.g. "The New Organic Grower" by Coleman has sticker "635.04 COL", not "635.04 THE". If you cannot read it clearly, return null.
-If a sticker is partially cut off by the edge of the image or another book, DO NOT guess the missing letters or numbers. Return null.
-Never copy a neighbor's label.
-IMPORTANT for element 2: return 1 ONLY if you can read every character of the sticker with certainty. If ANY character is unclear, blurry, shadowed, or you are guessing even one letter, return 0. A wrong sticker causes incorrect shelving flags — when in doubt, return 0.
-Example: [["973.7 HAR","Lincoln",1,[930,12,965,58]],["KIN","The Stand",1,[930,60,965,102]],["635.04 COL","New Organic Grower",1,[930,105,966,149]]]
-Example of unreadable or cropped sticker: [null, "Harry Potter", 0, [931,151,965,190]]`;
+      s = s.replace(/(\d)\s*,\s*(\d)/g, '$1.$2');   // 635,048  -> 635.048
+      s = s.replace(/(\d)\.\s+(\d)/g, '$1.$2');      // 635. 048 -> 635.048
+      s = s.replace(/^(\d+)\.(?!\d)/, '$1');         // 635. XYZ -> 635 XYZ
     }
-    return `This is a library FICTION shelf photo. There may be multiple shelves.
-Read every book spine left-to-right, top shelf first, then lower shelves.
-${orderNote}
-Return ONLY a JSON array of arrays, one per book spine.
-Each inner array has exactly 4 elements:
-0: full text on the white sticker at the bottom of the spine (e.g. "BLACK, Cara", "BLACK, Cara 5"), or null if unreadable.
-1: book title from the spine, or null if unreadable.
-2: 1 if you read the white sticker clearly, 0 if unsure.
-3: box_2d of the WHITE STICKER as [ymin, xmin, ymax, xmax] in 0-1000 normalized image coordinates. Always give the box, even when element 0 is null.
-Rules: the white bottom sticker is the primary sort key — read it first. Return null and 0 for element 2 if you cannot read the sticker. Never copy a neighbor's text.
-If a sticker is partially cut off by the edge of the image or another book, DO NOT guess the missing letters or numbers. Return null.
-IMPORTANT for element 2: return 1 ONLY if you can read every character of the sticker with certainty. If ANY character is unclear, blurry, shadowed, or you are guessing even one letter, return 0. A wrong sticker causes incorrect shelving flags — when in doubt, return 0.
-Example: [["BLACK, Cara","Murder in Clichy",1,[840,15,885,70]],["KING, Stephen","The Stand",1,[840,72,886,121]],["ADAMS, Douglas","Hitchhiker",1,[841,124,885,170]]]
-Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,215]]`;
+    return s;
   }
 
-  // Expand the 4-element wire format [spine_label, title, confidence, box_2d].
-  // box_2d is the sticker's [ymin,xmin,ymax,xmax] in 0-1000 normalized TILE
-  // coordinates; kept as .boxN here and mapped into full-image fractions by
-  // callGeminiTiles. shelfRow is no longer on the wire — it's derived from the
-  // real box y (clusterRowIndex) inside fuseLabels, which is far more reliable
-  // than asking the model to count shelves.
-  function expandGeminiBook(arr) {
-    const b = arr[3];
-    const boxN = Array.isArray(b) && b.length === 4 && b.every(v => typeof v === 'number' && isFinite(v))
-      ? b : null;
-    return {
-      spine_label: arr[0] ?? null,
-      title:       arr[1] ?? null,
-      confidence:  Number(arr[2]) === 1 ? 'high' : 'low',
-      shelfRow:    0,
-      boxN,
-    };
-  }
-
-  // Call Gemini as a pure text reader (image in, short JSON out, no boxes).
-  // Any failure (429, timeout, parse error) must be caught by the caller and
-  // treated as "no cross-check available" — this function throws freely.
-  async function callGeminiSpines(b64, section, externalSignal) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
-    const onExternalAbort = () => controller.abort();
-    if (externalSignal) {
-      if (externalSignal.aborted) controller.abort();
-      else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
-    }
-    let res;
-    try {
-      res = await fetch(GEMINI_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          generationConfig: {
-            temperature: 0,
-            response_mime_type: 'application/json',
-            thinkingConfig: { thinkingBudget: 0 },
-          },
-          contents: [{ parts: [
-            { text: buildGeminiPrompt(section) },
-            { inline_data: { mime_type: 'image/jpeg', data: b64 } },
-          ] }],
-        }),
-      });
-    } finally {
-      clearTimeout(timer);
-      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
-    }
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      const err = new Error(`Gemini ${res.status}: ${t.slice(0, 200)}`);
-      err.status = res.status;
-      throw err;
-    }
-    const json = await res.json();
-    const cand = json.candidates?.[0];
-    if (!cand) throw new Error('Gemini returned no candidate');
-    if (cand.finishReason && cand.finishReason !== 'STOP') {
-      throw new Error(`Gemini stopped unexpectedly (${cand.finishReason})`);
-    }
-    const raw = (cand.content?.parts || []).map(p => p.text || '').join('');
-    if (!raw) throw new Error('Gemini returned no text');
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      try {
-        parsed = JSON.parse(raw.replace(/^```(json)?/, '').replace(/```$/, '').trim());
-      } catch {
-        throw new Error('could not parse Gemini output');
-      }
-    }
-    if (!Array.isArray(parsed)) throw new Error('unexpected Gemini output format');
-    return parsed.filter(Array.isArray).map(expandGeminiBook);
-  }
-
-  // ── Gemini tile calls ───────────────────────────────────────────────────
-  // Two parallel L/R tile calls (8% overlap) instead of one full-frame call:
-  // output tokens dominate Gemini latency, so halving the books per call
-  // roughly halves wall-clock (measured 16.3s full-frame → ~5.5s tiles on a
-  // 54-book shelf). Tiles also double effective resolution on tiny stickers,
-  // and each book returns a real sticker box — which replaces rank-based
-  // synth placement in fuseLabels and lets Gemini render standalone (with
-  // boxes) when ocr.space is down.
-  const GEM_TILE_OVERLAP = 0.08;
-  const GEM_TILE_MAXDIM  = 2000;
-
-  function encodeGeminiTile(src, sxFrac, swFrac) {
-    const sx = Math.round(src.width * sxFrac), sw = Math.round(src.width * swFrac);
-    const scale = Math.min(1, GEM_TILE_MAXDIM / Math.max(sw, src.height));
-    const c = document.createElement('canvas');
-    c.width  = Math.max(1, Math.round(sw * scale));
-    c.height = Math.max(1, Math.round(src.height * scale));
-    c.getContext('2d').drawImage(src, sx, 0, sw, src.height, 0, 0, c.width, c.height);
-    return new Promise((resolve, reject) =>
-      c.toBlob(b => b ? resolve(b) : reject(new Error('tile encoding failed')), 'image/jpeg', 0.82));
-  }
-
-  // One retry per tile: free-tier Gemini throws transient 503s under load —
-  // a single short-delay retry recovers most of them without stalling the
-  // race (ocr.space is usually still in flight anyway).
-  async function callGeminiTileWithRetry(b64, section, signal) {
-    try { return await callGeminiSpines(b64, section, signal); }
-    catch (e) {
-      if (signal?.aborted) throw e;
-      await new Promise(r => setTimeout(r, 800));
-      return callGeminiSpines(b64, section, signal);
-    }
-  }
-
-  // Fire both tiles; return gem books with .bboxFrac = [x,y,w,h] as fractions
-  // of the source canvas (resolution-independent — mapGemToPixels projects
-  // them into whatever coordinate space the render target uses). Books in the
-  // overlap band are deduped by the center-line rule: L keeps centers < 0.5,
-  // R keeps centers ≥ 0.5 — both tiles see an overlap sticker fully, so both
-  // compute (nearly) the same global center and exactly one side claims it.
-  // A single failed tile degrades to half coverage; only both failing throws.
-  // Pure merge of the two tile results (testable without a DOM): map each
-  // book's normalized tile box into full-image fractions and dedupe the
-  // overlap band by the center-line rule.
-  function mergeGeminiTiles(results) {
-    const halfFrac = 0.5 + GEM_TILE_OVERLAP;
-    const tiles = [
-      { xoffFrac: 0,            wFrac: halfFrac, keep: cx => cx <  0.5 },
-      { xoffFrac: 1 - halfFrac, wFrac: halfFrac, keep: cx => cx >= 0.5 },
-    ];
-    const books = [];
-    const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toUpperCase();
-    tiles.forEach((t, i) => {
-      const otherFailed = !results[1 - i];
-      for (const b of (results[i] || [])) {
-        if (!b.boxN) continue;
-        const [ymin, xmin, ymax, xmax] = b.boxN;
-        const x = t.xoffFrac + (xmin / 1000) * t.wFrac;
-        const w = Math.max(0.001, (xmax - xmin) / 1000 * t.wFrac);
-        const y = ymin / 1000, h = Math.max(0.001, (ymax - ymin) / 1000);
-        const cx = x + w / 2, cy = y + h / 2;
-        if (!otherFailed && !t.keep(cx)) continue;   // overlap dedupe
-        // Center-line straddler guard: box jitter between the two tiles can
-        // put the SAME sticker's center on opposite sides of the line, so
-        // both rules keep it. Identical text within ~half a spine width is
-        // that same sticker; true adjacent duplicate copies sit a full spine
-        // apart (~2% of width) and survive the 1.2% window.
-        if (i === 1 && !otherFailed) {
-          const tx = norm(b.spine_label);
-          if (tx && books.some(a => norm(a.spine_label) === tx
-              && Math.abs(a.bboxFrac[0] + a.bboxFrac[2] / 2 - cx) < 0.012
-              && Math.abs(a.bboxFrac[1] + a.bboxFrac[3] / 2 - cy) < 0.02)) continue;
-        }
-        books.push({ ...b, bboxFrac: [x, y, w, h] });
-      }
-    });
-    return books;
-  }
-
-  async function callGeminiTiles(src, section, signal) {
-    const halfFrac = 0.5 + GEM_TILE_OVERLAP;
+  async function callLocalOcr(src, signal) {
     const t0 = performance.now();
-    const results = await Promise.all([0, 1 - halfFrac].map(xoffFrac =>
-      encodeGeminiTile(src, xoffFrac, halfFrac)
-        .then(blobToBase64)
-        .then(b64 => callGeminiTileWithRetry(b64, section, signal))
-        .catch(() => null)));
-    if (results.every(r => !r)) throw new Error('Gemini tiles failed');
-    const books = mergeGeminiTiles(results);
-    console.log(`[perf] callGeminiTiles: ${books.length} book(s) at ${Math.round(performance.now() - t0)}ms${results.some(r => !r) ? ' (one tile failed)' : ''}`);
+    const section = getSection();
+    // note: plausibility runs on the RAW text; normalization happens below in
+    // the book mapping so truncation evidence (trailing "635.") survives
+    // until the confidence decision.
+    const labels = (await LocalOCR.run(src, { signal }))
+      .filter(l => localLabelPlausible(l.text, section));
+    // 'high' is deliberately strict (0.97): raw OCR misreads ("NALKER" for
+    // WALKER) usually dip below it, and only high-confidence books are ever
+    // eligible for misshelving flags — a wrong flag is worse than a grey
+    // "unverifiable" entry. A Dewey number ending in a bare separator
+    // ("635." / "635,0") is a truncated read — same demotion.
+    const truncatedNum = t => section === 'nonfiction' &&
+      (/^\s*\d{1,3}[.,](?!\d)/.test(t) || /^\s*\d{1,3}\.\d*0(?=\s|$)/.test(t));
+    const books = labels.map(l => ({
+      spine_label: normalizeLocalText(l.text, section),
+      title: null,
+      confidence: (l.conf >= 0.97 && !truncatedNum(l.text)) ? 'high' : 'low',
+      shelfRow: 0,
+      bboxFrac: l.bboxFrac,
+    }));
+    console.log(`[perf] callLocalOcr: ${books.length} book(s) at ${Math.round(performance.now() - t0)}ms`);
     return books;
   }
 
@@ -1437,12 +1283,38 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
         const o = O[oi], g = G[gi];
         matchedGIdx.add(gi);
         let text, score, src;
-        if (fuseNorm(o.text) === fuseNorm(g.spine_label)) {
+        const NO = fuseNorm(o.text), NG = fuseNorm(g.spine_label);
+        if (NO === NG) {
           text = o.text; score = 0.95; src = 'both';
-        } else if (g.confidence === 'high') {
-          text = g.spine_label; score = 0.9; src = 'gemini';
         } else {
-          text = o.text; score = 0.6; src = 'ocr?';
+          // Cross-engine key agreement: both engines independently read the
+          // same SORTING key (Dewey prefix + cutter, or surname) even if the
+          // raw strings differ. That's the only other way a label becomes
+          // flag-eligible — a misread by a single engine can then never
+          // produce a false misshelving flag.
+          const po = fuseParse(NO), pg = fuseParse(NG);
+          const numOk = po.num && pg.num && (po.num.startsWith(pg.num) || pg.num.startsWith(po.num));
+          const cutOk = po.cut && pg.cut && po.cut.slice(0, 3) === pg.cut.slice(0, 3);
+          const surOk = !po.num && !pg.num && po.sur && pg.sur &&
+                        (po.sur === pg.sur || fuseEditDist(po.sur, pg.sur) <= 1);
+          if (numOk && cutOk && g.confidence === 'high') {
+            // Agree on the key. Prefer the local read when it carries
+            // decimals: its confidence is per-glyph and a high-conf
+            // "635.04" is usually the real sticker, while the remote
+            // extension "635.048" is often carried over from neighbors. A
+            // bare local number ("635") yields to a longer remote read —
+            // dropping the whole decimal block is the classic local
+            // truncation. Real truncations that slip through are caught by
+            // the truncation-shape recheck before they can flag.
+            text = (pg.num.length > po.num.length || pg.num.includes('.')) ? g.spine_label : o.text;
+            score = 0.9; src = 'both';
+          } else if (surOk && g.confidence === 'high') {
+            text = g.spine_label; score = 0.9; src = 'both';
+          } else if (g.confidence === 'high') {
+            text = g.spine_label; score = 0.6; src = 'gemini';
+          } else {
+            text = o.text; score = 0.6; src = 'ocr?';
+          }
         }
         rowOut.push({
           text, bbox: o.bbox, score, src,
@@ -1462,10 +1334,15 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
       for (const gi of gOnly) {
         const g = G[gi];
         if (g.bbox) {
-          if (g.spine_label && g.confidence === 'high') {
+          if (g.spine_label) {
+            // Single-engine finds are always shown but never flag-eligible
+            // (0.6 < the 0.65 'high' bar): only cross-engine-confirmed reads
+            // above can trigger a misshelving flag.
             rowOut.push({
-              text: g.spine_label, bbox: g.bbox.slice(), score: 0.7, src: 'gemini-synth', synthBox: false,
-              title: g.title || null, title_score: 0.9,
+              text: g.spine_label, bbox: g.bbox.slice(),
+              score: g.confidence === 'high' ? 0.6 : 0.55,
+              src: 'gemini-synth', synthBox: false,
+              title: g.title || null, title_score: g.confidence === 'high' ? 0.9 : 0.5,
             });
           }
         } else {
@@ -1779,7 +1656,41 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
     labels.sort((a, b) => a._row - b._row || a.bbox[0] - b.bbox[0]);
     for (const lbl of labels) lbl.shelfRow = lbl._row;
 
-    return labels.map(l => ({
+    // Row-consensus truncation guard (nonfiction): when nearly every
+    // high-confidence label in a row carries decimals, a bare "635 XXX" read
+    // is almost certainly a truncated "635.0xx XXX" — both engines clip the
+    // same tiny digits — and bare sorts before every decimal, so one such
+    // read false-flags real books. Demote it below the flag bar. Rows that
+    // are genuinely bare (whole 635 GAR shelves) keep >20% bare and are
+    // untouched.
+    if (section === 'nonfiction') {
+      const rows = new Map();
+      for (const l of labels) {
+        if (l.score < 0.65) continue;
+        const m = /^\s*(\d{1,3})(\.\d+)?/.exec(l.text);
+        if (!m) continue;
+        if (!rows.has(l._row)) rows.set(l._row, { bare: 0, dec: 0 });
+        rows.get(l._row)[m[2] ? 'dec' : 'bare']++;
+      }
+      for (const l of labels) {
+        if (l.score < 0.65) continue;
+        const m = /^\s*(\d{1,3})(\.\d+)?/.exec(l.text);
+        if (!m || m[2]) continue;
+        const r = rows.get(l._row);
+        if (r && r.dec >= 4 && r.bare / (r.bare + r.dec) <= 0.2) l.score = 0.6;
+      }
+    }
+
+    // Nonfiction labels start with the call number; anything glued on before
+    // it ("TIMBER 635.028 HOL" — publisher text from the spine) derails the
+    // sort key into a bogus flag. Strip the junk prefix.
+    if (section === 'nonfiction') {
+      for (const l of labels) {
+        l.text = l.text.replace(/^[^\d]{2,24}?\s+(?=\d{1,3}(?:\.\d+)?(?:\s|$))/, '');
+      }
+    }
+
+    const out = labels.map(l => ({
       text:           l.text,
       score:          l.score,
       bbox:           l.bbox,
@@ -1790,20 +1701,139 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
       title_verified: l.title_verified ?? false,
       src:            l.src            || 'ocr',
     }));
+
+    // Verify-before-accusing: a false misshelving flag is the worst mistake
+    // this app can make, so every label a provisional order check would flag
+    // gets one extra high-zoom local re-read of its own sticker. A longer
+    // Dewey decimal that extends the current read repairs a truncation (the
+    // common false-flag cause — "635.04" read off a 635.0484 sticker); a
+    // conflicting key demotes the label below the flag bar; agreement keeps
+    // the flag. The final checkOrder in showResults then re-derives flags
+    // from the corrected labels.
+    if (localOcrEnabled && window.LocalOCR && LocalOCR.available() && snapshot.width) {
+      try {
+        const provisional = checkOrder(labelsToBooks(out), tieSect);
+        const fx = snapshot.width / imgW, fy = snapshot.height / imgH;
+        // Per-row Dewey class census: a lone class one character off from the
+        // row's dominant class ("535.048" in a row of 635.048s) is a
+        // correlated misread — both engines confuse the same glyph — not a
+        // misshelved book, so it must never flag.
+        const rowClass = new Map();
+        if (tieSect === 'nonfiction') {
+          for (const o of out) {
+            const m = /^\s*(\d{3})\./.exec(o.text);
+            if (!m || o.score < 0.65) continue;
+            if (!rowClass.has(o.shelfRow)) rowClass.set(o.shelfRow, new Map());
+            const cm = rowClass.get(o.shelfRow);
+            cm.set(m[1], (cm.get(m[1]) || 0) + 1);
+          }
+        }
+        for (let i = 0; i < provisional.length; i++) {
+          if (!provisional[i].outOfOrder || !out[i].bbox) continue;
+          if (signal?.aborted) break;
+          if (tieSect === 'nonfiction') {
+            const myCls = (/^\s*(\d{3})\./.exec(out[i].text) || [])[1];
+            const cm = rowClass.get(out[i].shelfRow);
+            if (myCls && cm) {
+              let modal = null, modalN = 0;
+              for (const [c, n] of cm) if (n > modalN) { modal = c; modalN = n; }
+              if (modal !== myCls && modalN >= 4 && (cm.get(myCls) || 0) <= 1 &&
+                  fuseEditDist(myCls, modal) === 1) {
+                out[i].score = Math.min(out[i].score, 0.6);
+                console.log(`[perf] finishLabels: class-outlier demote "${out[i].text}" (row modal ${modal})`);
+                continue;
+              }
+            }
+          }
+          const b = out[i].bbox;
+          const rr = await LocalOCR.readRegion(snapshot, [b[0] * fx, b[1] * fy, b[2] * fx, b[3] * fy])
+            .catch(() => null);
+          if (!rr || !rr.text) { out[i].score = Math.min(out[i].score, 0.6); continue; }
+          const rTxt = normalizeLocalText(rr.text, tieSect);
+          const oldP = fuseParse(fuseNorm(out[i].text)), newP = fuseParse(fuseNorm(rTxt));
+          let verdict;
+          if (tieSect === 'nonfiction') {
+            // A crop that caught more than one sticker (two number tokens in
+            // the re-read) proves nothing about THIS sticker — inconclusive,
+            // so don't accuse.
+            const numToks = (rTxt.match(/\d{1,3}\.\d+|\b\d{3}\b/g) || []).length;
+            // Truncation-shaped flag: this book's number is a strict prefix
+            // of BOTH in-order neighbors' numbers ("641.567" between two
+            // 641.5676s). Stickers folded around the spine edge produce
+            // exactly this, so only an exact re-read confirmation may keep
+            // the flag — a shorter second read demotes it.
+            const truncShape = (() => {
+              if (!oldP.num) return false;
+              let ext = 0;
+              for (let j = 0; j < out.length; j++) {
+                if (j === i || out[j].shelfRow !== out[i].shelfRow) continue;
+                const nj = fuseParse(fuseNorm(out[j].text)).num;
+                if (nj && nj !== oldP.num && nj.startsWith(oldP.num)) ext++;
+              }
+              return ext >= 3;
+            })();
+            if (!oldP.num || !newP.num || !oldP.cut || !newP.cut) verdict = 'demote';
+            else if (numToks !== 1) verdict = 'demote';
+            else if (newP.cut.slice(0, 3) !== oldP.cut.slice(0, 3)) verdict = 'demote';
+            // Truncation-shaped flags can't be confirmed by re-reading the
+            // same prefix — the hidden trailing digit is exactly what's in
+            // question (stickers fold around the spine edge). Demote; only a
+            // re-read that extends or contradicts the number resolves one.
+            else if (newP.num === oldP.num) verdict = truncShape ? 'demote' : 'keep';
+            else if (newP.num.startsWith(oldP.num) && rr.conf >= 0.9) verdict = 'repair';
+            // recheck read LESS of the number than the original (a shorter
+            // prefix): the original stands — don't punish the flag for a
+            // worse second read (unless the flag is truncation-shaped)
+            else if (oldP.num.startsWith(newP.num)) verdict = truncShape ? 'demote' : 'keep';
+            else verdict = 'demote';
+          } else {
+            // Fiction flags usually hinge on a single character of the
+            // surname, so a re-read that differs at all (even edit 1) is not
+            // confirmation — only an exact surname match keeps the flag.
+            // And a surname that's a strict prefix of several same-row
+            // surnames ("WALD" among WALDMAN/WALDON) is truncation-shaped:
+            // re-reading the same prefix proves nothing, so demote unless
+            // the re-read extends it.
+            const truncShapeF = (() => {
+              if (!oldP.sur) return false;
+              let ext = 0;
+              for (let j = 0; j < out.length; j++) {
+                if (j === i || out[j].shelfRow !== out[i].shelfRow) continue;
+                const sj = fuseParse(fuseNorm(out[j].text)).sur;
+                if (sj && sj !== oldP.sur && sj.startsWith(oldP.sur)) ext++;
+              }
+              return ext >= 2;
+            })();
+            if (!oldP.sur || !newP.sur) verdict = 'demote';
+            else if (truncShapeF && newP.sur.length > oldP.sur.length &&
+                     newP.sur.startsWith(oldP.sur) && rr.conf >= 0.9) verdict = 'repair';
+            else if (truncShapeF) verdict = 'demote';
+            else verdict = oldP.sur === newP.sur ? 'keep' : 'demote';
+          }
+          if (verdict === 'repair') { out[i].text = rTxt; }
+          else if (verdict === 'demote') { out[i].score = Math.min(out[i].score, 0.6); }
+          console.log(`[perf] finishLabels: recheck "${provisional[i].spine_label}" -> "${rTxt}" (${verdict})`);
+        }
+      } catch (e) {
+        console.warn('flag recheck skipped:', e.message || e);
+      }
+    }
+
+    return out;
   }
 
-  // How long OCR results will wait for the in-flight Gemini cross-check
-  // before rendering without it. Gemini itself still gets up to
-  // GEMINI_TIMEOUT_MS to finish in the background; if it lands after this
-  // grace window, runOcr's `refine` promise carries the improved result so
-  // the caller can update the already-rendered UI in place.
-  const GEMINI_GRACE_MS = 1500;
+  // How long remote OCR results will wait for the in-flight local engine
+  // before rendering without it. The local engine keeps running in the
+  // background; if it lands after this grace window, runOcr's `refine`
+  // promise carries the improved result so the caller can update the
+  // already-rendered UI in place.
+  const LOCAL_GRACE_MS = 1500;
 
   // Run the full OCR pipeline; returns {labels, ms, imageSize, n, refine}.
-  // `refine` is null when Gemini either was disabled or answered within the
-  // grace window (already folded into `labels`); otherwise it's a promise
-  // that resolves to an improved {labels, imageSize, n} once Gemini lands,
-  // or null if Gemini ultimately failed/added nothing.
+  // `refine` is null when local OCR either was disabled or answered within
+  // the grace window (already folded into `labels`); otherwise it's a promise
+  // that resolves to an improved {labels, imageSize, n} once local OCR lands,
+  // or null if it ultimately failed/added nothing.
   // Calls onCall1Done() between the two proxy calls so the UI can advance stages.
   // ocr.space free tier throws transient 502s under back-to-back load; one
   // delayed retry recovers most of them. 4xx (bad request, file too large)
@@ -1821,14 +1851,16 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
     const t0 = performance.now();
     const section = getSection();
 
-    // Gemini tile calls fire immediately, in parallel with ocr.space, from
+    // The local engine fires immediately, in parallel with ocr.space, from
     // the full-res snapshot canvas (both the upload and AR paths draw into
-    // it). ocr.space and Gemini fail independently (502 rate limits vs 503
-    // capacity / 429 quota), so racing both means a scan only dies when BOTH
-    // are down — and first render comes from whichever answers first.
-    const geminiP = geminiEnabled
-      ? callGeminiTiles(snapshot, section, signal).catch(() => null)
-      : Promise.resolve(null);
+    // it). They fail independently (device too old / models still downloading
+    // vs 502 rate limits), so racing both means a scan only dies when BOTH
+    // fail — and first render comes from whichever answers first.
+    const localP = pendingLocal
+      ?? ((localOcrEnabled && window.LocalOCR && LocalOCR.available())
+        ? callLocalOcr(snapshot, signal).catch(() => null)
+        : Promise.resolve(null));
+    pendingLocal = null;
 
     const ocrP = (async () => {
       let labels, imgW, imgH;
@@ -1862,15 +1894,15 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
       return { labels, imgW, imgH };
     })();
 
-    // First-success race. Whichever service produces a usable result first
+    // First-success race. Whichever engine produces a usable result first
     // drives the first render; the other fuses in later as a background
-    // refine. A Gemini null/empty result counts as a loss, never a win.
+    // refine. A local null/empty result counts as a loss, never a win.
     let first;
     try {
       first = await Promise.any([
         ocrP.then(r => ({ kind: 'ocr', r })),
-        geminiP.then(g => {
-          if (!g || !g.length) throw new Error('gemini unavailable');
+        localP.then(g => {
+          if (!g || !g.length) throw new Error('local OCR unavailable');
           return { kind: 'gem', g };
         }),
       ]);
@@ -1881,21 +1913,25 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
     }
 
     if (first.kind === 'gem') {
-      // Gemini won (ocr.space slow or down): render its reads with its own
-      // real sticker boxes now. If OCR eventually lands, fuse and refine in
-      // place through the existing progressive-render path.
+      // Local OCR won (ocr.space slow or down): render its reads with their
+      // real sticker boxes now. If remote OCR eventually lands, fuse and
+      // refine in place through the existing progressive-render path.
       const imgW = snapshot.width, imgH = snapshot.height;
+      // Unconfirmed single-engine reads render at 0.6 (< the 0.65 flag bar):
+      // the first paint shows every book with its box, and misshelving flags
+      // appear moments later when the remote engine lands and the refine pass
+      // cross-confirms the reads.
       const gemLabels = mapGemToPixels(first.g, imgW, imgH)
         .filter(b => b.spine_label)
         .map(b => ({
           text: b.spine_label, bbox: b.bbox,
-          score: b.confidence === 'high' ? 0.9 : 0.4,
+          score: b.confidence === 'high' ? 0.6 : 0.4,
           src: 'gemini', title: b.title || null,
           title_score: b.confidence === 'high' ? 0.9 : 0.5,
         }));
       if (onCall1Done) onCall1Done();
       const finishedLabels = await finishLabels(gemLabels.map(l => ({ ...l })), imgW, imgH, null, section, signal);
-      console.log(`[perf] runOcr: gemini-first render ready at ${Math.round(performance.now() - t0)}ms`);
+      console.log(`[perf] runOcr: local-first render ready at ${Math.round(performance.now() - t0)}ms`);
       const refine = ocrP.then(async ({ labels: oLabels, imgW: oW, imgH: oH }) => {
         const gemPx = mapGemToPixels(first.g, oW, oH);
         const refined = await finishLabels(oLabels.map(l => ({ ...l })), oW, oH, gemPx, section, signal);
@@ -1912,32 +1948,32 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
 
     const { labels, imgW, imgH } = first.r;
 
-    // Race the already-in-flight Gemini promise against a short grace timer
-    // instead of always awaiting it — a slow cross-check must never hold up
-    // OCR results that are already sitting in memory.
-    const GRACE_TIMEOUT = Symbol('gemini-grace-timeout');
+    // Race the already-in-flight local promise against a short grace timer
+    // instead of always awaiting it — a slow device must never hold up
+    // remote OCR results that are already sitting in memory.
+    const GRACE_TIMEOUT = Symbol('local-grace-timeout');
     let graceTimer;
     // Cap the grace window so a slow OCR round trip can't push first render
     // past the 5s budget: shrink the remaining grace to whatever's left of a
     // 4.3s deadline from the start of runOcr, floored at 250ms.
-    const graceMs = Math.max(250, Math.min(GEMINI_GRACE_MS, 4300 - (performance.now() - t0)));
+    const graceMs = Math.max(250, Math.min(LOCAL_GRACE_MS, 4300 - (performance.now() - t0)));
     const graceP = new Promise(r => { graceTimer = setTimeout(() => r(GRACE_TIMEOUT), graceMs); });
-    const raced = geminiEnabled ? await Promise.race([geminiP, graceP]) : null;
+    const raced = localOcrEnabled ? await Promise.race([localP, graceP]) : null;
     clearTimeout(graceTimer);
     const gemOnTime = raced === GRACE_TIMEOUT || !raced ? null : mapGemToPixels(raced, imgW, imgH);
-    console.log(`[perf] runOcr: gemini race resolved at ${Math.round(performance.now() - t0)}ms (${raced === GRACE_TIMEOUT ? 'grace won — rendering OCR-only, gemini will refine' : raced ? 'gemini won — fused into first render' : 'gemini unavailable — OCR-only'})`);
+    console.log(`[perf] runOcr: local race resolved at ${Math.round(performance.now() - t0)}ms (${raced === GRACE_TIMEOUT ? 'grace won — rendering remote-only, local will refine' : raced ? 'local won — fused into first render' : 'local unavailable — remote-only'})`);
 
     if (onCall1Done) onCall1Done();
 
     const finishedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gemOnTime, section, signal);
     console.log(`[perf] runOcr: finishLabels (first render) ready at ${Math.round(performance.now() - t0)}ms`);
 
-    // Gemini didn't make the grace window — hand the caller a promise that
+    // Local OCR didn't make the grace window — hand the caller a promise that
     // resolves to a refined result once it (eventually) does, so the UI can
     // fuse it in without blocking the first render.
     let refine = null;
     if (raced === GRACE_TIMEOUT) {
-      refine = geminiP.then(async gem => {
+      refine = localP.then(async gem => {
         if (!gem || !gem.length) return null;
         const gemPx = mapGemToPixels(gem, imgW, imgH);
         const refinedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gemPx, section, signal);
@@ -2018,7 +2054,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
 
   // Small non-blocking pill shown while OCR-only results are already on
   // screen but the Gemini cross-check is still refining them in the
-  // background (see runOcr's `refine` promise / GEMINI_GRACE_MS).
+  // background (see runOcr's `refine` promise / LOCAL_GRACE_MS).
   function showRefiningBadge(parent = photoArea) {
     hideRefiningBadge();
     const badge = document.createElement('div');
@@ -2033,7 +2069,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
   function cancelAnalysis() {
     analysisCancelled = true;
     analysisAbort?.abort();
-    analysisGeneration++;   // invalidate any in-flight Gemini refine
+    analysisGeneration++;   // invalidate any in-flight refine
     hideLoading();
     hideRefiningBadge();
     if (arActive) {
@@ -2233,7 +2269,7 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
     arSheet.classList.remove('show'); arSheet.innerHTML = '';
     arResume.classList.remove('show');
     arActive = false;
-    analysisGeneration++;   // invalidate any in-flight Gemini refine
+    analysisGeneration++;   // invalidate any in-flight refine
     hideRefiningBadge();
     cameraVideo.play().catch(() => {});
   }
@@ -2591,7 +2627,15 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
         cmp = (a.val.numStr === null) === (b.val.numStr === null) ? 0
             : (a.val.numStr === null ? 1 : -1);
       } else {
-        cmp = compareDeweyNums(a.val.numStr, b.val.numStr);
+        const as = String(a.val.numStr), bs = String(b.val.numStr);
+        // A bare read ("635") next to a decimal read with the same integer
+        // part ("635.04") is more often a truncated read than a really-bare
+        // sticker, and bare-sorts-first would then flag the correctly-read
+        // neighbor. Treat the pair as fully tied (no cutter tiebreak — the
+        // two books' cutters aren't comparable across that uncertainty).
+        if (as.includes('.') !== bs.includes('.') &&
+            parseInt(as, 10) === parseInt(bs, 10)) return 0;
+        cmp = compareDeweyNums(as, bs);
       }
       if (cmp === 0) cmp = a.val.cut.localeCompare(b.val.cut, undefined, { sensitivity: 'base' });
     }
@@ -2742,6 +2786,17 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
                             (minLen >= 4 && editDistance(vM, vN) <= 1))) { demote = true; break; }
         }
       }
+      // Dewey cutter near-twin: same call number as both neighbors and a
+      // cutter one edit away from a neighbor's is a misread of that neighbor's
+      // sticker ("635 FRA" beside "635 FRO"), not a misshelved book.
+      if (!demote && kM.kind !== 'str' && kL.kind === kM.kind && kR.kind === kM.kind &&
+          kM.val.num != null && kM.val.num === kL.val.num && kM.val.num === kR.val.num) {
+        const cM = kM.val.cut || '';
+        for (const kN of [kL, kR]) {
+          const cN = kN.val.cut || '';
+          if (cM && cN && cM !== cN && editDistance(cM, cN) <= 1) { demote = true; break; }
+        }
+      }
       if (demote) { checked[i].outOfOrder = false; checked[i].unverifiable = true; checked[i].idealPosition = null; }
     }
     return checked;
@@ -2749,9 +2804,23 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
 
   function checkOrder(books, section) {
     const shelves = groupByShelfRow(books);
-    return shelves.flatMap((shelf, si) =>
+    const checked = shelves.flatMap((shelf, si) =>
       checkOrderOneShelf(shelf, section).map(b => ({ ...b, shelfIndex: si }))
     );
+    // Stray-duplicate demotion: a flagged label whose exact text also sits
+    // IN order in a different row is almost always the same sticker detected
+    // twice (tile overlap / row mis-clustering), not a second misshelved
+    // copy — don't accuse on a phantom.
+    const dupNorm = t => (t || '').toUpperCase().replace(/\s+/g, ' ').trim();
+    for (const b of checked) {
+      if (!b.outOfOrder) continue;
+      const n = dupNorm(b.spine_label);
+      if (n && checked.some(o => o !== b && !o.outOfOrder && !o.unverifiable &&
+                                 o.shelfRow !== b.shelfRow && dupNorm(o.spine_label) === n)) {
+        b.outOfOrder = false; b.unverifiable = true; b.idealPosition = null;
+      }
+    }
+    return checked;
   }
 
   // ── Results display ───────────────────────────────────────────────────────
@@ -2966,16 +3035,30 @@ Example of unreadable or cropped sticker: [null, "The Stand", 0, [842,172,884,21
 
   const geminiToggle = document.getElementById('geminiToggle');
   const geminiSwitch  = document.getElementById('geminiToggleSwitch');
-  geminiSwitch.classList.toggle('on', geminiEnabled);
-  geminiToggle.setAttribute('aria-checked', String(geminiEnabled));
+  geminiSwitch.classList.toggle('on', localOcrEnabled);
+  geminiToggle.setAttribute('aria-checked', String(localOcrEnabled));
   geminiToggle.addEventListener('click', () => {
-    geminiEnabled = !geminiEnabled;
-    localStorage.setItem('shelfcheck.gemini', geminiEnabled ? '1' : '0');
-    geminiSwitch.classList.toggle('on', geminiEnabled);
-    geminiToggle.setAttribute('aria-checked', String(geminiEnabled));
+    localOcrEnabled = !localOcrEnabled;
+    localStorage.setItem('shelfcheck.localocr', localOcrEnabled ? '1' : '0');
+    geminiSwitch.classList.toggle('on', localOcrEnabled);
+    geminiToggle.setAttribute('aria-checked', String(localOcrEnabled));
     settingsMenu.classList.remove('show');
     settingsBtn.setAttribute('aria-expanded', 'false');
+    if (localOcrEnabled && window.LocalOCR && LocalOCR.available()) {
+      LocalOCR.preload().catch(() => {});
+    }
   });
+
+  // Warm the local engine as soon as the page is idle: the one-time ~31MB
+  // model download plus session compile happens while the user lines up the
+  // shot instead of inside the first scan.
+  if (localOcrEnabled) {
+    const warm = () => {
+      if (window.LocalOCR && LocalOCR.available()) LocalOCR.preload().catch(() => {});
+    };
+    if ('requestIdleCallback' in window) requestIdleCallback(warm, { timeout: 4000 });
+    else setTimeout(warm, 1500);
+  }
 
 
   function showTimingBadge(prepMs, apiMs, ocrMs) {
