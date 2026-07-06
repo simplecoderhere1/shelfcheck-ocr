@@ -362,6 +362,17 @@
        arTrackTick) so they visually track the camera between analysis
        cycles — the video itself never freezes. */
     #arLiveOverlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; }
+    /* Tapping a green/grey box (no list row to open) pops this instead —
+       a small floating readout of what was read, positioned by JS next to
+       the tapped box. */
+    .ar-caption {
+      display: none; position: absolute; z-index: 4; max-width: 220px;
+      background: rgba(17,17,17,.92); color: #fff; font-size: 12px; font-weight: 600;
+      padding: 5px 9px; border-radius: 7px; pointer-events: none;
+      box-shadow: 0 2px 8px rgba(0,0,0,.4); white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .ar-caption.show { display: block; }
     .ar-sheet {
       display: none; position: absolute; left: 0; right: 0; bottom: 0; z-index: 5;
       flex-direction: column; background: #111; border-top: 1px solid #2c2c2c;
@@ -450,6 +461,7 @@
   <video id="cameraVideo" playsinline autoplay muted aria-hidden="true"></video>
   <canvas id="arLiveOverlay" aria-hidden="true"></canvas>
   <div class="box-pulse" id="arBoxPulse"></div>
+  <div class="ar-caption" id="arCaption"></div>
   <div class="cam-message" id="camMessage">Point at a shelf row — scanning automatically</div>
   <button class="cam-close" id="camClose" aria-label="Close camera">&times;</button>
   <div class="ar-sheet" id="arSheet" role="region" aria-label="Flagged books"></div>
@@ -622,22 +634,73 @@
     cameraVideo.style.transform = `scale(${camZoom})`;
   }
 
+  // Sticker text is tiny relative to the whole frame, and a browser is free
+  // to silently negotiate a getUserMedia video stream down to something like
+  // 640x480 under a bare "ideal" hint even on hardware that supports far
+  // more — there's no floor unless one is asked for. Try progressively
+  // lower resolution floors (not just "ideal") until one is accepted, and
+  // ask for a modest frame rate throughout: the live loop only needs the
+  // video smooth enough for cheap motion tracking (see arTrackTick), not a
+  // full 30fps, and relaxing frame rate lets some phones unlock a higher
+  // resolution mode on the same camera.
+  const AR_RES_STAGES = [
+    { width: { min: 3840 }, height: { min: 2160 } },
+    { width: { min: 2560 }, height: { min: 1440 } },
+    { width: { min: 1920 }, height: { min: 1080 } },
+    { width: { min: 1280 }, height: { min: 720 } },
+    {},   // last resort: whatever the device/browser defaults to
+  ];
+
   async function openLiveCamera() {
     landscapeGate.classList.remove('show');
     if (!navigator.mediaDevices?.getUserMedia) { photoInput.click(); return; }
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
-        audio: false,
-      });
-    } catch { photoInput.click(); return; }
+    let stream = null;
+    for (const res of AR_RES_STAGES) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, frameRate: { ideal: 15, max: 24 }, ...res },
+          audio: false,
+        });
+        break;
+      } catch { /* try the next, lower-floor stage */ }
+    }
+    if (!stream) { photoInput.click(); return; }
     cameraStream = stream;
     cameraVideo.srcObject = stream;
     setZoom(1);
     cameraLive.classList.add('show');
     try { await cameraVideo.play(); } catch {}
+    const settings = stream.getVideoTracks()[0]?.getSettings?.() || {};
+    console.log(`[perf] openLiveCamera: negotiated ${settings.width}x${settings.height} @ ${settings.frameRate || '?'}fps ` +
+                `(video element reports ${cameraVideo.videoWidth}x${cameraVideo.videoHeight})`);
+    arSetupImageCapture(stream);
     startArLoop();
+  }
+
+  // Progressive enhancement: ImageCapture.takePhoto() pulls a genuine
+  // photographic still from the camera hardware — meaningfully higher
+  // resolution than the live preview stream on devices that support it
+  // (Chrome/Android). Safari on iOS doesn't implement ImageCapture at all,
+  // so this silently stays null there and arScanCycle keeps using the video-
+  // frame grab it already had, same as before — never worse, sometimes
+  // considerably better.
+  let arImageCapture = null;
+  function arSetupImageCapture(stream) {
+    arImageCapture = null;
+    if (typeof ImageCapture === 'undefined') return;
+    try { arImageCapture = new ImageCapture(stream.getVideoTracks()[0]); } catch { arImageCapture = null; }
+  }
+
+  // Grab the frame to analyze this cycle: a real high-res still via
+  // ImageCapture where available, otherwise the current live video frame.
+  // Returns null on total failure (caller falls back to the video frame).
+  async function arGrabStillPhoto() {
+    if (!arImageCapture) return null;
+    try {
+      const blob = await arImageCapture.takePhoto();
+      const bmp = await createImageBitmap(blob);
+      return bmp;
+    } catch { return null; }
   }
 
   function closeLiveCamera() {
@@ -778,16 +841,24 @@
       const bx = Math.min(x0, x1), by = Math.min(y0, y1);
       const bw = Math.abs(x1 - x0), bh = Math.abs(y1 - y0);
       entry._overlayRect = [bx, by, bw, bh];
+      // Every book gets a thin outline (never filled) so the spine stays
+      // readable underneath — red misshelved, grey unconfirmed, green
+      // confidently correct. Only flagged boxes get a number badge, matching
+      // the "box N" the flagged-list rows show — a solid green wall of
+      // badges on a 40-book shelf would be pure clutter for boxes that don't
+      // have a corresponding list row to point at anyway.
       ctx.strokeStyle = entry.color; ctx.lineWidth = lw;
       if (entry.dashed) ctx.setLineDash([6, 4]);
       ctx.strokeRect(bx, by, bw, bh);
       ctx.setLineDash([]);
-      const num = String(entry.index);
-      const tw = ctx.measureText(num).width;
-      ctx.fillStyle = entry.color; ctx.globalAlpha = 0.85;
-      ctx.fillRect(bx, by - fs - 3, tw + 6, fs + 3);
-      ctx.globalAlpha = 1; ctx.fillStyle = '#000';
-      ctx.fillText(num, bx + 3, by - 2);
+      if (entry.index != null) {
+        const num = String(entry.index);
+        const tw = ctx.measureText(num).width;
+        ctx.fillStyle = entry.color; ctx.globalAlpha = 0.85;
+        ctx.fillRect(bx, by - fs - 3, tw + 6, fs + 3);
+        ctx.globalAlpha = 1; ctx.fillStyle = '#000';
+        ctx.fillText(num, bx + 3, by - 2);
+      }
     }
   }
 
@@ -804,25 +875,36 @@
   }
 
   // Turn a fresh analysis result into tracker state: run the SAME checkOrder
-  // flag logic as ever, remap each flagged book's bbox from image-pixel space
-  // back into full video-frame pixel space using the capture rect this cycle
-  // used, reset the tracker's reference frame + zero the accumulated motion,
-  // and refresh the flagged-books sheet.
+  // flag logic as ever, remap EVERY book's bbox (not just flagged ones) from
+  // image-pixel space back into full video-frame pixel space using the
+  // capture rect this cycle used, reset the tracker's reference frame + zero
+  // the accumulated motion, and refresh the flagged-books sheet. Every
+  // detected book gets a box now — red for misshelved, grey for "couldn't
+  // confirm", green for confidently correct — so the overlay reads like a
+  // live labeling pass over the whole shelf rather than only surfacing
+  // problems. Numbering (for the tap-to-list correlation) stays reserved for
+  // flagged books, same as the sheet below, so a dense shelf of green boxes
+  // doesn't turn into a wall of badges.
   function arApplyResults(books, section, rect) {
     const checked = checkOrder(books, section);
     lastCheckedBooks = checked;
     const sentW = lastApiDims.sentW, sentH = lastApiDims.sentH;
     const toVideoX = sc => rect.sx + sc * (rect.sw / sentW);
     const toVideoY = sc => rect.sy + sc * (rect.sh / sentH);
-    arLastBoxes = checked.filter(b => b._bbox && (b.outOfOrder || b.unverifiable))
-      .map((b, i) => {
+    // "box N" in the flagged-list rows (showFlaggedList) is each book's 1-based
+    // position among ALL books on the shelf, not a flagged-only count — match
+    // that here so a box's badge number is the same number its list row shows.
+    arLastBoxes = checked.filter(b => b._bbox)
+      .map((b) => {
         const [bx, by, bw, bh] = b._bbox;
+        const flagged = b.outOfOrder || b.unverifiable;
         return {
           bbox: [toVideoX(bx), toVideoY(by), bw * (rect.sw / sentW), bh * (rect.sh / sentH)],
           book: b,
-          color: b.unverifiable ? '#facc15' : '#ef4444',
+          color: b.outOfOrder ? '#ef4444' : b.unverifiable ? '#9ca3af' : '#22c55e',
           dashed: b._src === 'gemini-synth',
-          index: i + 1,
+          flagged,
+          index: flagged ? checked.indexOf(b) + 1 : null,
           _overlayRect: null,
         };
       });
@@ -852,13 +934,33 @@
   async function arScanCycle() {
     const myToken = arLoopToken;
     if (!arActive) return;
+    // rect stays in VIDEO-pixel space throughout — it's what arApplyResults
+    // uses afterward to map analysis results back onto the live overlay, and
+    // that mapping is resolution-agnostic (a ratio), so it's unaffected by
+    // which source image (video frame vs a higher-res still) actually gets
+    // analyzed below.
     const rect = computeCaptureRect();
     if (!rect) { setTimeout(() => { if (arLoopToken === myToken) arScanCycle(); }, 400); return; }
 
-    const sc = Math.min(1, MAX_CANVAS_DIM / Math.max(rect.sw, rect.sh));
-    snapshot.width  = Math.round(rect.sw * sc);
-    snapshot.height = Math.round(rect.sh * sc);
-    snapshot.getContext('2d').drawImage(cameraVideo, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, snapshot.width, snapshot.height);
+    // Prefer a real photographic still (ImageCapture) when available — much
+    // higher resolution than the live preview stream, which matters because
+    // the sticker text this app reads is tiny relative to the whole frame.
+    // Rescale the video-space crop rect into the still's own pixel space
+    // (same physical framing, just a different resolution) before cropping.
+    const stillPhoto = await arGrabStillPhoto();
+    if (arLoopToken !== myToken) return;   // camera closed mid-capture
+    const source = stillPhoto || cameraVideo;
+    const srcW = stillPhoto ? stillPhoto.width  : cameraVideo.videoWidth;
+    const srcH = stillPhoto ? stillPhoto.height : cameraVideo.videoHeight;
+    const rx = stillPhoto ? srcW / cameraVideo.videoWidth  : 1;
+    const ry = stillPhoto ? srcH / cameraVideo.videoHeight : 1;
+    const cropX = rect.sx * rx, cropY = rect.sy * ry, cropW = rect.sw * rx, cropH = rect.sh * ry;
+
+    const sc = Math.min(1, MAX_CANVAS_DIM / Math.max(cropW, cropH));
+    snapshot.width  = Math.round(cropW * sc);
+    snapshot.height = Math.round(cropH * sc);
+    snapshot.getContext('2d').drawImage(source, cropX, cropY, cropW, cropH, 0, 0, snapshot.width, snapshot.height);
+    stillPhoto?.close?.();
     saveCleanPhoto();
 
     camMessage.textContent = 'Scanning…';
@@ -918,17 +1020,21 @@
     arLoopToken++;   // in-flight cycle's checks will now fail, so it stops rescheduling itself
     if (analysisAbort) { analysisCancelled = true; analysisAbort.abort(); analysisAbort = null; }
     if (arTrackHandle) { cancelAnimationFrame(arTrackHandle); arTrackHandle = null; }
-    arLastBoxes = []; arKeyLuma = null;
+    arLastBoxes = []; arKeyLuma = null; arImageCapture = null;
     const ctx = arLiveOverlay.getContext('2d');
     if (arLiveOverlay.width) ctx.clearRect(0, 0, arLiveOverlay.width, arLiveOverlay.height);
     arBoxPulse.classList.remove('show');
     arSheet.classList.remove('show'); arSheet.innerHTML = '';
+    arCaptionEl?.classList.remove('show');
   }
 
   // Tap-to-highlight on the live overlay: hit-test against each box's last
   // rendered on-screen rect (arRenderOverlay keeps these current every frame)
   // rather than the classic canvas/sentW-sentH math, since the AR overlay's
-  // mapping changes continuously with camera pan/zoom.
+  // mapping changes continuously with camera pan/zoom. Every box is tappable
+  // now, not just flagged ones — flagged boxes open their flagged-list row
+  // as before; green/grey boxes (no list row to open) pop a small caption
+  // with what was read instead.
   arLiveOverlay.addEventListener('click', e => {
     if (!arActive) return;
     const rect = arLiveOverlay.getBoundingClientRect();
@@ -938,8 +1044,17 @@
     const hit = arLastBoxes.find(en => en._overlayRect &&
       tapX >= en._overlayRect[0] && tapX <= en._overlayRect[0] + en._overlayRect[2] &&
       tapY >= en._overlayRect[1] && tapY <= en._overlayRect[1] + en._overlayRect[3]);
-    if (hit) { highlightArrow(hit.book); openBookDetail(hit.book, arSheet); }
-    else arBoxPulse.classList.remove('show');
+    if (hit && hit.flagged) {
+      arHideCaption();
+      highlightArrow(hit.book);
+      openBookDetail(hit.book, arSheet);
+    } else if (hit) {
+      popBoxPulse(hit.book);
+      arShowCaption(hit);
+    } else {
+      arBoxPulse.classList.remove('show');
+      arHideCaption();
+    }
   });
 
   // Pinch-to-zoom
@@ -2624,9 +2739,34 @@
 
   const boxPulse   = document.getElementById('boxPulse');
   const arBoxPulse = document.getElementById('arBoxPulse');
+  const arCaptionEl = document.getElementById('arCaption');
+
+  // Small floating readout for tapping a green ("confidently correct") AR
+  // box — red and grey boxes both already have a flagged-list row to open
+  // instead (grey/unverifiable books are on that list same as red ones), so
+  // this only ever fires for a book with neither flag.
+  function arShowCaption(entry) {
+    if (!entry._overlayRect) return;
+    const dpr = window.devicePixelRatio || 1;
+    const [ox, oy] = entry._overlayRect;
+    const oRect = arLiveOverlay.getBoundingClientRect();
+    const pRect = cameraLive.getBoundingClientRect();
+    arCaptionEl.textContent = `${entry.book.spine_label || '(unreadable)'} — looks correct`;
+    arCaptionEl.style.left = `${(oRect.left - pRect.left) + ox / dpr}px`;
+    arCaptionEl.style.top  = `${(oRect.top  - pRect.top)  + oy / dpr - 28}px`;
+    arCaptionEl.classList.add('show');
+    clearTimeout(arCaptionEl._hideTimer);
+    arCaptionEl._hideTimer = setTimeout(() => arCaptionEl.classList.remove('show'), 3000);
+  }
+  function arHideCaption() { arCaptionEl.classList.remove('show'); }
+
   function popBoxPulse(book) {
     const pulse = activePulseEl();
-    if (!book?._bbox || !lastApiDims || (!book.outOfOrder && !book.unverifiable)) {
+    // The classic still-photo view only ever draws (and lists) flagged
+    // books, so a non-flagged book never reaches here in that mode anyway —
+    // this guard only matters for classic mode. AR mode now draws (and can
+    // pulse) a box for every book, including confidently-correct ones.
+    if (!book?._bbox || !lastApiDims || (!arActive && !book.outOfOrder && !book.unverifiable)) {
       pulse.classList.remove('show');
       return;
     }
