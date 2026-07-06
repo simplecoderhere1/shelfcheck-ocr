@@ -353,18 +353,15 @@
     .camera-live { display: none; position: fixed; inset: 0; z-index: 70; background: #000; overflow: hidden; touch-action: none; }
     .camera-live.show { display: block; }
     .camera-live video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform-origin: center center; }
-    .cam-message { position: absolute; top: max(14px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 3; font-size: 13px; font-weight: 600; color: #fff; background: rgba(0,0,0,.5); padding: 6px 14px; border-radius: 20px; white-space: nowrap; pointer-events: none; }
-    .cam-controls { position: absolute; top: 0; bottom: 0; right: 0; padding: 0 14px; padding-right: max(14px, env(safe-area-inset-right)); display: flex; align-items: center; justify-content: center; z-index: 3; background: linear-gradient(to left, rgba(0,0,0,.4), transparent); }
-    .cam-shutter { width: 46px; height: 46px; border-radius: 50%; border: 3px solid rgba(255,255,255,.9); background: #fff; cursor: pointer; flex-shrink: 0; transition: transform .1s ease; }
-    .cam-shutter:active { transform: scale(.94); }
+    .cam-message { position: absolute; top: max(14px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 3; font-size: 13px; font-weight: 600; color: #fff; background: rgba(0,0,0,.5); padding: 6px 14px; border-radius: 20px; white-space: nowrap; pointer-events: none; transition: opacity .2s ease; }
     .cam-close { position: absolute; top: max(12px, env(safe-area-inset-top)); left: max(12px, env(safe-area-inset-left)); z-index: 3; width: 40px; height: 40px; border-radius: 50%; border: none; background: rgba(0,0,0,.5); color: #fff; font-size: 24px; line-height: 1; cursor: pointer; }
 
-    /* AR capture: freeze-frame + overlay shown in place of the live video
-       while a photo is analyzed and its results are shown. */
-    #camFreeze { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: none; z-index: 1; background: #000; transition: filter .25s ease-out; }
-    #camFreeze.show { display: block; }
-    #camFreeze.loading { animation: ar-shimmer 1.6s ease-in-out infinite; }
-    @keyframes ar-shimmer { 0%, 100% { filter: brightness(.55); } 50% { filter: brightness(.72); } }
+    /* Live AR: a transparent overlay canvas sits on top of the still-playing
+       camera video. Boxes from the last completed analysis are drawn onto it
+       and repositioned every frame by a lightweight motion tracker (see
+       arTrackTick) so they visually track the camera between analysis
+       cycles — the video itself never freezes. */
+    #arLiveOverlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; }
     .ar-sheet {
       display: none; position: absolute; left: 0; right: 0; bottom: 0; z-index: 5;
       flex-direction: column; background: #111; border-top: 1px solid #2c2c2c;
@@ -373,14 +370,6 @@
       opacity: 0; transition: opacity .18s ease-out;
     }
     .ar-sheet.show { display: flex; opacity: 1; }
-    .ar-resume {
-      display: none; position: absolute; left: 50%; transform: translateX(-50%);
-      bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 6;
-      background: #fff; color: #111; border: none; border-radius: 22px;
-      padding: 10px 22px; font-size: 14px; font-weight: 700; cursor: pointer;
-      box-shadow: 0 2px 10px rgba(0,0,0,.35);
-    }
-    .ar-resume.show { display: block; }
   </style>
   <!-- COOP/COEP shim: enables crossOriginIsolated on GitHub Pages so the
        local OCR engine can use multi-threaded WASM (one reload, first visit only). -->
@@ -459,14 +448,10 @@
 
 <div class="camera-live" id="cameraLive" role="dialog" aria-label="Camera">
   <video id="cameraVideo" playsinline autoplay muted aria-hidden="true"></video>
-  <canvas id="camFreeze" role="img" aria-label="Captured shelf photo"></canvas>
+  <canvas id="arLiveOverlay" aria-hidden="true"></canvas>
   <div class="box-pulse" id="arBoxPulse"></div>
-  <div class="cam-message">Take a picture of one shelf row</div>
+  <div class="cam-message" id="camMessage">Point at a shelf row — scanning automatically</div>
   <button class="cam-close" id="camClose" aria-label="Close camera">&times;</button>
-  <div class="cam-controls">
-    <button class="cam-shutter" id="camShutter" aria-label="Take photo"></button>
-  </div>
-  <button class="ar-resume" id="arResume" aria-label="Resume live camera">&#8635; Resume camera</button>
   <div class="ar-sheet" id="arSheet" role="region" aria-label="Flagged books"></div>
 </div>
 
@@ -623,13 +608,12 @@
   });
 
   // ── Live in-app camera ────────────────────────────────────────────────────
-  const cameraLive  = document.getElementById('cameraLive');
-  const cameraVideo = document.getElementById('cameraVideo');
-  const camShutter  = document.getElementById('camShutter');
-  const camClose    = document.getElementById('camClose');
-  const camFreeze   = document.getElementById('camFreeze');
-  const arSheet     = document.getElementById('arSheet');
-  const arResume    = document.getElementById('arResume');
+  const cameraLive   = document.getElementById('cameraLive');
+  const cameraVideo  = document.getElementById('cameraVideo');
+  const camClose     = document.getElementById('camClose');
+  const arLiveOverlay = document.getElementById('arLiveOverlay');
+  const arSheet      = document.getElementById('arSheet');
+  const camMessage   = document.getElementById('camMessage');
   let cameraStream  = null;
   let camZoom       = 1;
 
@@ -653,9 +637,12 @@
     setZoom(1);
     cameraLive.classList.add('show');
     try { await cameraVideo.play(); } catch {}
+    startArLoop();
   }
 
   function closeLiveCamera() {
+    const hadResults = arActive && lastRawBooks && lastRawBooks.length;
+    stopArLoop();
     cameraLive.classList.remove('show');
     if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
     cameraVideo.srcObject = null;
@@ -665,30 +652,21 @@
       document.getElementById('errorBanner')?.remove();
     }
 
-    if (arActive) {
+    if (hadResults) {
       // Hand off to the classic still-photo view — snapshot already holds
-      // the captured frame (and results too, if analysis finished before Close).
-      if (analysisAbort) { analysisCancelled = true; analysisAbort.abort(); }
-      hideLoading();
-      camFreeze.classList.remove('show', 'loading');
-      arBoxPulse.classList.remove('show');
-      arSheet.classList.remove('show'); arSheet.innerHTML = '';
-      arResume.classList.remove('show');
-      arActive = false;
+      // the last frame the live loop analyzed (and its results).
       photoPlaceholder.style.display = 'none';
       snapshot.style.display = 'block';
-      if (lastRawBooks && lastRawBooks.length) {
-        showResults(lastRawBooks, getSection());
-      } else {
-        actionBar.classList.add('show');
-        analyzeBtn.disabled = false;
-      }
+      showResults(lastRawBooks, getSection());
+    } else {
+      actionBar.classList.add('show');
+      analyzeBtn.disabled = false;
     }
   }
 
   // Pure math: what region of the video frame is currently on screen, in
   // video-pixel space, accounting for the cover-fit + pinch zoom. Returns
-  // null if the camera isn't ready yet. Shared by the AR capture flow below.
+  // null if the camera isn't ready yet. Shared by the live AR loop below.
   function computeCaptureRect() {
     const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
     const dispW = cameraLive.clientWidth, dispH = cameraLive.clientHeight;
@@ -703,15 +681,274 @@
     return { sx, sy, sw: Math.max(1, sx2 - sx), sh: Math.max(1, sy2 - sy) };
   }
 
+  // ── Live AR: continuous scanning, no shutter ─────────────────────────────
+  // Google Lens/Word Lens play the same trick: a slow, accurate recognition
+  // pass runs asynchronously in the background (can take multiple seconds),
+  // while a cheap per-frame visual tracker drags the LAST pass's boxes along
+  // with the camera in between, so the overlay never looks frozen even
+  // though the actual text reading isn't running anywhere near 60fps.
+  // (Google's own patent for this: US20140112527A1.) The full det+rec
+  // pipeline and every flag-safety rule are reused completely unchanged —
+  // only the on-screen box POSITION between analyses is ever approximated.
+  let arLoopToken   = 0;     // bumped on stop/restart so a stale cycle can't apply results after the fact
+  let arLastBoxes   = [];    // [{bbox:[vx,vy,vw,vh] in video-pixel space, book, color, dashed, index, _overlayRect}]
+  let arKeyLuma     = null;  // Uint8ClampedArray — downsampled grayscale of the frame the last analysis used
+  let arMotion      = { dx: 0, dy: 0 };  // accumulated video-px drift since arKeyLuma was captured
+  let arTrackHandle = null;
+  let arLumaScratch = null;
+
+  const AR_TRACK_W = 96, AR_TRACK_H = 72, AR_SEARCH = 14;
+
+  // Downsampled grayscale of the currently-visible capture region — cheap
+  // enough to recompute every frame (a few thousand pixels).
+  function arGrabLuma(rect) {
+    const c = arLumaScratch || (arLumaScratch = document.createElement('canvas'));
+    c.width = AR_TRACK_W; c.height = AR_TRACK_H;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(cameraVideo, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, AR_TRACK_W, AR_TRACK_H);
+    const px = ctx.getImageData(0, 0, AR_TRACK_W, AR_TRACK_H).data;
+    const n = AR_TRACK_W * AR_TRACK_H;
+    const luma = new Uint8ClampedArray(n);
+    for (let i = 0; i < n; i++) {
+      const o = i * 4;
+      luma[i] = (px[o] * 0.299 + px[o + 1] * 0.587 + px[o + 2] * 0.114) | 0;
+    }
+    return luma;
+  }
+
+  // Coarse global motion estimate between two downsampled grayscale frames:
+  // sum-of-absolute-differences block match over a small search window, on a
+  // strided pixel sample. Deliberately a single rigid (dx,dy) for the whole
+  // frame rather than per-feature optical flow — good enough for panning
+  // across a shelf, and far simpler (and less failure-prone) to get right
+  // than a full tracker.
+  function arEstimateMotion(prevLuma, curLuma) {
+    let bestDx = 0, bestDy = 0, bestScore = Infinity;
+    const W = AR_TRACK_W, H = AR_TRACK_H, R = AR_SEARCH;
+    for (let dy = -R; dy <= R; dy += 2) {
+      for (let dx = -R; dx <= R; dx += 2) {
+        let sad = 0, cnt = 0;
+        for (let y = R; y < H - R; y += 3) {
+          const rowPrev = y * W, rowCur = (y + dy) * W;
+          for (let x = R; x < W - R; x += 3) {
+            sad += Math.abs(prevLuma[rowPrev + x] - curLuma[rowCur + x + dx]);
+            cnt++;
+          }
+        }
+        const score = sad / cnt;
+        if (score < bestScore) { bestScore = score; bestDx = dx; bestDy = dy; }
+      }
+    }
+    return { dx: bestDx, dy: bestDy };
+  }
+
+  // Map a point in full video-frame pixel space to the overlay canvas's own
+  // pixel space, given the current cover-fit + pinch zoom (the inverse of
+  // computeCaptureRect's toVX/toVY math).
+  function arVideoToOverlay(vx, vy) {
+    const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
+    const dispW = cameraLive.clientWidth, dispH = cameraLive.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+    const cover = Math.max(dispW / vw, dispH / vh);
+    const eff = cover * camZoom;
+    return [
+      (dispW / 2 + (vx - vw / 2) * eff) * dpr,
+      (dispH / 2 + (vy - vh / 2) * eff) * dpr,
+    ];
+  }
+
+  function arRenderOverlay() {
+    const dpr = window.devicePixelRatio || 1;
+    const cw = Math.max(1, Math.round(cameraLive.clientWidth  * dpr));
+    const ch = Math.max(1, Math.round(cameraLive.clientHeight * dpr));
+    if (arLiveOverlay.width !== cw || arLiveOverlay.height !== ch) {
+      arLiveOverlay.width = cw; arLiveOverlay.height = ch;
+    }
+    const ctx = arLiveOverlay.getContext('2d');
+    ctx.clearRect(0, 0, cw, ch);
+    if (!arLastBoxes.length) return;
+    const lw = Math.max(2, Math.round(cw / 260));
+    const fs = Math.max(11, Math.round(cw / 40));
+    ctx.font = `bold ${fs}px sans-serif`;
+    ctx.textBaseline = 'bottom';
+    for (const entry of arLastBoxes) {
+      const [vx, vy, vw2, vh2] = entry.bbox;
+      const [x0, y0] = arVideoToOverlay(vx + arMotion.dx, vy + arMotion.dy);
+      const [x1, y1] = arVideoToOverlay(vx + vw2 + arMotion.dx, vy + vh2 + arMotion.dy);
+      const bx = Math.min(x0, x1), by = Math.min(y0, y1);
+      const bw = Math.abs(x1 - x0), bh = Math.abs(y1 - y0);
+      entry._overlayRect = [bx, by, bw, bh];
+      ctx.strokeStyle = entry.color; ctx.lineWidth = lw;
+      if (entry.dashed) ctx.setLineDash([6, 4]);
+      ctx.strokeRect(bx, by, bw, bh);
+      ctx.setLineDash([]);
+      const num = String(entry.index);
+      const tw = ctx.measureText(num).width;
+      ctx.fillStyle = entry.color; ctx.globalAlpha = 0.85;
+      ctx.fillRect(bx, by - fs - 3, tw + 6, fs + 3);
+      ctx.globalAlpha = 1; ctx.fillStyle = '#000';
+      ctx.fillText(num, bx + 3, by - 2);
+    }
+  }
+
+  function arTrackTick() {
+    arTrackHandle = requestAnimationFrame(arTrackTick);
+    if (!arActive || !cameraVideo.videoWidth) return;
+    const rect = computeCaptureRect();
+    if (!rect || !arKeyLuma) { arRenderOverlay(); return; }
+    const curLuma = arGrabLuma(rect);
+    const m = arEstimateMotion(arKeyLuma, curLuma);
+    // Scale from downsampled tracking space back to video-pixel space.
+    arMotion = { dx: m.dx * (rect.sw / AR_TRACK_W), dy: m.dy * (rect.sh / AR_TRACK_H) };
+    arRenderOverlay();
+  }
+
+  // Turn a fresh analysis result into tracker state: run the SAME checkOrder
+  // flag logic as ever, remap each flagged book's bbox from image-pixel space
+  // back into full video-frame pixel space using the capture rect this cycle
+  // used, reset the tracker's reference frame + zero the accumulated motion,
+  // and refresh the flagged-books sheet.
+  function arApplyResults(books, section, rect) {
+    const checked = checkOrder(books, section);
+    lastCheckedBooks = checked;
+    const sentW = lastApiDims.sentW, sentH = lastApiDims.sentH;
+    const toVideoX = sc => rect.sx + sc * (rect.sw / sentW);
+    const toVideoY = sc => rect.sy + sc * (rect.sh / sentH);
+    arLastBoxes = checked.filter(b => b._bbox && (b.outOfOrder || b.unverifiable))
+      .map((b, i) => {
+        const [bx, by, bw, bh] = b._bbox;
+        return {
+          bbox: [toVideoX(bx), toVideoY(by), bw * (rect.sw / sentW), bh * (rect.sh / sentH)],
+          book: b,
+          color: b.unverifiable ? '#facc15' : '#ef4444',
+          dashed: b._src === 'gemini-synth',
+          index: i + 1,
+          _overlayRect: null,
+        };
+      });
+    arKeyLuma = arGrabLuma(rect);
+    arMotion  = { dx: 0, dy: 0 };
+    arRenderOverlay();
+
+    const total = checked.length;
+    (window.__shelfcheckRenders = window.__shelfcheckRenders || []).push({
+      t: performance.now(), section, total,
+      outCount: checked.filter(b => b.outOfOrder).length,
+      unvCount: checked.filter(b => b.unverifiable).length, ar: true,
+      books: checked.map(b => ({
+        spine_label: b.spine_label, title: b.title || null, title_verified: !!b.title_verified,
+        outOfOrder: !!b.outOfOrder, unverifiable: !!b.unverifiable, shelfRow: b.shelfRow ?? null,
+      })),
+    });
+
+    showFlaggedList(checked, arSheet);
+  }
+
+  // One full analysis cycle: grab the current framing, run the existing
+  // encode/OCR/finishLabels/checkOrder pipeline completely unchanged, apply
+  // the fresh boxes, then immediately schedule the next cycle. No fixed
+  // timer — cadence is exactly however long the device's pipeline takes,
+  // never overlapping, never queuing up stale work.
+  async function arScanCycle() {
+    const myToken = arLoopToken;
+    if (!arActive) return;
+    const rect = computeCaptureRect();
+    if (!rect) { setTimeout(() => { if (arLoopToken === myToken) arScanCycle(); }, 400); return; }
+
+    const sc = Math.min(1, MAX_CANVAS_DIM / Math.max(rect.sw, rect.sh));
+    snapshot.width  = Math.round(rect.sw * sc);
+    snapshot.height = Math.round(rect.sh * sc);
+    snapshot.getContext('2d').drawImage(cameraVideo, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, snapshot.width, snapshot.height);
+    saveCleanPhoto();
+
+    camMessage.textContent = 'Scanning…';
+    analysisCancelled = false;
+    analysisAbort = new AbortController();
+
+    const finishCycle = (delay) => {
+      analysisAbort = null;
+      camMessage.textContent = 'Point at a shelf row — scanning automatically';
+      if (arLoopToken === myToken && arActive) {
+        if (delay) setTimeout(() => { if (arLoopToken === myToken) arScanCycle(); }, delay);
+        else arScanCycle();
+      }
+    };
+
+    let encoded;
+    try {
+      encoded = await encodeForOCR();
+    } catch { finishCycle(800); return; }
+    if (arLoopToken !== myToken) return;   // camera closed / loop restarted mid-cycle
+
+    let ocrData;
+    try {
+      ocrData = await runOcr(encoded, analysisAbort.signal, () => {});
+    } catch { finishCycle(800); return; }
+    if (arLoopToken !== myToken) return;
+
+    lastRawBooks = labelsToBooks(ocrData.labels);
+    lastApiDims  = { sentW: ocrData.imageSize[0], sentH: ocrData.imageSize[1] };
+    const detected = autoDetectSection(lastRawBooks);
+    if (detected) setActiveTab(detected);
+
+    arApplyResults(lastRawBooks, getSection(), rect);
+
+    if (ocrData.refine) {
+      ocrData.refine.then(refined => {
+        if (arLoopToken !== myToken || !refined) return;
+        lastRawBooks = labelsToBooks(refined.labels);
+        lastApiDims  = { sentW: refined.imageSize[0], sentH: refined.imageSize[1] };
+        arApplyResults(lastRawBooks, getSection(), rect);
+      });
+    }
+
+    finishCycle(0);
+  }
+
+  function startArLoop() {
+    arActive = true;
+    arLoopToken++;
+    arLastBoxes = []; arKeyLuma = null; arMotion = { dx: 0, dy: 0 };
+    if (!arTrackHandle) arTrackHandle = requestAnimationFrame(arTrackTick);
+    arScanCycle();
+  }
+
+  function stopArLoop() {
+    arActive = false;
+    arLoopToken++;   // in-flight cycle's checks will now fail, so it stops rescheduling itself
+    if (analysisAbort) { analysisCancelled = true; analysisAbort.abort(); analysisAbort = null; }
+    if (arTrackHandle) { cancelAnimationFrame(arTrackHandle); arTrackHandle = null; }
+    arLastBoxes = []; arKeyLuma = null;
+    const ctx = arLiveOverlay.getContext('2d');
+    if (arLiveOverlay.width) ctx.clearRect(0, 0, arLiveOverlay.width, arLiveOverlay.height);
+    arBoxPulse.classList.remove('show');
+    arSheet.classList.remove('show'); arSheet.innerHTML = '';
+  }
+
+  // Tap-to-highlight on the live overlay: hit-test against each box's last
+  // rendered on-screen rect (arRenderOverlay keeps these current every frame)
+  // rather than the classic canvas/sentW-sentH math, since the AR overlay's
+  // mapping changes continuously with camera pan/zoom.
+  arLiveOverlay.addEventListener('click', e => {
+    if (!arActive) return;
+    const rect = arLiveOverlay.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const tapX = (e.clientX - rect.left) * dpr;
+    const tapY = (e.clientY - rect.top)  * dpr;
+    const hit = arLastBoxes.find(en => en._overlayRect &&
+      tapX >= en._overlayRect[0] && tapX <= en._overlayRect[0] + en._overlayRect[2] &&
+      tapY >= en._overlayRect[1] && tapY <= en._overlayRect[1] + en._overlayRect[3]);
+    if (hit) { highlightArrow(hit.book); openBookDetail(hit.book, arSheet); }
+    else arBoxPulse.classList.remove('show');
+  });
+
   // Pinch-to-zoom
   let pinchDist = 0, pinchZoom = 1;
   const touchDist = t => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
   cameraLive.addEventListener('touchstart', e => { if (e.touches.length === 2) { pinchDist = touchDist(e.touches); pinchZoom = camZoom; } }, { passive: false });
   cameraLive.addEventListener('touchmove',  e => { if (e.touches.length === 2 && pinchDist) { e.preventDefault(); setZoom(pinchZoom * touchDist(e.touches) / pinchDist); } }, { passive: false });
 
-  camShutter.addEventListener('click', arCapture);
   camClose.addEventListener('click', closeLiveCamera);
-  arResume.addEventListener('click', arResumeCamera);
   uploadPicBtn.addEventListener('click', () => uploadInput.click());
   retakeBtn.addEventListener('click', retake);
   photoInput.addEventListener('change',  () => { if (photoInput.files[0])  loadPhoto(photoInput.files[0]); });
@@ -1164,6 +1401,38 @@
       }
     }
     pairs.reverse(); oOnly.reverse(); gOnly.reverse();
+
+    // Rescue pass: the DP above is a single monotonic sequence alignment, so
+    // one local disruption (duplicate/near-duplicate candidates, a box one
+    // engine split or merged differently) can knock an otherwise-perfect
+    // match out of position for the rest of the row — leaving a book that
+    // BOTH engines actually read identically stranded in oOnly/gOnly, where
+    // it's unconditionally scored as unconfirmed (0.6) even though real
+    // cross-engine agreement exists. Sweep the leftovers for the strongest
+    // remaining exact-text matches and promote them into pairs; this can only
+    // ever gain confidence for a label, never take it away, so it can't
+    // introduce a false misshelving flag on its own.
+    if (oOnly.length && gOnly.length) {
+      const rescues = [];
+      for (const oi of oOnly) {
+        for (const gi of gOnly) {
+          if (fuseNorm(oTexts[oi]) !== fuseNorm(gTexts[gi])) continue;
+          rescues.push([oi, gi]);
+        }
+      }
+      const usedO = new Set(), usedG = new Set();
+      for (const [oi, gi] of rescues) {
+        if (usedO.has(oi) || usedG.has(gi)) continue;
+        usedO.add(oi); usedG.add(gi);
+        pairs.push([oi, gi]);
+      }
+      if (usedO.size) {
+        for (let k = oOnly.length - 1; k >= 0; k--) if (usedO.has(oOnly[k])) oOnly.splice(k, 1);
+        for (let k = gOnly.length - 1; k >= 0; k--) if (usedG.has(gOnly[k])) gOnly.splice(k, 1);
+        pairs.sort((a, b) => a[0] - b[0]);
+      }
+    }
+
     return { pairs, oOnly, gOnly };
   }
 
@@ -2153,21 +2422,18 @@
   }
   function hideRefiningBadge() { document.getElementById('refiningBadge')?.remove(); }
 
+  // Cancels the classic (non-AR) still-photo analysis. The live AR loop has
+  // no equivalent one-shot cancel — closing the camera (closeLiveCamera) is
+  // how a scan in progress there is stopped.
   function cancelAnalysis() {
     analysisCancelled = true;
     analysisAbort?.abort();
     analysisGeneration++;   // invalidate any in-flight refine
     hideLoading();
     hideRefiningBadge();
-    if (arActive) {
-      camFreeze.classList.remove('loading', 'show');
-      arActive = false;
-      cameraVideo.play().catch(() => {});
-    } else {
-      analyzeBtn.disabled    = false;
-      analyzeBtn.textContent = 'Analyze';
-      actionBar.classList.add('show');
-    }
+    analyzeBtn.disabled    = false;
+    analyzeBtn.textContent = 'Analyze';
+    actionBar.classList.add('show');
   }
 
   // ── Main pipeline ─────────────────────────────────────────────────────────
@@ -2252,115 +2518,6 @@
     }
   }
 
-  // ── AR capture: freeze the live camera in place, analyze, overlay results ──
-  // Mirrors analyzeShelf's pipeline above but renders into the camera overlay
-  // (camFreeze/arSheet) instead of the classic still-photo view, and never
-  // closes the camera — arResumeCamera()/closeLiveCamera() are the only exits.
-  async function arCapture() {
-    const rect = computeCaptureRect();
-    if (!rect) { showErrorBanner("Camera isn't ready — try again.", () => {}, cameraLive); return; }
-    const { sx, sy, sw, sh } = rect;
-    const sc = Math.min(1, MAX_CANVAS_DIM / Math.max(sw, sh));
-    snapshot.width  = Math.round(sw * sc);
-    snapshot.height = Math.round(sh * sc);
-    snapshot.getContext('2d').drawImage(cameraVideo, sx, sy, sw, sh, 0, 0, snapshot.width, snapshot.height);
-    saveCleanPhoto();
-
-    // Freeze the camera view in place: pause the live video and draw the
-    // exact same crop into camFreeze, sized to the on-screen video box.
-    cameraVideo.pause();
-    const dpr = window.devicePixelRatio || 1;
-    camFreeze.width  = Math.max(1, Math.round(cameraLive.clientWidth  * dpr));
-    camFreeze.height = Math.max(1, Math.round(cameraLive.clientHeight * dpr));
-    camFreeze.getContext('2d').drawImage(cameraVideo, sx, sy, sw, sh, 0, 0, camFreeze.width, camFreeze.height);
-    camFreeze.classList.add('show', 'loading');
-    arActive = true;
-
-    analysisCancelled = false;
-    analysisAbort     = new AbortController();
-    const myGen = ++analysisGeneration;
-    showLoading(cameraLive);
-
-    // Yield two frames so the freeze overlay + loading UI both paint before
-    // the speculative pre-encode's synchronous filter/drawImage work runs
-    // (encodeForOCR/encodeTilesForOCR block the main thread until their
-    // first await — starting them before this paint would freeze the
-    // just-captured camera frame instead of showing it).
-    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-    pendingEncode = encodeForOCR();
-    pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
-
-    let encoded;
-    try {
-      encoded = await (pendingEncode ?? encodeForOCR());
-      pendingEncode = null;
-    } catch (err) {
-      if (analysisCancelled) return;
-      hideLoading();
-      camFreeze.classList.remove('loading');
-      showErrorBanner('Could not prepare the photo. Try again.', arResumeCamera, cameraLive);
-      return;
-    }
-
-    advanceStage();  // → "Reading & cross-checking labels"
-
-    let ocrData;
-    try {
-      ocrData = await runOcr(encoded, analysisAbort.signal, () => {
-        if (!analysisCancelled) advanceStage();  // → "Verifying titles"
-      });
-    } catch (err) {
-      if (analysisCancelled) return;
-      hideLoading();
-      camFreeze.classList.remove('loading');
-      showErrorBanner(friendlyErrorMessage(err), arResumeCamera, cameraLive);
-      return;
-    }
-
-    if (analysisCancelled) return;
-
-    advanceStage();  // → "Checking order"
-
-    lastRawBooks = labelsToBooks(ocrData.labels);
-    lastApiDims  = { sentW: ocrData.imageSize[0], sentH: ocrData.imageSize[1] };
-
-    const detected = autoDetectSection(lastRawBooks);
-    if (detected) setActiveTab(detected);
-
-    hideLoading();
-    camFreeze.classList.remove('loading');
-    showResults(lastRawBooks, getSection(), { ar: true });
-    arResume.classList.add('show');
-
-    // Gemini didn't land in time to be in the first render — results are
-    // already on screen (OCR-only); refine them in place if/when it arrives.
-    if (ocrData.refine) {
-      showRefiningBadge(cameraLive);
-      ocrData.refine.then(refined => {
-        if (myGen !== analysisGeneration) return;  // superseded by a newer capture
-        hideRefiningBadge();
-        if (!refined || !arActive) return;
-        lastRawBooks = labelsToBooks(refined.labels);
-        lastApiDims  = { sentW: refined.imageSize[0], sentH: refined.imageSize[1] };
-        showResults(lastRawBooks, getSection(), { ar: true });
-      });
-    }
-  }
-
-  // "Resume camera" button, and the retry action on AR-mode errors: drop the
-  // frozen frame/results overlay and go back to a live viewfinder.
-  function arResumeCamera() {
-    document.getElementById('errorBanner')?.remove();
-    camFreeze.classList.remove('show', 'loading');
-    arBoxPulse.classList.remove('show');
-    arSheet.classList.remove('show'); arSheet.innerHTML = '';
-    arResume.classList.remove('show');
-    arActive = false;
-    analysisGeneration++;   // invalidate any in-flight refine
-    hideRefiningBadge();
-    cameraVideo.play().catch(() => {});
-  }
-
   function friendlyErrorMessage(err) {
     if (err.name === 'AbortError' || err.name === 'TimeoutError')
       return 'Reading timed out. Move closer, improve lighting, and tap Retry.';
@@ -2381,11 +2538,10 @@
     document.getElementById('errBannerRetry').onclick = () => { banner.remove(); onRetry(); };
   }
 
-  // ── Bounding box drawing ─────────────────────────────────────────────────
-  // target: canvas to draw on (defaults to the classic photo view's snapshot
-  // canvas; AR mode passes camFreeze instead). opts.bands: also fill a tall
-  // "spine band" behind each box, for the AR overlay (see arCapture).
-  function drawBoundingBoxes(checkedBooks, sentW, sentH, target = snapshot, opts = {}) {
+  // ── Bounding box drawing (classic still-photo view only) ────────────────
+  // The live AR loop draws its own boxes (arRenderOverlay) since it tracks a
+  // still-playing video instead of a static photo.
+  function drawBoundingBoxes(checkedBooks, sentW, sentH, target = snapshot) {
     const ctx = target.getContext('2d');
     const sx  = target.width  / sentW;
     const sy  = target.height / sentH;
@@ -2399,33 +2555,6 @@
     // Only flagged books (out of order or unverifiable) get a box — correct
     // books are left unmarked so the photo isn't cluttered with green boxes.
     const flagged = checkedBooks.filter(b => b._bbox && (b.outOfOrder || b.unverifiable));
-
-    if (opts.bands) {
-      // Group by shelf row so each row's band top can be computed from its own
-      // sticker heights, then draw all bands first so boxes/badges sit on top.
-      const rows = new Map();
-      for (const book of flagged) {
-        const row = book.shelfRow ?? 0;
-        if (!rows.has(row)) rows.set(row, []);
-        rows.get(row).push(book);
-      }
-      for (const rowBooks of rows.values()) {
-        const bys = rowBooks.map(b => b._bbox[1]);
-        const bhs = rowBooks.map(b => b._bbox[3]).sort((a, b) => a - b);
-        const medBh = bhs[Math.floor(bhs.length / 2)];
-        const rowTop = Math.max(0, Math.min(...bys) - 6 * medBh);
-        for (const book of rowBooks) {
-          const [bx, by, bw, bh] = book._bbox;
-          const top    = Math.max(rowTop, by - 6 * bh);
-          const bottom = by + bh;
-          const color  = book.unverifiable ? '#facc15' : '#ef4444';
-          ctx.fillStyle   = color;
-          ctx.globalAlpha = 0.16;
-          ctx.fillRect(bx * sx, top * sy, bw * sx, (bottom - top) * sy);
-          ctx.globalAlpha = 1;
-        }
-      }
-    }
 
     flagged.forEach((book) => {
       const i = checkedBooks.indexOf(book);
@@ -2452,13 +2581,10 @@
     ctx.restore();
   }
 
-  // Which photo/panel/pulse-box trio is currently on screen — the classic
-  // still-photo view, or the AR camera overlay. Kept as one flag so every
-  // helper below (highlightArrow, popBoxPulse, tap handlers) picks the right
-  // set of elements without threading extra params through every call site.
+  // Whether the live AR camera loop is currently running — used so
+  // highlightArrow/popBoxPulse (shared between tapping the classic photo and
+  // tapping a flagged-list row) pick the right panel/pulse element.
   let arActive = false;
-  function activeCanvas()  { return arActive ? camFreeze : snapshot; }
-  function activeContainer() { return arActive ? cameraLive : photoArea; }
   function activePanel()   { return arActive ? arSheet : document.getElementById('flaggedList'); }
   function activePulseEl() { return arActive ? arBoxPulse : boxPulse; }
 
@@ -2472,8 +2598,8 @@
   }
 
   // The canvas element's CSS box (getBoundingClientRect) is *not* the same
-  // as the rectangle its image content actually occupies: #snapshot/camFreeze
-  // use object-fit: contain and are sized to fill their container, so a
+  // as the rectangle its image content actually occupies: #snapshot uses
+  // object-fit: contain and is sized to fill its container, so a
   // portrait photo inside a wider container gets pillarboxed (bars on the
   // sides) while a landscape photo in a taller container gets letterboxed
   // (bars top/bottom). Any mapping between screen coordinates and image/box
@@ -2504,10 +2630,31 @@
       pulse.classList.remove('show');
       return;
     }
-    const canvas = activeCanvas(), container = activeContainer();
+
+    if (arActive) {
+      // AR boxes track a live, continuously panning/zooming video (see
+      // arRenderOverlay), so there's no fixed sentW/sentH->canvas scaling to
+      // reuse here — position from that box's last rendered overlay rect.
+      const entry = arLastBoxes.find(en => en.book === book);
+      if (!entry || !entry._overlayRect) { pulse.classList.remove('show'); return; }
+      const dpr = window.devicePixelRatio || 1;
+      const oRect = arLiveOverlay.getBoundingClientRect();
+      const pRect = cameraLive.getBoundingClientRect();
+      const [ox, oy, ow, oh] = entry._overlayRect;
+      pulse.style.color  = book.unverifiable ? '#facc15' : '#ef4444';
+      pulse.style.left   = `${(oRect.left - pRect.left) + ox / dpr}px`;
+      pulse.style.top    = `${(oRect.top  - pRect.top)  + oy / dpr}px`;
+      pulse.style.width  = `${ow / dpr}px`;
+      pulse.style.height = `${oh / dpr}px`;
+      pulse.classList.remove('show');
+      void pulse.offsetWidth;
+      pulse.classList.add('show');
+      return;
+    }
+
     const [bx, by, bw, bh] = book._bbox;
-    const cRect = canvasContentRect(canvas);
-    const pRect = container.getBoundingClientRect();
+    const cRect = canvasContentRect(snapshot);
+    const pRect = photoArea.getBoundingClientRect();
     const sx = cRect.width  / lastApiDims.sentW;
     const sy = cRect.height / lastApiDims.sentH;
     const left = (cRect.left - pRect.left) + bx * sx;
@@ -2574,8 +2721,7 @@
     }
   }
 
-  snapshot.addEventListener('click', e => { if (!arActive) handleCanvasTap(snapshot, e); });
-  camFreeze.addEventListener('click', e => { if (arActive)  handleCanvasTap(camFreeze, e); });
+  snapshot.addEventListener('click', e => handleCanvasTap(snapshot, e));
 
   // ── Ordering logic (identical to shelfcheck/index.html) ──────────────────
   const SURNAME_PREFIXES = new Set([
@@ -2854,7 +3000,17 @@
       if (L < 0 || R >= checked.length) continue;
       const kL = keys[L], kR = keys[R], kM = keys[i];
       if (!kL || !kR || !kM) continue;
-      let demote = compareKeys(kL, kR) === 0;
+      // This whole post-pass exists to rescue a SINGLE-engine misread that
+      // looks sandwiched between two identical/near-identical real reads
+      // (e.g. a garbled duplicate-detection artifact). A book with its OWN
+      // independent cross-engine confirmation (score >= 0.9, src 'both')
+      // doesn't need rescuing from that same-key-neighbors heuristic — two
+      // engines agreeing on ITS text is stronger evidence than "its
+      // neighbors happen to share a key", so demoting it anyway just
+      // because duplicate copies of the same call number legitimately sit
+      // on the shelf was needlessly turning good reads into "please check".
+      const crossConfirmed = checked[i]._score >= 0.9 && checked[i]._src === 'both';
+      let demote = !crossConfirmed && compareKeys(kL, kR) === 0;
       if (!demote && kL.kind === kR.kind && kM.kind === kL.kind) {
         const vL = kL.kind === 'str' ? kL.val : String(kL.val.num ?? '');
         const vR = kR.kind === 'str' ? kR.val : String(kR.val.num ?? '');
@@ -2931,22 +3087,19 @@
     try { localStorage.setItem('shelfcheck.section', section); } catch {}
   }
 
-  // opts.ar: render into the camera overlay (camFreeze + arSheet, with spine
-  // bands) instead of the classic still-photo view (snapshot + flaggedList).
-  function showResults(books, section, opts = {}) {
+  // Classic still-photo results view (snapshot + flaggedList). The live AR
+  // loop has its own rendering path — arApplyResults + arRenderOverlay —
+  // since its boxes track a still-playing video instead of a static photo.
+  function showResults(books, section) {
     const checked = checkOrder(books, section);
     lastCheckedBooks = checked;
-    const ar = !!opts.ar;
 
-    if (!ar) {
-      document.getElementById('resultsOverlay')?.remove();
-      actionBar.classList.remove('show');
-      restoreCleanPhoto();   // redraw the clean photo before overlaying boxes
-    }
+    document.getElementById('resultsOverlay')?.remove();
+    actionBar.classList.remove('show');
+    restoreCleanPhoto();   // redraw the clean photo before overlaying boxes
 
-    const target = ar ? camFreeze : snapshot;
-    const panel  = ar ? arSheet   : document.getElementById('flaggedList');
-    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH, target, { bands: ar });
+    const panel = document.getElementById('flaggedList');
+    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH, snapshot);
 
     const total    = checked.length;
     const outCount = checked.filter(b => b.outOfOrder).length;
@@ -2956,7 +3109,7 @@
     // the e2e harness (e2e_pipeline_test.mjs) can read the real pipeline output
     // and measure first-vs-final (refine) render latency. Never read by the app.
     (window.__shelfcheckRenders = window.__shelfcheckRenders || []).push({
-      t: performance.now(), section, total, outCount, unvCount, ar,
+      t: performance.now(), section, total, outCount, unvCount, ar: false,
       books: checked.map(b => ({
         spine_label:    b.spine_label,
         title:          b.title || null,
@@ -2968,12 +3121,12 @@
     });
 
     if (total === 0) {
-      if (!ar) showNoBooksBadge();
+      showNoBooksBadge();
       showFlaggedList([], panel);
       return;
     }
 
-    if (!ar) showSummaryBadge(total, outCount, unvCount);
+    showSummaryBadge(total, outCount, unvCount);
     showFlaggedList(checked, panel);
   }
 
