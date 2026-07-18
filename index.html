@@ -1291,6 +1291,54 @@
     return letters.replace(/[^A-Z]/g, '').length / letters.length >= 0.6;
   }
 
+  // ── Lexicon-aware post-correction (Fix 3) ─────────────────────────────────
+  // Sticker text follows rigid patterns: a call-number zone (mostly digits,
+  // at most one decimal point) and a cutter/surname zone (mostly letters).
+  // The rec model's most common confusions are visually-similar glyph pairs
+  // (O/0, I/l/1, S/5, B/8). This is a conservative fix-up pass over already-
+  // RECOGNIZED text, applied upstream of parseDewey/parseSurnameAndFirst
+  // (neither of which is modified) — a substitution is kept only when it
+  // turns the WHOLE token into something that cleanly matches its zone's
+  // shape; tokens that already cleanly match a zone are left untouched.
+  const LEX_DIGIT_MAP  = { O: '0', o: '0', I: '1', l: '1', S: '5', B: '8' };
+  const LEX_LETTER_MAP = { '0': 'O', '1': 'I', '5': 'S', '8': 'B' };
+  const LEX_DIGIT_RE  = /^\d{1,3}(\.\d+)?$/;
+  const LEX_LETTER_RE = /^[A-Za-z]+$/;
+
+  function lexiconCorrectToken(tok) {
+    if (!tok || LEX_DIGIT_RE.test(tok) || LEX_LETTER_RE.test(tok)) return tok;  // already clean
+    let digits = 0, letters = 0;
+    for (const ch of tok) {
+      if (ch >= '0' && ch <= '9') digits++;
+      else if (/[A-Za-z]/.test(ch)) letters++;
+    }
+    if (digits > letters) {
+      // call-number zone: O/o/I/l/S/B -> digit, only kept if the WHOLE token
+      // then matches a Dewey-shaped number.
+      let cand = '';
+      for (const ch of tok) cand += (ch in LEX_DIGIT_MAP ? LEX_DIGIT_MAP[ch] : ch);
+      if (LEX_DIGIT_RE.test(cand)) return cand;
+    } else if (letters > digits && tok.length >= 2 && tok.length <= 6) {
+      // cutter/surname zone: 0/1/5/8 -> letter, only kept if the WHOLE token
+      // then becomes all-letters.
+      let cand = '';
+      for (const ch of tok) cand += (ch in LEX_LETTER_MAP ? LEX_LETTER_MAP[ch] : ch);
+      if (LEX_LETTER_RE.test(cand)) return cand;
+    }
+    return tok;
+  }
+
+  function lexiconCorrectText(text) {
+    const s = String(text || '');
+    if (!s) return s;
+    return s.split(/(\s+)/).map(part => {
+      if (part === '' || /^\s+$/.test(part)) return part;
+      const fixed = lexiconCorrectToken(part);
+      if (fixed !== part) console.debug(`[dbglex] ${part} -> ${fixed}`);
+      return fixed;
+    }).join('');
+  }
+
   // Clean up raw rec text: OCR confuses commas/spaced dots inside Dewey
   // numbers, and a malformed number both mis-sorts and blocks cross-engine
   // confirmation.
@@ -1320,7 +1368,7 @@
     const truncatedNum = t => section === 'nonfiction' &&
       (/^\s*\d{1,3}[.,](?!\d)/.test(t) || /^\s*\d{1,3}\.\d*0(?=\s|$)/.test(t));
     const books = labels.map(l => ({
-      spine_label: normalizeLocalText(l.text, section),
+      spine_label: lexiconCorrectText(normalizeLocalText(l.text, section)),
       title: null,
       confidence: (l.conf >= 0.97 && !truncatedNum(l.text)) ? 'high' : 'low',
       shelfRow: 0,
