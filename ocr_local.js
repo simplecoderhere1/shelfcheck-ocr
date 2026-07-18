@@ -17,6 +17,9 @@
 //   preload(onProgress)-> Promise<void>  idempotent warm-up (models+sessions)
 //   run(sourceCanvas, {signal}) -> Promise<Array<{text, conf, bboxFrac}>>
 //      bboxFrac = [x, y, w, h] as fractions of the source canvas.
+//   detect(sourceCanvas, {signal}) -> Promise<Array<{bboxFrac}>>
+//      detection-only (single cheap det pass, no recognition) — used by the
+//      live AR loop to paint "seen, still reading" boxes near-instantly.
 (function () {
   'use strict';
 
@@ -381,6 +384,36 @@
 
   // ---- main ---------------------------------------------------------------
 
+  // Sticker-size gate, shared by run() and detect() so both use byte-identical
+  // logic: keep boxes whose height is 0.4%..3.2% of the frame's max dimension
+  // (the physical size range of a call-number/author sticker at shelf distance)
+  // and at least half as wide as tall.
+  function stickerFilter(boxes, W, H) {
+    const maxDim = Math.max(W, H);
+    return boxes.filter(b =>
+      b[3] >= STICK_H_MIN * maxDim && b[3] <= STICK_H_MAX * maxDim && b[2] >= b[3] * 0.5);
+  }
+
+  // Detection only — one cheap DBNet pass, no recognition. Returns sticker-
+  // sized boxes as { bboxFrac:[x,y,w,h] } fractions of the source canvas. The
+  // live AR loop calls this every few hundred ms to show grey "seen, still
+  // reading" boxes long before the full det+rec+fusion cycle finishes.
+  async function detect(src, opts = {}) {
+    const { signal } = opts;
+    await preload();
+    throwIfAborted(signal);
+    const t0 = performance.now();
+    const W = src.width, H = src.height;
+    const { data, nw, nh } = detPreprocess(src);
+    throwIfAborted(signal);
+    const detOut = await detSess.run({ x: new ort.Tensor('float32', data, [1, 3, nh, nw]) });
+    const prob = detOut[detSess.outputNames[0]].data;
+    throwIfAborted(signal);
+    const stick = stickerFilter(detPostprocess(prob, nw, nh, W, H), W, H);
+    console.log(`[perf] localocr: det-only ${Math.round(performance.now() - t0)}ms (${stick.length} boxes)`);
+    return stick.map(b => ({ bboxFrac: [b[0] / W, b[1] / H, b[2] / W, b[3] / H] }));
+  }
+
   async function run(src, opts = {}) {
     const { signal } = opts;
     await preload();
@@ -396,9 +429,7 @@
     throwIfAborted(signal);
 
     const allBoxes = detPostprocess(prob, nw, nh, W, H);
-    const maxDim = Math.max(W, H);
-    const stick = allBoxes.filter(b =>
-      b[3] >= STICK_H_MIN * maxDim && b[3] <= STICK_H_MAX * maxDim && b[2] >= b[3] * 0.5);
+    const stick = stickerFilter(allBoxes, W, H);
 
     // Batch recognition per width bucket: one inference call per bucket
     // instead of one per line — per-call overhead (worker round trips)
@@ -584,5 +615,5 @@
     return { title: best.title, conf: best.conf };
   }
 
-  window.LocalOCR = { available, preload, run, readRegion, readTitle, get ep() { return activeEP; } };
+  window.LocalOCR = { available, preload, run, detect, readRegion, readTitle, get ep() { return activeEP; } };
 })();

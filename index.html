@@ -221,7 +221,7 @@
     }
     .debug-book-table tr.book-ok  td:first-child { border-left: 3px solid #4ade80; }
     .debug-book-table tr.book-bad td:first-child { border-left: 3px solid #ef4444; }
-    .debug-book-table tr.book-unv td:first-child { border-left: 3px solid #facc15; }
+    .debug-book-table tr.book-unv td:first-child { border-left: 3px solid #eab308; }
     .debug-actions {
       display: flex; gap: 8px; padding: 12px 16px;
       padding-bottom: max(12px, env(safe-area-inset-bottom));
@@ -292,7 +292,7 @@
     .flagged-item.active { background: #162316; }
     .flagged-item-dot { flex-shrink: 0; width: 9px; height: 9px; border-radius: 50%; }
     .flagged-item-dot-bad { background: #ef4444; }
-    .flagged-item-dot-unv { background: #facc15; }
+    .flagged-item-dot-unv { background: #eab308; }
     .flagged-item-text { flex: 1; min-width: 0; }
     .flagged-item-label { font-size: 13px; font-weight: 600; color: #e2e2e2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .flagged-item-title { font-size: 12px; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; font-style: italic; }
@@ -353,7 +353,7 @@
     .camera-live { display: none; position: fixed; inset: 0; z-index: 70; background: #000; overflow: hidden; touch-action: none; }
     .camera-live.show { display: block; }
     .camera-live video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform-origin: center center; }
-    .cam-message { position: absolute; top: max(14px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 3; font-size: 13px; font-weight: 600; color: #fff; background: rgba(0,0,0,.5); padding: 6px 14px; border-radius: 20px; white-space: nowrap; pointer-events: none; transition: opacity .2s ease; }
+    .cam-message { position: absolute; top: max(14px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); z-index: 3; font-size: 13px; font-weight: 600; color: #fff; background: rgba(0,0,0,.5); padding: 6px 14px; border-radius: 20px; max-width: min(92vw, 420px); text-align: center; white-space: normal; pointer-events: none; transition: opacity .2s ease; }
     .cam-close { position: absolute; top: max(12px, env(safe-area-inset-top)); left: max(12px, env(safe-area-inset-left)); z-index: 3; width: 40px; height: 40px; border-radius: 50%; border: none; background: rgba(0,0,0,.5); color: #fff; font-size: 24px; line-height: 1; cursor: pointer; }
 
     /* Live AR: a transparent overlay canvas sits on top of the still-playing
@@ -674,7 +674,30 @@
     console.log(`[perf] openLiveCamera: negotiated ${settings.width}x${settings.height} @ ${settings.frameRate || '?'}fps ` +
                 `(video element reports ${cameraVideo.videoWidth}x${cameraVideo.videoHeight})`);
     arSetupImageCapture(stream);
+    arPreloadWithProgress();
     startArLoop();
+  }
+
+  // Kick off (don't await) the on-device reader warm-up the moment the camera
+  // opens, surfacing the one-time ~31MB model download as a visible progress
+  // line so a cold first-run doesn't look frozen. Idempotent/memoized in
+  // ocr_local.js, so a warm profile resolves instantly with no progress calls
+  // (cachedFetch only reports progress on a real network fetch). Guarded on
+  // arActive so a mid-download camera close can't resurrect stale messages.
+  function arPreloadWithProgress() {
+    if (!(localOcrEnabled && window.LocalOCR && LocalOCR.available())) return;
+    const prog = {};
+    LocalOCR.preload((url, got, total) => {
+      prog[url] = { got, total };
+      let g = 0, t = 0;
+      for (const k in prog) { g += prog[k].got; t += prog[k].total; }
+      if (t && arActive && cameraLive.classList.contains('show') && !arLastBoxes.length) {
+        camMessage.textContent = `Preparing reader… ${Math.min(99, Math.round(g / t * 100))}%`;
+      }
+    }).then(
+      () => { if (arActive && !arLastBoxes.length) camMessage.textContent = 'Point at a shelf row — scanning automatically'; },
+      () => { if (arActive) camMessage.textContent = 'Reader unavailable — using online service'; }
+    );
   }
 
   // Progressive enhancement: ImageCapture.takePhoto() pulls a genuine
@@ -760,7 +783,25 @@
   let arTrackHandle = null;
   let arLumaScratch = null;
 
+  // Det-only fast path: grey "seen, still reading" boxes that appear near-
+  // instantly (one cheap detection pass) long before the full det+rec+fusion
+  // read result lands. They live in the SAME video-pixel reference frame as
+  // the read boxes (arLastBoxes) — anchored to arKeyLuma, dragged by arMotion —
+  // so the single motion tracker moves both. When a read result overlaps a
+  // det box, the read box wins and the det box is suppressed at render time,
+  // giving an in-place grey→green/red/yellow transition with no flicker.
+  let arDetBoxes    = [];    // [{bbox:[vx,vy,vw,vh] in the arKeyLuma reference frame}]
+  let arDetBusy     = false; // a det pass is in flight
+  let arScanBusy    = false; // a full read cycle is using the ORT session (det must wait its turn)
+  let arDetHandle   = null;  // setTimeout handle for the det sub-loop
+  let arDetScratch  = null;
+  let arRemoteDown  = false; // last attempted remote OCR call failed → flags paused
+  let arLastRemoteAt = 0;    // perf-clock time of the last remote OCR attempt (throttle)
+
   const AR_TRACK_W = 96, AR_TRACK_H = 72, AR_SEARCH = 14;
+  const AR_DET_INTERVAL_MS = 400;      // cadence of the det-only sub-loop
+  const AR_DET_MAX_SIDE = 1600;        // scratch canvas size for the det pass
+  const AR_REMOTE_MIN_INTERVAL_MS = 20000;  // at most one ocr.space call per 20s during continuous AR
 
   // Downsampled grayscale of the currently-visible capture region — cheap
   // enough to recompute every frame (a few thousand pixels).
@@ -829,7 +870,7 @@
     }
     const ctx = arLiveOverlay.getContext('2d');
     ctx.clearRect(0, 0, cw, ch);
-    if (!arLastBoxes.length) return;
+    if (!arLastBoxes.length && !arDetBoxes.length) return;
     const lw = Math.max(2, Math.round(cw / 260));
     const fs = Math.max(11, Math.round(cw / 40));
     ctx.font = `bold ${fs}px sans-serif`;
@@ -860,6 +901,85 @@
         ctx.fillText(num, bx + 3, by - 2);
       }
     }
+
+    // Det-only "seen, still reading" boxes: thin grey dashed outlines, no
+    // badge. Drawn AFTER (under, visually) the read boxes and only where they
+    // don't overlap one — an overlapping read box means that sticker has now
+    // been read, so its coloured box supersedes the grey placeholder in place.
+    let detSuppressed = 0;
+    if (arDetBoxes.length) {
+      const overlapsRead = (d) => {
+        const [vx, vy, vw2, vh2] = d.bbox;
+        const cx = vx + vw2 / 2, cy = vy + vh2 / 2;
+        return arLastBoxes.some(en => {
+          const [ex, ey, ew, eh] = en.bbox;
+          if (cx >= ex && cx <= ex + ew && cy >= ey && cy <= ey + eh) return true;
+          const ix = Math.max(0, Math.min(vx + vw2, ex + ew) - Math.max(vx, ex));
+          const iy = Math.max(0, Math.min(vy + vh2, ey + eh) - Math.max(vy, ey));
+          const inter = ix * iy, uni = vw2 * vh2 + ew * eh - inter;
+          return uni > 0 && inter / uni > 0.3;
+        });
+      };
+      const dlw = Math.max(1, Math.round(lw * 0.6));
+      ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = dlw; ctx.setLineDash([6, 4]);
+      for (const d of arDetBoxes) {
+        if (overlapsRead(d)) { detSuppressed++; continue; }
+        const [vx, vy, vw2, vh2] = d.bbox;
+        const [x0, y0] = arVideoToOverlay(vx + arMotion.dx, vy + arMotion.dy);
+        const [x1, y1] = arVideoToOverlay(vx + vw2 + arMotion.dx, vy + vh2 + arMotion.dy);
+        ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+      }
+      ctx.setLineDash([]);
+    }
+    // Test/telemetry hook: last overlay composition (read boxes, det boxes,
+    // and how many det boxes were superseded in place by an overlapping read).
+    window.__arOverlayStats = { readBoxes: arLastBoxes.length, detBoxes: arDetBoxes.length, detSuppressed };
+  }
+
+  // Draw the currently-visible capture region into a scratch canvas for the
+  // det-only pass. Higher-res than the tiny motion-tracking luma grab (sticker
+  // text needs the detail) but capped so a single det pass stays cheap.
+  function arGrabDetFrame(rect) {
+    const sc = Math.min(1, AR_DET_MAX_SIDE / Math.max(rect.sw, rect.sh));
+    const w = Math.max(32, Math.round(rect.sw * sc));
+    const h = Math.max(32, Math.round(rect.sh * sc));
+    const c = arDetScratch || (arDetScratch = document.createElement('canvas'));
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(cameraVideo, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, w, h);
+    return c;
+  }
+
+  // The det-only sub-loop: every ~400ms, when the ORT session isn't busy with a
+  // full read cycle, run a single detection pass and refresh the grey boxes.
+  // Anchored into the arKeyLuma reference frame (subtract the current motion
+  // drift) so the tracker drags them exactly like the read boxes.
+  async function arDetTick() {
+    if (!arActive) return;
+    if (!arDetBusy && !arScanBusy && cameraVideo.videoWidth &&
+        localOcrEnabled && window.LocalOCR && LocalOCR.available()) {
+      arDetBusy = true;
+      try {
+        const rect = computeCaptureRect();
+        if (rect) {
+          const mdx = arMotion.dx, mdy = arMotion.dy;
+          const boxes = await LocalOCR.detect(arGrabDetFrame(rect));
+          if (arActive && boxes.length) {
+            arDetBoxes = boxes.map(o => {
+              const [fx, fy, fw, fh] = o.bboxFrac;
+              return { bbox: [
+                rect.sx + fx * rect.sw - mdx, rect.sy + fy * rect.sh - mdy,
+                fw * rect.sw, fh * rect.sh,
+              ] };
+            });
+            window.__arDetRenders = (window.__arDetRenders || 0) + 1;
+            arRenderOverlay();
+          }
+        }
+      } catch { /* det is best-effort; a failed pass just skips this tick */ }
+      arDetBusy = false;
+    }
+    if (arActive) arDetHandle = setTimeout(arDetTick, AR_DET_INTERVAL_MS);
   }
 
   function arTrackTick() {
@@ -897,29 +1017,37 @@
     arLastBoxes = checked.filter(b => b._bbox)
       .map((b) => {
         const [bx, by, bw, bh] = b._bbox;
-        const flagged = b.outOfOrder || b.unverifiable;
+        const flagged = b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder;
         return {
           bbox: [toVideoX(bx), toVideoY(by), bw * (rect.sw / sentW), bh * (rect.sh / sentH)],
           book: b,
-          color: b.outOfOrder ? '#ef4444' : b.unverifiable ? '#9ca3af' : '#22c55e',
+          color: b.outOfOrder ? '#ef4444' : (b.unverifiable || b.possiblyOutOfOrder) ? '#eab308' : '#22c55e',
           dashed: b._src === 'gemini-synth',
           flagged,
           index: flagged ? checked.indexOf(b) + 1 : null,
           _overlayRect: null,
         };
       });
+    // Re-anchor the det-only boxes into the new reference frame (the read
+    // cycle resets arKeyLuma to the current frame and zeroes the drift), so
+    // grey boxes on not-yet-read stickers stay put instead of jumping.
+    const _preDx = arMotion.dx, _preDy = arMotion.dy;
     arKeyLuma = arGrabLuma(rect);
     arMotion  = { dx: 0, dy: 0 };
+    if (arDetBoxes.length) arDetBoxes = arDetBoxes.map(d =>
+      ({ bbox: [d.bbox[0] + _preDx, d.bbox[1] + _preDy, d.bbox[2], d.bbox[3]] }));
     arRenderOverlay();
 
     const total = checked.length;
     (window.__shelfcheckRenders = window.__shelfcheckRenders || []).push({
       t: performance.now(), section, total,
       outCount: checked.filter(b => b.outOfOrder).length,
-      unvCount: checked.filter(b => b.unverifiable).length, ar: true,
+      unvCount: checked.filter(b => b.unverifiable).length,
+      possiblyCount: checked.filter(b => b.possiblyOutOfOrder).length, ar: true,
       books: checked.map(b => ({
         spine_label: b.spine_label, title: b.title || null, title_verified: !!b.title_verified,
-        outOfOrder: !!b.outOfOrder, unverifiable: !!b.unverifiable, shelfRow: b.shelfRow ?? null,
+        outOfOrder: !!b.outOfOrder, unverifiable: !!b.unverifiable,
+        possiblyOutOfOrder: !!b.possiblyOutOfOrder, shelfRow: b.shelfRow ?? null,
       })),
     });
 
@@ -963,29 +1091,51 @@
     stillPhoto?.close?.();
     saveCleanPhoto();
 
-    camMessage.textContent = 'Scanning…';
+    // Throttle the remote (ocr.space) engine during continuous AR so the free
+    // tier's ~10-scans/day quota isn't burned in seconds: fire it at most once
+    // per AR_REMOTE_MIN_INTERVAL_MS; every cycle in between reads on-device
+    // only. Red misshelving flags still need fused confidence, so they refresh
+    // roughly every 20s; grey/green/yellow reads keep updating every cycle.
+    const allowRemote = (performance.now() - arLastRemoteAt) >= AR_REMOTE_MIN_INTERVAL_MS;
+    if (allowRemote) { arLastRemoteAt = performance.now(); console.log('[ar] remote OCR attempt (throttle window open)'); }
+
+    arScanBusy = true;   // the ORT session is now in use by this read cycle — det-only pauses
+    // Keep the "online check unavailable" state visible even mid-scan so the
+    // persistent status isn't clobbered by a bare "Scanning…" every cycle.
+    camMessage.textContent = arRemoteDown
+      ? 'Scanning… · online check unavailable — local reads only'
+      : 'Scanning…';
     analysisCancelled = false;
     analysisAbort = new AbortController();
 
-    const finishCycle = (delay) => {
+    // When the online service is unreachable, keep saying so (persistent status)
+    // rather than reverting to the neutral "scanning" line and looking silent.
+    const idleMsg = () => arRemoteDown
+      ? 'Online check unavailable — local reads only'
+      : 'Point at a shelf row — scanning automatically';
+    const finishCycle = (delay, msg) => {
       analysisAbort = null;
-      camMessage.textContent = 'Point at a shelf row — scanning automatically';
+      arScanBusy = false;
+      if (arActive) camMessage.textContent = msg || idleMsg();
       if (arLoopToken === myToken && arActive) {
         if (delay) setTimeout(() => { if (arLoopToken === myToken) arScanCycle(); }, delay);
         else arScanCycle();
       }
     };
 
-    let encoded;
-    try {
-      encoded = await encodeForOCR();
-    } catch { finishCycle(800); return; }
-    if (arLoopToken !== myToken) return;   // camera closed / loop restarted mid-cycle
+    // Only pay the remote-encode cost on cycles that are actually allowed to
+    // call the remote engine; throttled cycles read on-device from `snapshot`.
+    let encoded = null;
+    if (allowRemote) {
+      try { encoded = await encodeForOCR(); }
+      catch { finishCycle(800, 'Reconnecting…'); return; }
+      if (arLoopToken !== myToken) return;   // camera closed / loop restarted mid-cycle
+    }
 
     let ocrData;
     try {
-      ocrData = await runOcr(encoded, analysisAbort.signal, () => {});
-    } catch { finishCycle(800); return; }
+      ocrData = await runOcr(encoded, analysisAbort.signal, () => {}, { arMode: true, skipRemote: !allowRemote });
+    } catch { finishCycle(800, 'Reconnecting…'); return; }
     if (arLoopToken !== myToken) return;
 
     lastRawBooks = labelsToBooks(ocrData.labels);
@@ -1011,7 +1161,13 @@
     arActive = true;
     arLoopToken++;
     arLastBoxes = []; arKeyLuma = null; arMotion = { dx: 0, dy: 0 };
+    arDetBoxes = []; arDetBusy = false; arScanBusy = false;
+    // Seed one full interval in the past (performance.now() is ms-since-load,
+    // so a literal 0 would wrongly gate the remote engine off for the first
+    // 20s of the page's life) → the very first cycle is allowed to fuse.
+    arRemoteDown = false; arLastRemoteAt = -AR_REMOTE_MIN_INTERVAL_MS;
     if (!arTrackHandle) arTrackHandle = requestAnimationFrame(arTrackTick);
+    if (!arDetHandle) arDetHandle = setTimeout(arDetTick, 0);  // grey boxes ASAP, before the first full cycle
     arScanCycle();
   }
 
@@ -1020,7 +1176,9 @@
     arLoopToken++;   // in-flight cycle's checks will now fail, so it stops rescheduling itself
     if (analysisAbort) { analysisCancelled = true; analysisAbort.abort(); analysisAbort = null; }
     if (arTrackHandle) { cancelAnimationFrame(arTrackHandle); arTrackHandle = null; }
+    if (arDetHandle) { clearTimeout(arDetHandle); arDetHandle = null; }
     arLastBoxes = []; arKeyLuma = null; arImageCapture = null;
+    arDetBoxes = []; arDetBusy = false; arScanBusy = false;
     const ctx = arLiveOverlay.getContext('2d');
     if (arLiveOverlay.width) ctx.clearRect(0, 0, arLiveOverlay.width, arLiveOverlay.height);
     arBoxPulse.classList.remove('show');
@@ -1914,6 +2072,15 @@
   // Open Library to confirm the title is real.  Confirmed titles are kept
   // (replaced with the canonical OL form); unconfirmed titles are cleared so
   // they don't pollute tiebreaking.
+  // Session-level memo of Open Library lookups, keyed by
+  // section + author-key + normalized title. In live AR mode the background
+  // refine re-runs every ~20s over a largely unchanged shelf; without this,
+  // every cycle re-queries Open Library for the identical tied titles. A hit
+  // replays the stored resolution and skips the network call entirely. Only
+  // definitive responses are cached — transient errors/timeouts are not, so a
+  // blip doesn't poison a title permanently.
+  const _olMemo = new Map();
+
   async function verifyTitlesOpenLibrary(labels, section, signal) {
     // Build a map of primary-key → [indices] to find tied groups.
     const groups = new Map();
@@ -1941,25 +2108,48 @@
     if (!toVerify.length) return;
 
     const t0 = performance.now();
-    // Every call already runs concurrently (Promise.all below) with its own
-    // OL_TIMEOUT_MS cap — but a slow/rate-limiting Open Library can still let
-    // every one of those calls individually run close to that cap, stalling
-    // the whole verification step. Add a hard total budget on top: once it
-    // elapses, abort every still-pending call so finishLabels (and the first
-    // render that awaits it) is never held up longer than this, regardless
-    // of how many labels needed verification.
+    // Requests are issued SEQUENTIALLY (one at a time), not in parallel: Open
+    // Library is a courtesy-rate free service, and the AR refine loop can fire
+    // this repeatedly, so we keep the outbound rate polite (well under 1/sec
+    // given per-call latency). A slow/rate-limiting Open Library must still not
+    // stall the whole verification step, so a hard total budget aborts every
+    // remaining call once it elapses — finishLabels (and any render awaiting
+    // it) is never held up longer than this, regardless of how many labels
+    // needed verification.
     const OL_BUDGET_MS = 5000;
     const budgetCtrl  = new AbortController();
     const budgetTimer = setTimeout(() => budgetCtrl.abort(), OL_BUDGET_MS);
 
-    await Promise.all(toVerify.map(async i => {
+    // Apply a resolved OL outcome (fresh or memoized) to a label.
+    const applyOl = (lbl, r) => {
+      if (r.kind === 'verified') { lbl.title = r.title; lbl.title_verified = true; }
+      else if (r.kind === 'none') { lbl.title = null; lbl.title_verified = false; }
+      else { lbl.title_verified = false; }   // 'weak' — keep raw read, display only
+    };
+
+    let calls = 0, memoHits = 0;
+    for (const i of toVerify) {
       const lbl = labels[i];
       const rawTitle = lbl.title;
-      const params = new URLSearchParams({ title: lbl.title, limit: '3', fields: 'title,author_name' });
+      // Author component of the memo key: surname for fiction, call number +
+      // cutter for nonfiction (both scope the OL query the same way).
+      let authorKey = '';
       if (section === 'fiction') {
         const p = parseSurnameAndFirst(lbl.text);
-        if (p?.surname) params.set('author', p.surname);
+        authorKey = p?.surname || '';
+      } else {
+        const d = parseDewey(lbl.text);
+        authorKey = d ? (String(d.num ?? '') + (d.cut || '')) : '';
       }
+      const memoKey = section + '\x00' + authorKey + '\x00' + lettersLower(rawTitle);
+      if (_olMemo.has(memoKey)) { applyOl(lbl, _olMemo.get(memoKey)); memoHits++; continue; }
+
+      // Once the total budget is spent, stop making calls; remaining tied books
+      // keep their raw (unverified) title and stay tie-safe.
+      if (signal?.aborted || budgetCtrl.signal.aborted) { lbl.title_verified = false; continue; }
+
+      const params = new URLSearchParams({ title: lbl.title, limit: '3', fields: 'title,author_name' });
+      if (section === 'fiction' && authorKey) params.set('author', authorKey);
       // Open Library is a third-party API with no SLA — a single slow request
       // must never be able to hang the whole analysis. Bound each call and
       // treat a timeout exactly like a network error: keep the raw title but
@@ -1967,18 +2157,19 @@
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), OL_TIMEOUT_MS);
       const onAbort = () => ctrl.abort();
-      const onBudgetAbort = () => ctrl.abort();
       if (signal) {
         if (signal.aborted) ctrl.abort();
         else signal.addEventListener('abort', onAbort, { once: true });
       }
       if (budgetCtrl.signal.aborted) ctrl.abort();
-      else budgetCtrl.signal.addEventListener('abort', onBudgetAbort, { once: true });
+      else budgetCtrl.signal.addEventListener('abort', onAbort, { once: true });
       try {
+        calls++;
         const res = await fetch(`https://openlibrary.org/search.json?${params}`,
           { signal: ctrl.signal, headers: { 'Accept': 'application/json' } });
         const data = await res.json();
         const olTitle = data.numFound > 0 ? data.docs[0]?.title : null;
+        let result;
         if (olTitle) {
           // Guard against Open Library matching a DIFFERENT book by the same
           // author: only trust the hit for ordering when its title words
@@ -1988,25 +2179,22 @@
           const rTok = new Set(lettersLower(rawTitle).split(/\s+/).filter(w => w.length >= 3));
           const oTok = lettersLower(olTitle).split(/\s+/).filter(w => w.length >= 3);
           const overlap = oTok.length ? oTok.filter(w => rTok.has(w)).length / oTok.length : 0;
-          if (overlap >= 0.5) {
-            lbl.title = olTitle; lbl.title_verified = true;
-          } else {
-            lbl.title_verified = false;   // keep raw read for display only
-          }
+          result = overlap >= 0.5 ? { kind: 'verified', title: olTitle } : { kind: 'weak' };
         } else {
-          lbl.title          = null;   // unrecognised — don't use for ordering
-          lbl.title_verified = false;
+          result = { kind: 'none' };   // unrecognised — don't use for ordering
         }
+        _olMemo.set(memoKey, result);   // definitive response — safe to memoize
+        applyOl(lbl, result);
       } catch {
-        lbl.title_verified = false;  // network error, timeout, or budget abort — keep raw title but unverified
+        lbl.title_verified = false;  // network error, timeout, or budget abort — keep raw title, don't memoize
       } finally {
         clearTimeout(timer);
         if (signal) signal.removeEventListener('abort', onAbort);
-        budgetCtrl.signal.removeEventListener('abort', onBudgetAbort);
+        budgetCtrl.signal.removeEventListener('abort', onAbort);
       }
-    }));
+    }
     clearTimeout(budgetTimer);
-    console.log(`[perf] verifyTitlesOpenLibrary: ${toVerify.length} call(s), ${Math.round(performance.now() - t0)}ms`);
+    console.log(`[perf] verifyTitlesOpenLibrary: ${calls} call(s), ${memoHits} memo hit(s), ${Math.round(performance.now() - t0)}ms`);
   }
 
   // The on-device title reader returns the whole spine line (author name mixed
@@ -2063,7 +2251,11 @@
         .catch(() => null);
       if (tt && tt.title) {
         const cleaned = cleanSpineTitle(tt.title, labels[i].text);
-        if (cleaned.length >= 3) { labels[i].title = cleaned; got++; }
+        // Keep the read confidence alongside the title so the unverified
+        // title-order pass (checkOrderOneShelf) can apply a quality bar — a
+        // low-confidence spine read must not be able to raise "possibly out
+        // of order". Currently the conf was dropped here.
+        if (cleaned.length >= 3) { labels[i].title = cleaned; labels[i].title_conf = tt.conf; got++; }
       }
     }
     console.log(`[perf] finishLabels: read ${got}/${read} spine title(s) (${tied.length} tied) in ${Math.round(performance.now() - t0)}ms`);
@@ -2161,6 +2353,7 @@
       shelfRow:       l.shelfRow,
       title:          l.title          || null,
       title_score:    l.title_score    || null,
+      title_conf:     l.title_conf     ?? null,
       title_verified: l.title_verified ?? false,
       src:            l.src            || 'ocr',
     }));
@@ -2310,9 +2503,16 @@
     }
   }
 
-  async function runOcr(encoded, signal, onCall1Done) {
+  async function runOcr(encoded, signal, onCall1Done, arOpts) {
     const t0 = performance.now();
     const section = getSection();
+    // AR mode throttles the remote engine to protect the free-tier quota. When
+    // `skipRemote` is set this cycle reads on-device only (no ocr.space call at
+    // all); the local engine alone drives the render, so — by the sacred flag-
+    // safety invariant — no red misshelving flag can be produced (single-engine
+    // reads score below the 0.65 fuse bar).
+    const arMode = !!(arOpts && arOpts.arMode);
+    const skipRemote = !!(arOpts && arOpts.skipRemote);
 
     // The local engine fires immediately, in parallel with ocr.space, from
     // the full-res snapshot canvas (both the upload and AR paths draw into
@@ -2325,7 +2525,7 @@
         : Promise.resolve(null));
     pendingLocal = null;
 
-    const ocrP = (async () => {
+    const ocrP = skipRemote ? Promise.reject(new Error('remote skipped (AR throttle)')) : (async () => {
       let labels, imgW, imgH;
       if (section === 'fiction') {
         // Fiction stickers are large; one downscaled frame reads them fine.
@@ -2356,6 +2556,14 @@
       console.log(`[perf] runOcr: OCR call(s) done at ${Math.round(performance.now() - t0)}ms`);
       return { labels, imgW, imgH };
     })();
+
+    // Track remote health so the AR loop can surface a persistent "online check
+    // unavailable — local reads only" status (and keep serving on-device reads)
+    // instead of going silent. Only meaningful when a remote call was actually
+    // attempted; a throttled (skipRemote) cycle leaves the last verdict intact.
+    if (arMode && !skipRemote) {
+      ocrP.then(() => { arRemoteDown = false; }, () => { arRemoteDown = true; });
+    }
 
     // First-success race. Whichever engine produces a usable result first
     // drives the first render; the other fuses in later as a background
@@ -2467,6 +2675,7 @@
       spine_label:    label.text,
       title:          label.title          || null,
       title_verified: label.title_verified ?? false,
+      title_conf:     label.title_conf     ?? null,
       confidence:     label.score >= 0.65 ? 'high' : 'low',
       shelfRow:       label.shelfRow ?? 0,
       _bbox:          label.bbox,
@@ -2667,15 +2876,18 @@
     ctx.font         = `bold ${fs}px sans-serif`;
     ctx.textBaseline = 'bottom';
 
-    // Only flagged books (out of order or unverifiable) get a box — correct
-    // books are left unmarked so the photo isn't cluttered with green boxes.
-    const flagged = checkedBooks.filter(b => b._bbox && (b.outOfOrder || b.unverifiable));
+    // Only flagged books (out of order, unverifiable, or possibly-out-of-order)
+    // get a box — correct books are left unmarked so the photo isn't cluttered
+    // with green boxes.
+    const flagged = checkedBooks.filter(b => b._bbox && (b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder));
 
     flagged.forEach((book) => {
       const i = checkedBooks.indexOf(book);
       const [bx, by, bw, bh] = book._bbox;
       const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
-      const color = book.unverifiable ? '#facc15' : '#ef4444';
+      // Red only for confirmed (fused+verified) out-of-order; both "unsure"
+      // states (unverifiable label, possibly-out-of-order title) are yellow.
+      const color = book.outOfOrder ? '#ef4444' : '#eab308';
 
       ctx.strokeStyle = color;
       ctx.lineWidth   = lw;
@@ -2781,7 +2993,7 @@
       const oRect = arLiveOverlay.getBoundingClientRect();
       const pRect = cameraLive.getBoundingClientRect();
       const [ox, oy, ow, oh] = entry._overlayRect;
-      pulse.style.color  = book.unverifiable ? '#facc15' : '#ef4444';
+      pulse.style.color  = book.unverifiable ? '#eab308' : '#ef4444';
       pulse.style.left   = `${(oRect.left - pRect.left) + ox / dpr}px`;
       pulse.style.top    = `${(oRect.top  - pRect.top)  + oy / dpr}px`;
       pulse.style.width  = `${ow / dpr}px`;
@@ -2800,7 +3012,7 @@
     const left = (cRect.left - pRect.left) + bx * sx;
     const top  = (cRect.top  - pRect.top)  + by * sy;
 
-    pulse.style.color  = book.unverifiable ? '#facc15' : '#ef4444';
+    pulse.style.color  = book.unverifiable ? '#eab308' : '#ef4444';
     pulse.style.left   = `${left}px`;
     pulse.style.top    = `${top}px`;
     pulse.style.width  = `${bw * sx}px`;
@@ -3121,11 +3333,11 @@
 
     const checked = books.map((book, i) => {
       const pos = i + 1;
-      if (!keys[i]) return { ...book, outOfOrder: false, unverifiable: true, idealPosition: null, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: null };
+      if (!keys[i]) return { ...book, outOfOrder: false, unverifiable: true, possiblyOutOfOrder: false, idealPosition: null, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: null };
       const ideal    = idealRank.get(i) ?? null;
       const tied     = tiedSlots.get(i) || null;
       const inTied   = tied && pos >= tied[0] && pos <= tied[1];
-      return { ...book, outOfOrder: !lisGlobal.has(i) && !inTied, unverifiable: false, idealPosition: ideal, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: tied };
+      return { ...book, outOfOrder: !lisGlobal.has(i) && !inTied, unverifiable: false, possiblyOutOfOrder: false, idealPosition: ideal, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: tied };
     });
 
     // Post-pass: sandwich / near-twin demotion
@@ -3182,6 +3394,69 @@
       }
       if (demote) { checked[i].outOfOrder = false; checked[i].unverifiable = true; checked[i].idealPosition = null; }
     }
+
+    // ── Unverified-title order pass → possiblyOutOfOrder (yellow) ────────────
+    // Within a primary-key tie group, unverified spine-read titles are blanked
+    // by sortKey (never feed the red LIS), so two clearly out-of-alphabetical-
+    // order titles on tied books go unsurfaced. Surface that as YELLOW
+    // ("possibly out of order — not sure"), NEVER red: a title that is not
+    // OL-verified is single-source evidence and must never cause outOfOrder
+    // (the 0-false-positive misshelving invariant). Verified titles already
+    // break the primary key and get red via the LIS above, so they are
+    // excluded here.
+    //
+    // Noise guard: only a FIRST-LETTER disagreement counts as a violation.
+    // Sub-first-letter OCR noise (a stray middle character) must not trigger a
+    // flag, so titles sharing a first letter are treated as tied for ordering.
+    const filingTitle = t =>
+      lettersLower(String(t || '').replace(/^the\s+|^a\s+|^an\s+/i, ''));
+    const titleCmp = (a, b) => (a[0] === b[0] ? 0 : compareFiling(a, b));
+    const titleLNDS = titles => {
+      const n = titles.length;
+      if (!n) return new Set();
+      const dp = new Array(n).fill(1), prev = new Array(n).fill(-1);
+      let bestEnd = 0;
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < i; j++) {
+          if (titleCmp(titles[j], titles[i]) <= 0 && dp[j] + 1 > dp[i]) { dp[i] = dp[j] + 1; prev[i] = j; }
+        }
+        if (dp[i] > dp[bestEnd]) bestEnd = i;
+      }
+      const set = new Set();
+      for (let i = bestEnd; i !== -1; i = prev[i]) set.add(i);
+      return set;
+    };
+
+    // Group verified indices by their tie range (lo is unique per group, since
+    // vIdx is strictly increasing). Books in the same tie group share [lo, hi].
+    const titleGroups = new Map();
+    for (let i = 0; i < checked.length; i++) {
+      const tied = tiedSlots.get(i);
+      if (!tied) continue;
+      const gk = tied[0];
+      if (!titleGroups.has(gk)) titleGroups.set(gk, []);
+      titleGroups.get(gk).push(i);   // pushed in physical (left→right) order
+    }
+    for (const members of titleGroups.values()) {
+      if (members.length < 2) continue;   // singletons are never "out of order"
+      const eligIdx = [], eligTitle = [];
+      for (const i of members) {
+        const b = checked[i];
+        if (b.outOfOrder || b.unverifiable) continue;   // already surfaced otherwise
+        if (b.title_verified) continue;                 // verified titles → red path, handled by LIS
+        const ft = filingTitle(b.title);
+        if (!ft) continue;                              // empty/absent title
+        if ((b.title || '').replace(/[^a-z0-9]/gi, '').length < 4) continue;  // min length bar
+        if (!(typeof b.title_conf === 'number' && b.title_conf >= 0.6)) continue;  // confidence bar
+        eligIdx.push(i); eligTitle.push(ft);
+      }
+      if (eligIdx.length < 2) continue;
+      const keep = titleLNDS(eligTitle);   // longest non-decreasing (by first letter) run
+      eligTitle.forEach((_, k) => {
+        if (!keep.has(k)) checked[eligIdx[k]].possiblyOutOfOrder = true;
+      });
+    }
+
     return checked;
   }
 
@@ -3241,22 +3516,24 @@
     const panel = document.getElementById('flaggedList');
     if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH, snapshot);
 
-    const total    = checked.length;
-    const outCount = checked.filter(b => b.outOfOrder).length;
-    const unvCount = checked.filter(b => b.unverifiable).length;
+    const total        = checked.length;
+    const outCount     = checked.filter(b => b.outOfOrder).length;
+    const unvCount     = checked.filter(b => b.unverifiable).length;
+    const possiblyCount = checked.filter(b => b.possiblyOutOfOrder).length;
 
     // Test hook (harmless in prod): record each render's result + timestamp so
     // the e2e harness (e2e_pipeline_test.mjs) can read the real pipeline output
     // and measure first-vs-final (refine) render latency. Never read by the app.
     (window.__shelfcheckRenders = window.__shelfcheckRenders || []).push({
-      t: performance.now(), section, total, outCount, unvCount, ar: false,
+      t: performance.now(), section, total, outCount, unvCount, possiblyCount, ar: false,
       books: checked.map(b => ({
-        spine_label:    b.spine_label,
-        title:          b.title || null,
-        title_verified: !!b.title_verified,
-        outOfOrder:     !!b.outOfOrder,
-        unverifiable:   !!b.unverifiable,
-        shelfRow:       b.shelfRow ?? null,
+        spine_label:        b.spine_label,
+        title:              b.title || null,
+        title_verified:     !!b.title_verified,
+        outOfOrder:         !!b.outOfOrder,
+        unverifiable:       !!b.unverifiable,
+        possiblyOutOfOrder: !!b.possiblyOutOfOrder,
+        shelfRow:           b.shelfRow ?? null,
       })),
     });
 
@@ -3266,7 +3543,9 @@
       return;
     }
 
-    showSummaryBadge(total, outCount, unvCount);
+    // "possibly out of order" is a soft, unsure state — fold it into the same
+    // "to check" bucket as unverifiable labels for the summary count.
+    showSummaryBadge(total, outCount, unvCount + possiblyCount);
     showFlaggedList(checked, panel);
   }
 
@@ -3291,7 +3570,7 @@
   }
 
   function showFlaggedList(checked, panel = document.getElementById('flaggedList')) {
-    const flagged = checked.filter(b => b.outOfOrder || b.unverifiable);
+    const flagged = checked.filter(b => b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder);
     panel.innerHTML = '';
     _flaggedRowMap.clear();
     if (!flagged.length) {
@@ -3327,7 +3606,7 @@
       row.setAttribute('role', 'button');
       row.setAttribute('tabindex', '0');
       row.setAttribute('aria-expanded', 'false');
-      row.setAttribute('aria-label', `${book.spine_label || 'Book'}${book.title ? `, ${book.title}` : ''} — ${isBad ? 'out of order' : 'check manually'}`);
+      row.setAttribute('aria-label', `${book.spine_label || 'Book'}${book.title ? `, ${book.title}` : ''} — ${isBad ? 'out of order' : book.possiblyOutOfOrder ? 'possibly out of order' : 'check manually'}`);
       _flaggedRowMap.set(book, row);
 
       const posBits = [];
@@ -3343,13 +3622,15 @@
           ${titleLine}
           <div class="flagged-item-sub">${escapeHtml(posBits.join(' · '))}</div>
         </div>
-        <div class="flagged-item-status ${isBad ? 'flagged-item-status-bad' : 'flagged-item-status-unv'}">${isBad ? 'Out of order' : 'Check'}</div>`;
+        <div class="flagged-item-status ${isBad ? 'flagged-item-status-bad' : 'flagged-item-status-unv'}">${isBad ? 'Out of order' : book.possiblyOutOfOrder ? 'Check order' : 'Check'}</div>`;
 
       // Build inline expandable detail (shown below row on tap)
       const detail = document.createElement('div');
       detail.className = 'flagged-item-detail';
-      const dcolor = book.unverifiable ? '#facc15' : book.outOfOrder ? '#ef4444' : '#22c55e';
-      const dstatus = book.unverifiable ? 'Check manually' : 'Out of order';
+      const dcolor = book.outOfOrder ? '#ef4444' : '#eab308';
+      const dstatus = book.outOfOrder ? 'Out of order'
+                    : book.possiblyOutOfOrder ? 'Possibly out of order — check title order'
+                    : 'Check manually';
       detail.innerHTML = `
         ${book.title ? `<div class="fi-drow"><span class="fi-dk">Title</span><span class="fi-dv">${escapeHtml(book.title)}${book.title_verified ? ' <span style="opacity:.5;font-size:10px">✓</span>' : ''}</span></div>` : ''}
         <div class="fi-drow"><span class="fi-dk">Confidence</span><span class="fi-dv">${Math.round((book._score || 0) * 100)}%${book._title_score ? ` · title ${Math.round(book._title_score * 100)}%` : ''}</span></div>
@@ -3501,20 +3782,21 @@
         const books   = labelsToBooks(data.labels);
         const checked = checkOrder(books, section);
         const out = checked.filter(b => b.outOfOrder).length;
-        const unv = checked.filter(b => b.unverifiable).length;
+        const unv = checked.filter(b => b.unverifiable || b.possiblyOutOfOrder).length;
         const ok  = checked.length - out - unv;
         let html = `<div class="debug-section-title">
             ${data.n} labels · ${data.ms}ms OCR · ${elapsed}ms total ·
             <span style="color:#4ade80">${ok} ok</span>
             <span style="color:#ef4444"> ${out} out</span>
-            <span style="color:#facc15"> ${unv} check</span>
+            <span style="color:#eab308"> ${unv} check</span>
           </div><div style="overflow-x:auto">
           <table class="debug-book-table">
             <tr><th>#</th><th>Label</th><th>Score</th><th>Row</th><th>Status</th></tr>`;
         checked.forEach((b, i) => {
-          const cls = b.outOfOrder ? 'book-bad' : b.unverifiable ? 'book-unv' : 'book-ok';
+          const cls = b.outOfOrder ? 'book-bad' : (b.unverifiable || b.possiblyOutOfOrder) ? 'book-unv' : 'book-ok';
           const status = b.outOfOrder ? `<span style="color:#ef4444">→ slot ${b.idealPosition ?? '?'}</span>`
-                       : b.unverifiable ? '<span style="color:#facc15">Check</span>'
+                       : b.possiblyOutOfOrder ? '<span style="color:#eab308">title order?</span>'
+                       : b.unverifiable ? '<span style="color:#eab308">Check</span>'
                        : '<span style="color:#4ade80">OK</span>';
           html += `<tr class="${cls}"><td>${i + 1}</td><td>${escapeHtml(b.spine_label || '—')}</td>
             <td>${Math.round((b._score || 0) * 100)}%</td><td>${(b.shelfIndex ?? 0) + 1}</td><td>${status}</td></tr>`;
@@ -3562,7 +3844,7 @@
           <span><b>Red box</b> on the photo = out of order — listed below with its box number.</span>
         </div>
         <div class="first-hint-row">
-          <span class="first-hint-dot" style="background:#facc15"></span>
+          <span class="first-hint-dot" style="background:#eab308"></span>
           <span><b>Yellow box</b> = label unclear — check it by eye.</span>
         </div>
         <div class="first-hint-row">
