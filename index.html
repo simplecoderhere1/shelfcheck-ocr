@@ -2146,10 +2146,22 @@
           // actually overlap what we read off the spine. A weak match keeps
           // the raw read for display but stays unverified, so it can never
           // reorder a same-author run into a false misshelving flag.
-          const rTok = new Set(lettersLower(rawTitle).split(/\s+/).filter(w => w.length >= 3));
-          const oTok = lettersLower(olTitle).split(/\s+/).filter(w => w.length >= 3);
+          // Tokenize on >= 3-letter words AND pure-number runs, so short or
+          // numeric titles ("It", "1984", "Us") aren't left with zero tokens
+          // (which could never reach the >= 0.5 bar and so could never verify).
+          const tokenize = (s) => {
+            const low = String(s).toLowerCase();
+            return (low.match(/[a-z]{3,}/g) || []).concat(low.match(/\d+/g) || []);
+          };
+          const rTok = new Set(tokenize(rawTitle));
+          const oTok = tokenize(olTitle);
           const overlap = oTok.length ? oTok.filter(w => rTok.has(w)).length / oTok.length : 0;
-          result = overlap >= 0.5 ? { kind: 'verified', title: olTitle } : { kind: 'weak' };
+          // Fallback: if the fully normalized (lowercase, alnum-only) strings
+          // are identical, trust the hit even when token overlap is 0/undefined
+          // — this recovers exact short/numeric titles. A merely-weak overlap
+          // still stays unverified, so it can't create a false misshelving flag.
+          const exact = lettersLower(rawTitle) !== '' && lettersLower(rawTitle) === lettersLower(olTitle);
+          result = (overlap >= 0.5 || exact) ? { kind: 'verified', title: olTitle } : { kind: 'weak' };
         } else {
           result = { kind: 'none' };   // unrecognised — don't use for ordering
         }
@@ -2171,11 +2183,20 @@
   // with the title, plus the odd stray glyph). Drop pure-symbol tokens and the
   // author surname so Open Library's title search matches on the title words.
   function cleanSpineTitle(raw, spineLabel) {
-    const sur = (parseSurnameAndFirst(spineLabel)?.surname || '')
-      .toUpperCase().replace(/[^A-Z]/g, '');
+    const parsed = parseSurnameAndFirst(spineLabel);
+    const sur = (parsed?.surname || '').toUpperCase().replace(/[^A-Z]/g, '');
+    // The spine strip carries the whole author line, so also drop the author's
+    // FIRST-name word(s). Only strip words of >= 3 letters so genuine short
+    // title words ("A", "An", "It") are never nuked.
+    const firstWords = new Set(
+      String(parsed?.first || '').toUpperCase().split(/\s+/)
+        .map(w => w.replace(/[^A-Z]/g, ''))
+        .filter(w => w.length >= 3));
     const toks = String(raw).split(/\s+/).filter(t => {
       if (!/[A-Za-z]/.test(t)) return false;                       // stray symbols/CJK
-      if (sur && t.toUpperCase().replace(/[^A-Z]/g, '') === sur) return false;  // author surname
+      const norm = t.toUpperCase().replace(/[^A-Z]/g, '');
+      if (sur && norm === sur) return false;                       // author surname
+      if (norm.length >= 3 && firstWords.has(norm)) return false;  // author first name
       return true;
     });
     return toks.join(' ').replace(/\s+/g, ' ').trim();

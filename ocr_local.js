@@ -42,6 +42,7 @@
   let ortReady = null;          // Promise for ort script load
   let engineReady = null;       // Promise for sessions + dict
   let detSess = null, recSess = null, dictChars = null;
+  let allowedClasses = null;    // Int32Array of CTC classes ctcDecode argmaxes over
   let activeEP = 'none';
 
   function available() {
@@ -144,6 +145,7 @@
         cachedFetch(DICT_URL, onProgress),
       ]);
       dictChars = new TextDecoder('utf-8').decode(dictBuf).split('\n');
+      buildCharsetMask();
       [detSess, recSess] = await Promise.all([createSession(detBuf), createSession(recBuf)]);
       console.log(`[perf] localocr: engine ready in ${Math.round(performance.now() - t0)}ms ` +
                   `(ep=${activeEP}, threads=${ort.env.wasm.numThreads}, isolated=${!!self.crossOriginIsolated})`);
@@ -284,13 +286,50 @@
     return { data, tw };
   }
 
+  // The rec dict is the full multilingual PP-OCR charset (~18.7k glyphs: CJK,
+  // emoji, Cyrillic, symbols). This app only ever reads English library-spine
+  // text (call numbers, author names, English titles), so every non-Latin
+  // class is pure downside: it can only (a) steal an argmax win on a noisy
+  // glyph and corrupt the read (dragging confidence below the flag bars) or
+  // (b) waste decode time. buildCharsetMask precomputes ONE list of the CTC
+  // classes worth argmaxing over — the blank, the trailing space class, and
+  // the dict entries that are English letters/digits, common punctuation, or
+  // accented Latin letters (so author names like BRONTË / GARCÍA survive).
+  // ctcDecode then scans ~120 classes per timestep instead of ~18.7k.
+  function buildCharsetMask() {
+    if (!dictChars) return;
+    const punct = new Set(['.', ',', "'", '-', '&', '/', ':', ';', '!', '?', '(', ')', '"', ' ']);
+    const isAllowedChar = (ch) => {
+      if (!ch || ch.length !== 1) return false;   // '' padding / multi-codepoint emoji
+      const code = ch.charCodeAt(0);
+      if (code >= 48 && code <= 57) return true;   // 0-9
+      if (code >= 65 && code <= 90) return true;   // A-Z
+      if (code >= 97 && code <= 122) return true;  // a-z
+      if (punct.has(ch)) return true;              // common ASCII punctuation
+      // Latin-1 accented letters À(0xC0)..ÿ(0xFF), minus the × and ÷ math signs
+      if (code >= 0xC0 && code <= 0xFF && code !== 0xD7 && code !== 0xF7) return true;
+      return false;
+    };
+    const allowed = [0];   // CTC blank (class 0) — always keep
+    for (let i = 0; i < dictChars.length; i++) {
+      if (isAllowedChar(dictChars[i])) allowed.push(i + 1);   // class i>0 -> dictChars[i-1]
+    }
+    allowed.push(dictChars.length + 1);   // trailing space class (one past the dict)
+    allowedClasses = Int32Array.from(allowed);
+    console.log(`[perf] localocr: charset mask ${allowedClasses.length}/${dictChars.length + 2} classes`);
+  }
+
   function ctcDecode(logits, T, C) {
+    const allowed = allowedClasses;
     let prev = 0;
     const chars = []; let confSum = 0;
     for (let t = 0; t < T; t++) {
-      let best = 0, bestP = logits[t * C];
-      for (let c2 = 1; c2 < C; c2++) {
-        const p = logits[t * C + c2];
+      const base = t * C;
+      let best = 0, bestP = -Infinity;
+      for (let k = 0; k < allowed.length; k++) {
+        const c2 = allowed[k];
+        if (c2 >= C) continue;           // guard: space class beyond model output
+        const p = logits[base + c2];
         if (p > bestP) { bestP = p; best = c2; }
       }
       if (best !== 0 && best !== prev) {
