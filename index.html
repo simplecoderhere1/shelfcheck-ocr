@@ -330,25 +330,6 @@
       .action-bar { flex-direction: row; }
     }
 
-    /* Landscape gate */
-    .landscape-gate {
-      display: none; position: fixed; inset: 0; z-index: 60;
-      background: #0d0d0d; flex-direction: column; align-items: center;
-      justify-content: center; gap: 20px; padding: 40px 32px; text-align: center;
-    }
-    .landscape-gate.show { display: flex; }
-    .landscape-gate-phone { animation: lsRotate 2.8s ease-in-out infinite; color: #2563eb; }
-    @keyframes lsRotate {
-      0%, 20% { transform: rotate(0deg); }
-      50%, 80% { transform: rotate(-90deg); }
-      100%     { transform: rotate(0deg); }
-    }
-    .landscape-gate h2 { font-size: 22px; font-weight: 700; color: #fff; margin: 0; }
-    .landscape-gate-sub { font-size: 15px; color: #aaa; max-width: 280px; line-height: 1.55; margin: 0; }
-    .landscape-gate-sub strong { color: #f0f0f0; }
-    .landscape-gate-auto { font-size: 12px; color: #555; margin-top: 4px; }
-    .landscape-gate-skip { margin-top: 12px; background: none; border: none; color: #444; font-size: 12px; cursor: pointer; text-decoration: underline; padding: 4px 8px; }
-
     /* Live camera */
     .camera-live { display: none; position: fixed; inset: 0; z-index: 70; background: #000; overflow: hidden; touch-action: none; }
     .camera-live.show { display: block; }
@@ -432,7 +413,7 @@
           Upload Image
         </button>
         <p style="font-size:12px;color:#888;text-align:center;line-height:1.5;padding:0 8px">
-          Photograph <strong>one shelf row</strong>, close-up, phone in landscape — get close enough that the label stickers are sharp.
+          Hold your phone <strong>upright</strong> and pan across the shelf — get close enough that the label stickers are sharp.
         </p>
       </div>
     </div>
@@ -444,17 +425,6 @@
     </div>
   </div>
   <div class="flagged-list" id="flaggedList" role="region" aria-label="Flagged books"></div>
-</div>
-
-<div class="landscape-gate" id="landscapeGate" role="dialog" aria-label="Rotate your phone">
-  <svg class="landscape-gate-phone" width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false">
-    <rect x="5" y="2" width="14" height="20" rx="2.5"/>
-    <circle cx="12" cy="17.5" r=".5" fill="currentColor" stroke="none"/>
-  </svg>
-  <h2>Turn your phone sideways</h2>
-  <p class="landscape-gate-sub">Fit <strong>one shelf row</strong> in frame.</p>
-  <p class="landscape-gate-auto">Camera opens automatically when you rotate.</p>
-  <button class="landscape-gate-skip" id="landscapeSkip">Shoot in portrait anyway</button>
 </div>
 
 <div class="camera-live" id="cameraLive" role="dialog" aria-label="Camera">
@@ -605,19 +575,7 @@
       snapshot.getContext('2d').putImageData(_cleanPhotoData, 0, 0);
   }
 
-  // ── Landscape gate ────────────────────────────────────────────────────────
-  const landscapeGate = document.getElementById('landscapeGate');
-  function _isPortraitMobile() {
-    return Math.min(screen.width, screen.height) <= 500 && window.innerHeight > window.innerWidth;
-  }
-  takePicBtn.addEventListener('click', () => {
-    if (_isPortraitMobile()) landscapeGate.classList.add('show');
-    else openLiveCamera();
-  });
-  document.getElementById('landscapeSkip').addEventListener('click', () => openLiveCamera());
-  window.addEventListener('resize', () => {
-    if (landscapeGate.classList.contains('show') && !_isPortraitMobile()) openLiveCamera();
-  });
+  takePicBtn.addEventListener('click', () => openLiveCamera());
 
   // ── Live in-app camera ────────────────────────────────────────────────────
   const cameraLive   = document.getElementById('cameraLive');
@@ -652,7 +610,6 @@
   ];
 
   async function openLiveCamera() {
-    landscapeGate.classList.remove('show');
     if (!navigator.mediaDevices?.getUserMedia) { photoInput.click(); return; }
     let stream = null;
     for (const res of AR_RES_STAGES) {
@@ -3837,7 +3794,7 @@
         <h3>How ShelfCheck works</h3>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#3b82f6"></span>
-          <span>Photograph <b>one shelf row</b>, close-up, phone in landscape. Get close enough that the white label stickers are sharp.</span>
+          <span>Hold your phone <b>upright</b> and pan across the shelf. Get close enough that the white label stickers are sharp.</span>
         </div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#ef4444"></span>
