@@ -737,6 +737,13 @@
   let arLastBoxes   = [];    // [{bbox:[vx,vy,vw,vh] in video-pixel space, book, color, dashed, index, _overlayRect}]
   let arKeyLuma     = null;  // Uint8ClampedArray — downsampled grayscale of the frame the last analysis used
   let arMotion      = { dx: 0, dy: 0 };  // accumulated video-px drift since arKeyLuma was captured
+  let arRefGen      = 0;     // bumped whenever arKeyLuma/arMotion are reset to a new reference frame, so an
+                              // in-flight det() pass anchored to the OLD reference (captured its mdx/mdy before
+                              // the reset) can detect the mismatch and discard its result instead of drawing
+                              // boxes at the wrong position (the reset zeroes arMotion, so re-adding a stale
+                              // mdx at render time would offset the box by however far the camera moved between
+                              // the two reference frames — this is what caused det boxes to appear on blank
+                              // shelf gaps during a fast pan).
   let arTrackHandle = null;
   let arLumaScratch = null;
 
@@ -919,9 +926,14 @@
       try {
         const rect = computeCaptureRect();
         if (rect) {
-          const mdx = arMotion.dx, mdy = arMotion.dy;
+          const mdx = arMotion.dx, mdy = arMotion.dy, refGenAtStart = arRefGen;
           const boxes = await LocalOCR.detect(arGrabDetFrame(rect));
-          if (arActive && boxes.length) {
+          // A full read cycle can land (and reset arKeyLuma/arMotion to a new
+          // reference frame) while this det pass was in flight. mdx/mdy were
+          // captured against the OLD reference, so anchoring into the new one
+          // with them would misplace every box by however far the camera moved
+          // in between — discard rather than draw boxes in the wrong spot.
+          if (arActive && boxes.length && refGenAtStart === arRefGen) {
             arDetBoxes = boxes.map(o => {
               const [fx, fy, fw, fh] = o.bboxFrac;
               return { bbox: [
@@ -991,6 +1003,7 @@
     const _preDx = arMotion.dx, _preDy = arMotion.dy;
     arKeyLuma = arGrabLuma(rect);
     arMotion  = { dx: 0, dy: 0 };
+    arRefGen++;
     if (arDetBoxes.length) arDetBoxes = arDetBoxes.map(d =>
       ({ bbox: [d.bbox[0] + _preDx, d.bbox[1] + _preDy, d.bbox[2], d.bbox[3]] }));
     arRenderOverlay();
@@ -1117,7 +1130,7 @@
   function startArLoop() {
     arActive = true;
     arLoopToken++;
-    arLastBoxes = []; arKeyLuma = null; arMotion = { dx: 0, dy: 0 };
+    arLastBoxes = []; arKeyLuma = null; arMotion = { dx: 0, dy: 0 }; arRefGen++;
     arDetBoxes = []; arDetBusy = false; arScanBusy = false;
     // Seed one full interval in the past (performance.now() is ms-since-load,
     // so a literal 0 would wrongly gate the remote engine off for the first
