@@ -1237,9 +1237,23 @@
     const source = stillPhoto || cameraVideo;
     const srcW = stillPhoto ? stillPhoto.width  : cameraVideo.videoWidth;
     const srcH = stillPhoto ? stillPhoto.height : cameraVideo.videoHeight;
-    const rx = stillPhoto ? srcW / cameraVideo.videoWidth  : 1;
-    const ry = stillPhoto ? srcH / cameraVideo.videoHeight : 1;
-    const cropX = rect.sx * rx, cropY = rect.sy * ry, cropW = rect.sw * rx, cropH = rect.sh * ry;
+    // The ImageCapture still is frequently a DIFFERENT aspect ratio than the
+    // live video track (a 4:3 sensor photo vs a 16:9 preview stream): the
+    // browser derives the on-screen preview as a CENTERED crop of the sensor.
+    // Mapping the video-space crop rect into the still with independent x/y
+    // scales (srcW/vw, srcH/vh) therefore misplaced it — the still carries
+    // extra field of view (top & bottom for a 4:3 still under a 16:9 preview)
+    // that the preview never showed — which drew every AR box consistently
+    // BELOW its sticker on real phones. Map through the SHARED field of view
+    // instead: one uniform scale (the smaller axis is the shared-FOV axis) plus
+    // a centering offset on the axis the still over-covers. For the video-frame
+    // fallback (no still, e.g. the headless test harness) this reduces to
+    // scale 1 / offset 0 — byte-identical to the old behaviour.
+    const s    = stillPhoto ? Math.min(srcW / cameraVideo.videoWidth, srcH / cameraVideo.videoHeight) : 1;
+    const offX = (srcW - cameraVideo.videoWidth  * s) / 2;
+    const offY = (srcH - cameraVideo.videoHeight * s) / 2;
+    const cropX = offX + rect.sx * s, cropY = offY + rect.sy * s;
+    const cropW = rect.sw * s, cropH = rect.sh * s;
 
     const sc = Math.min(1, MAX_CANVAS_DIM / Math.max(cropW, cropH));
     snapshot.width  = Math.round(cropW * sc);
@@ -3403,7 +3417,14 @@
   }
 
   function sortKey(book, section) {
-    if (book.confidence === 'low') return null;
+    // A confident on-device read (AR local-only cycle: score ~0.6, below the
+    // 0.65 cross-engine bar so tagged confidence:'low') is still a perfectly
+    // good SORT key — it just can't earn a red flag on its own. Let it sort so
+    // a correctly-ordered on-device read renders GREEN instead of a wall of
+    // yellow; the red-vs-yellow gate lives in checkOrderOneShelf's final pass.
+    // Genuinely weak reads (score < 0.5, e.g. the 0.4 low-confidence tier) and
+    // score-less "uncertain" GT rows (_score undefined) stay unsortable/yellow.
+    if (book.confidence === 'low' && !(book._score >= 0.5)) return null;
     const vol   = extractVolume(book);
     // Titles must never tie-break unless human/OL-verified: Gemini titles are
     // frequently unverified (verifyTitlesOpenLibrary's timeout/budget-abort
@@ -3683,6 +3704,22 @@
       eligTitle.forEach((_, k) => {
         if (!keep.has(k)) checked[eligIdx[k]].possiblyOutOfOrder = true;
       });
+    }
+
+    // ── Red requires cross-engine confirmation → otherwise yellow ────────────
+    // A red "misshelved" flag is an accusation and must never rest on a single
+    // engine (the sacred 0-false-positive invariant). Only a fused read (src
+    // 'both', score >= 0.65) may STAY red. A confident on-device-only read (AR
+    // local-only cycle: src 'gemini'/'ocr-only', score ~0.6) that lands out of
+    // sequence is downgraded to yellow "possibly out of order" — still boxed
+    // and sortable (so its in-order neighbours render green), but the definite
+    // red flag waits for the periodic remote fuse to confirm it. Books with no
+    // score/src metadata (offline ordering GT) are trusted and keep red, so the
+    // ordering suite is byte-for-byte unaffected.
+    for (const b of checked) {
+      if (b.outOfOrder && b._src && b._src !== 'both' && !(b._score >= 0.65)) {
+        b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+      }
     }
 
     return checked;
