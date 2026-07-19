@@ -762,6 +762,26 @@
   let arRemoteDown  = false; // last attempted remote OCR call failed → flags paused
   let arLastRemoteAt = 0;    // perf-clock time of the last remote OCR attempt (throttle)
 
+  // ── Multi-frame vote / track store ───────────────────────────────────────
+  // Persistent per-spine tracks living in the CURRENT reference frame's
+  // video-pixel coordinates (same space as arLastBoxes/arDetBoxes). Each read
+  // cycle and each det pass matches its boxes to these tracks; a track that
+  // keeps being seen accumulates a read-history and votes on its displayed
+  // label, so the overlay stops rebuilding from scratch every cycle (which is
+  // what made text flicker and grey orphan boxes float everywhere). On every
+  // reference-frame reset the whole store is shifted by the same _preDx/_preDy
+  // drift that re-anchors arDetBoxes — so votes always compare boxes in one
+  // coordinate frame.
+  // Track shape: { id, bbox:[vx,vy,vw,vh], history:[{text}], voteText:{key,count,text},
+  //   lastSeenCycle, lastSeenDetTick, displayBook, displayColor, dashed, flagged, index }
+  let arTracks     = [];
+  let arCycleSeq   = 0;      // read-cycle counter (++ once per landed arApplyResults)
+  let arDetSeq     = 0;      // det-pass counter (++ once per landed det tick)
+  let arTrackId    = 0;      // monotonic track id
+  const AR_VOTE_CAP        = 6;  // read-history length cap per track
+  const AR_TRACK_CYCLE_TTL = 2;  // a track may go unread this many cycles if det still sees it
+  const AR_TRACK_DET_TTL   = 4;  // a track may go det-unseen this many ticks if a read is recent
+
   const AR_TRACK_W = 96, AR_TRACK_H = 72, AR_SEARCH = 14;
   const AR_DET_INTERVAL_MS = 400;      // cadence of the det-only sub-loop
   const AR_DET_MAX_SIDE = 1600;        // scratch canvas size for the det pass
@@ -895,9 +915,15 @@
       }
       ctx.setLineDash([]);
     }
-    // Test/telemetry hook: last overlay composition (read boxes, det boxes,
-    // and how many det boxes were superseded in place by an overlapping read).
-    window.__arOverlayStats = { readBoxes: arLastBoxes.length, detBoxes: arDetBoxes.length, detSuppressed };
+    // Test/telemetry hook: last overlay composition. orphanDetBoxes = grey det
+    // boxes NOT superseded by a read-bearing track (the "floating boxes" the
+    // tracking is meant to drive down); tracks/tracksWithReads expose the store.
+    window.__arOverlayStats = {
+      readBoxes: arLastBoxes.length, detBoxes: arDetBoxes.length, detSuppressed,
+      orphanDetBoxes: arDetBoxes.length - detSuppressed,
+      tracks: arTracks.length,
+      tracksWithReads: arTracks.filter(t => t.history && t.history.length).length,
+    };
   }
 
   // Draw the currently-visible capture region into a scratch canvas for the
@@ -941,6 +967,19 @@
                 fw * rect.sw, fh * rect.sh,
               ] };
             });
+            // Refresh the liveness of any track a det box still covers. This is
+            // what lets a read-bearing track survive read cycles that don't re-
+            // read it (anti-flicker) yet expire promptly once it pans off-frame.
+            // The refGen guard above means arDetBoxes and arTracks are in the
+            // same reference frame right now, so overlap matching is valid.
+            arDetSeq++;
+            for (const d of arDetBoxes) {
+              for (const tk of arTracks) {
+                if (arMatchScore(d.bbox, tk.bbox) > 0) tk.lastSeenDetTick = arDetSeq;
+              }
+            }
+            arPruneTracks();
+            arBoxesFromTracks();   // drop any track that just expired from the overlay
             window.__arDetRenders = (window.__arDetRenders || 0) + 1;
             arRenderOverlay();
           }
@@ -974,38 +1013,174 @@
   // problems. Numbering (for the tap-to-list correlation) stays reserved for
   // flagged books, same as the sheet below, so a dense shelf of green boxes
   // doesn't turn into a wall of badges.
+  // Normalize a spine label to a vote key: case- and punctuation-insensitive so
+  // "635.04 HEM" and "635.04  hem" fold together but "635.04" vs "635.048" don't.
+  function arNormText(t) { return String(t || '').toUpperCase().replace(/[^A-Z0-9]+/g, ''); }
+
+  // How well two video-px boxes correspond to the SAME physical spine. Strong
+  // IoU (>0.3) ranks above a mere center-in-box hit so a read box prefers the
+  // track it genuinely overlaps. Returns 0 for no correspondence.
+  function arMatchScore(a, b) {
+    const [ax, ay, aw, ah] = a, [bx, by, bw, bh] = b;
+    const ix = Math.max(0, Math.min(ax + aw, bx + bw) - Math.max(ax, bx));
+    const iy = Math.max(0, Math.min(ay + ah, by + bh) - Math.max(ay, by));
+    const inter = ix * iy, uni = aw * ah + bw * bh - inter;
+    const iou = uni > 0 ? inter / uni : 0;
+    if (iou > 0.3) return 1 + iou;                       // strong match
+    const acx = ax + aw / 2, acy = ay + ah / 2, bcx = bx + bw / 2, bcy = by + bh / 2;
+    if (acx >= bx && acx <= bx + bw && acy >= by && acy <= by + bh) return 0.5;
+    if (bcx >= ax && bcx <= ax + aw && bcy >= ay && bcy <= ay + ah) return 0.5;
+    return 0;
+  }
+
+  // Majority vote over a track's read history (chronological). Ties break to the
+  // most recently read label. Returns the winning normalized key, its count
+  // (= voteCount), and a raw representative text to actually display (the most
+  // recent raw label in the winning class, so formatting isn't lost to norm()).
+  function arMajority(history) {
+    const counts = new Map(), latest = new Map();
+    for (const h of history) {
+      const k = arNormText(h.text);
+      counts.set(k, (counts.get(k) || 0) + 1);
+      latest.set(k, h.text);                    // later entries overwrite → most recent raw
+    }
+    let bestK = null, bestC = 0;
+    for (const [k, c] of counts) if (c > bestC) { bestC = c; bestK = k; }
+    const tied = [...counts.entries()].filter(([, c]) => c === bestC).map(([k]) => k);
+    if (tied.length > 1) {
+      for (let i = history.length - 1; i >= 0; i--) {
+        const k = arNormText(history[i].text);
+        if (tied.includes(k)) { bestK = k; break; }
+      }
+    }
+    return { key: bestK, count: bestC, text: latest.get(bestK) };
+  }
+
+  // Drop tracks unseen by BOTH the read cycles (>TTL cycles) AND the det
+  // sub-loop (>TTL ticks). Keeping a track alive on EITHER signal is the whole
+  // anti-flicker win: a spine read once stays boxed while det keeps seeing it,
+  // even across read cycles that never re-read it; once it leaves frame both
+  // signals go stale and it expires, killing the floating-orphan problem.
+  function arPruneTracks() {
+    arTracks = arTracks.filter(tk =>
+      (arCycleSeq - tk.lastSeenCycle) <= AR_TRACK_CYCLE_TTL ||
+      (arDetSeq   - tk.lastSeenDetTick) <= AR_TRACK_DET_TTL);
+  }
+
+  // Rebuild arLastBoxes (the render source) from every live read-bearing track.
+  function arBoxesFromTracks() {
+    arLastBoxes = arTracks
+      .filter(tk => tk.history.length && tk.displayBook)
+      .map(tk => ({
+        trackId: tk.id,
+        bbox: tk.bbox.slice(),
+        book: tk.displayBook,
+        color: tk.displayColor,
+        dashed: tk.dashed,
+        flagged: tk.flagged,
+        index: tk.index,
+        voteCount: tk.voteText ? tk.voteText.count : 1,
+        _overlayRect: null,
+      }));
+  }
+
   function arApplyResults(books, section, rect) {
-    const checked = checkOrder(books, section);
-    lastCheckedBooks = checked;
     const sentW = lastApiDims.sentW, sentH = lastApiDims.sentH;
     const toVideoX = sc => rect.sx + sc * (rect.sw / sentW);
     const toVideoY = sc => rect.sy + sc * (rect.sh / sentH);
-    // "box N" in the flagged-list rows (showFlaggedList) is each book's 1-based
-    // position among ALL books on the shelf, not a flagged-only count — match
-    // that here so a box's badge number is the same number its list row shows.
-    arLastBoxes = checked.filter(b => b._bbox)
-      .map((b) => {
-        const [bx, by, bw, bh] = b._bbox;
-        const flagged = b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder;
-        return {
-          bbox: [toVideoX(bx), toVideoY(by), bw * (rect.sw / sentW), bh * (rect.sh / sentH)],
-          book: b,
-          color: b.outOfOrder ? '#ef4444' : (b.unverifiable || b.possiblyOutOfOrder) ? '#eab308' : '#22c55e',
-          dashed: b._src === 'gemini-synth',
-          flagged,
-          index: flagged ? checked.indexOf(b) + 1 : null,
-          _overlayRect: null,
-        };
-      });
-    // Re-anchor the det-only boxes into the new reference frame (the read
-    // cycle resets arKeyLuma to the current frame and zeroes the drift), so
-    // grey boxes on not-yet-read stickers stay put instead of jumping.
+
+    // ── 1. Re-anchor ALL persistent state into the new reference frame ──────
+    // A read cycle makes the current frame the new reference: grab its luma,
+    // zero the drift, bump arRefGen. Everything that was anchored to the OLD
+    // reference (tracks AND det boxes) must be shifted by exactly the drift
+    // (_preDx/_preDy) accumulated since that frame, or it would jump. This is
+    // the identical transform arDetBoxes has always used — tracks piggyback on
+    // it so incoming read boxes (already in the new frame) and existing tracks
+    // are compared in ONE coordinate space.
     const _preDx = arMotion.dx, _preDy = arMotion.dy;
     arKeyLuma = arGrabLuma(rect);
     arMotion  = { dx: 0, dy: 0 };
     arRefGen++;
+    for (const tk of arTracks) { tk.bbox[0] += _preDx; tk.bbox[1] += _preDy; }
     if (arDetBoxes.length) arDetBoxes = arDetBoxes.map(d =>
       ({ bbox: [d.bbox[0] + _preDx, d.bbox[1] + _preDy, d.bbox[2], d.bbox[3]] }));
+
+    arCycleSeq++;
+
+    // ── 2. Match incoming reads to tracks; append votes; create new tracks ──
+    const incoming = books.filter(b => b._bbox).map(b => {
+      const [bx, by, bw, bh] = b._bbox;
+      return { book: b, vbox: [toVideoX(bx), toVideoY(by),
+                               bw * (rect.sw / sentW), bh * (rect.sh / sentH)] };
+    });
+    const trackOfBook = new Map();
+    const usedTracks = new Set();
+    for (const inc of incoming) {
+      let best = null, bestScore = 0;
+      for (const tk of arTracks) {
+        if (usedTracks.has(tk)) continue;
+        const s = arMatchScore(inc.vbox, tk.bbox);
+        if (s > bestScore) { bestScore = s; best = tk; }
+      }
+      if (!best) {
+        best = { id: ++arTrackId, bbox: inc.vbox.slice(), history: [], voteText: null,
+                 lastSeenCycle: arCycleSeq, lastSeenDetTick: arDetSeq,
+                 displayBook: null, displayColor: null, dashed: false, flagged: false, index: null };
+        arTracks.push(best);
+      }
+      usedTracks.add(best);
+      trackOfBook.set(inc.book, best);
+      best.bbox = inc.vbox.slice();          // update position to the latest read
+      best.lastSeenCycle = arCycleSeq;
+      best.lastSeenDetTick = arDetSeq;        // a read implies the spine is present now
+      best.history.push({ text: inc.book.spine_label || '' });
+      if (best.history.length > AR_VOTE_CAP) best.history.shift();
+      best.voteText = arMajority(best.history);
+    }
+
+    // ── 3. Consensus labels → checkOrder → colours ─────────────────────────
+    // Substitute each matched track's MAJORITY text for its raw read before the
+    // flag logic runs, so the displayed label (and its colour) is the multi-
+    // frame consensus, not one noisy frame.
+    // SACRED INVARIANT: this rewrites only spine_label TEXT — never a score.
+    // checkOrder still gates every red outOfOrder flag on the fused >=0.65 bar,
+    // so on a local-only (skipRemote) cycle no book can reach that bar and vote
+    // agreement can NEVER manufacture a red flag. Consensus stabilises text and
+    // box colour/persistence only; red flags stay exclusive to the fused path.
+    // checkOrder spreads each book into a fresh object ({...b, shelfIndex}),
+    // so track association must ride ON the book as a copied property
+    // (_arTrackId), not in an object-identity map — identity dies in the spread.
+    const consensusBooks = books.map(b => {
+      const tk = trackOfBook.get(b);
+      if (!tk) return b;
+      if (tk.voteText && tk.voteText.text != null && tk.voteText.text !== b.spine_label) {
+        return { ...b, spine_label: tk.voteText.text, _arTrackId: tk.id };
+      }
+      return { ...b, _arTrackId: tk.id };
+    });
+    const checked = checkOrder(consensusBooks, section);
+    lastCheckedBooks = checked;
+
+    // ── 4. Fold this cycle's flag/colour result back onto matched tracks ────
+    // Only tracks matched THIS cycle refresh their colour/flag/book; tracks not
+    // re-read this cycle keep the colour from the LATEST cycle they appeared in
+    // (that colour-stability is the anti-flicker win). "box N" badges stay the
+    // 1-based whole-shelf position, matching the flagged-list rows.
+    const trackById = new Map(arTracks.map(tk => [tk.id, tk]));
+    for (const b of checked) {
+      const tk = b._arTrackId != null ? trackById.get(b._arTrackId) : null;
+      if (!tk) continue;
+      const flagged = b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder;
+      tk.displayBook  = b;
+      tk.displayColor = b.outOfOrder ? '#ef4444' : (b.unverifiable || b.possiblyOutOfOrder) ? '#eab308' : '#22c55e';
+      tk.dashed  = b._src === 'gemini-synth';
+      tk.flagged = flagged;
+      tk.index   = flagged ? checked.indexOf(b) + 1 : null;
+    }
+
+    // ── 5. Expire stale tracks, then rebuild the render source from tracks ──
+    arPruneTracks();
+    arBoxesFromTracks();
     arRenderOverlay();
 
     const total = checked.length;
@@ -1018,6 +1193,18 @@
         spine_label: b.spine_label, title: b.title || null, title_verified: !!b.title_verified,
         outOfOrder: !!b.outOfOrder, unverifiable: !!b.unverifiable,
         possiblyOutOfOrder: !!b.possiblyOutOfOrder, shelfRow: b.shelfRow ?? null,
+        // video-px bbox (additive telemetry) so a harness can match the same
+        // physical book across consecutive cycles by overlap for churn stats.
+        bbox: b._bbox ? [toVideoX(b._bbox[0]), toVideoY(b._bbox[1]),
+                         b._bbox[2] * (rect.sw / sentW), b._bbox[3] * (rect.sh / sentH)] : null,
+      })),
+      // The boxes actually drawn this cycle (video-px, current reference frame),
+      // with their displayed label — lets a harness measure label-text churn on
+      // the SAME physical spine across cycles by overlap.
+      renderBoxes: arLastBoxes.map(e => ({
+        trackId: e.trackId ?? null,
+        text: e.book ? e.book.spine_label : null, bbox: e.bbox,
+        color: e.color, voteCount: e.voteCount || 1,
       })),
     });
 
@@ -1132,6 +1319,7 @@
     arLoopToken++;
     arLastBoxes = []; arKeyLuma = null; arMotion = { dx: 0, dy: 0 }; arRefGen++;
     arDetBoxes = []; arDetBusy = false; arScanBusy = false;
+    arTracks = []; arCycleSeq = 0; arDetSeq = 0;
     // Seed one full interval in the past (performance.now() is ms-since-load,
     // so a literal 0 would wrongly gate the remote engine off for the first
     // 20s of the page's life) → the very first cycle is allowed to fuse.
@@ -1149,6 +1337,7 @@
     if (arDetHandle) { clearTimeout(arDetHandle); arDetHandle = null; }
     arLastBoxes = []; arKeyLuma = null; arImageCapture = null;
     arDetBoxes = []; arDetBusy = false; arScanBusy = false;
+    arTracks = []; arCycleSeq = 0; arDetSeq = 0;
     const ctx = arLiveOverlay.getContext('2d');
     if (arLiveOverlay.width) ctx.clearRect(0, 0, arLiveOverlay.width, arLiveOverlay.height);
     arBoxPulse.classList.remove('show');
