@@ -387,6 +387,10 @@
         <span>On-device AI OCR</span>
         <div class="settings-toggle" id="geminiToggleSwitch"></div>
       </div>
+      <div class="settings-item" id="liveArEntry" role="menuitem" tabindex="0" style="display:none">
+        <span>Live scan (experimental)</span>
+        <span aria-hidden="true" style="color:#777">&rsaquo;</span>
+      </div>
       <div style="padding:10px 16px;border-top:1px solid #2c2c2c">
         <div style="font-size:11px;color:#555;line-height:1.5">On-device AI OCR (PP-OCR)<br>+ ocr.space via Cloudflare proxy</div>
       </div>
@@ -413,7 +417,7 @@
           Upload Image
         </button>
         <p style="font-size:12px;color:#888;text-align:center;line-height:1.5;padding:0 8px">
-          Hold your phone <strong>upright</strong> and pan across the shelf — get close enough that the label stickers are sharp.
+          Take a photo of a shelf — fit as many books as you like. Get close enough that the label stickers are <strong>sharp</strong>, then it reads and checks the order automatically.
         </p>
       </div>
     </div>
@@ -509,7 +513,10 @@
   function getSection() { return document.querySelector('.tab-btn.active').dataset.section; }
 
   // ── Photo loading ─────────────────────────────────────────────────────────
-  function loadPhoto(file) {
+  // autoAnalyze: the native camera (photoInput) already had the user confirm the
+  // shot, so go straight to results. Gallery upload (uploadInput) keeps the
+  // review-then-Analyze step so the user can pick/replace the image first.
+  function loadPhoto(file, autoAnalyze = false) {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = async () => {
@@ -536,6 +543,9 @@
       if (localOcrEnabled && window.LocalOCR && LocalOCR.available()) {
         pendingLocal = callLocalOcr(snapshot, null).catch(() => null);
       }
+      // Take-photo → results with no extra tap (native camera only). Retake
+      // stays available for a redo; analyzeShelf flips Analyze to "Reading…".
+      if (autoAnalyze) analyzeShelf();
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
@@ -575,7 +585,12 @@
       snapshot.getContext('2d').putImageData(_cleanPhotoData, 0, 0);
   }
 
-  takePicBtn.addEventListener('click', () => openLiveCamera());
+  // Main capture path: hand off to the phone's NATIVE camera app (photoInput is
+  // <input capture="environment">). It returns a full-resolution still — better
+  // for tiny sticker OCR than the live preview — and gives the user its own
+  // shutter/confirm step. The in-app live-AR camera is now an experimental
+  // extra reachable only from the settings menu (see the AR debug entry below).
+  takePicBtn.addEventListener('click', () => photoInput.click());
 
   // ── Live in-app camera ────────────────────────────────────────────────────
   const cameraLive   = document.getElementById('cameraLive');
@@ -1397,7 +1412,7 @@
   camClose.addEventListener('click', closeLiveCamera);
   uploadPicBtn.addEventListener('click', () => uploadInput.click());
   retakeBtn.addEventListener('click', retake);
-  photoInput.addEventListener('change',  () => { if (photoInput.files[0])  loadPhoto(photoInput.files[0]); });
+  photoInput.addEventListener('change',  () => { if (photoInput.files[0])  loadPhoto(photoInput.files[0], true); });
   uploadInput.addEventListener('change', () => { if (uploadInput.files[0]) loadPhoto(uploadInput.files[0]); });
 
   // ── Image encoding ────────────────────────────────────────────────────────
@@ -3949,6 +3964,8 @@
     debugSwitch.classList.toggle('on', debugMode);
     debugToggle.setAttribute('aria-checked', String(debugMode));
     settingsBtn.classList.toggle('debug-active', debugMode);
+    // The live-AR scan is experimental — only surface its entry in debug mode.
+    liveArEntry.style.display = debugMode ? '' : 'none';
     document.getElementById('debugBadge')?.remove();
     if (debugMode) {
       const badge = document.createElement('div');
@@ -3957,6 +3974,13 @@
     }
     settingsMenu.classList.remove('show');
     settingsBtn.setAttribute('aria-expanded', 'false');
+  });
+
+  const liveArEntry = document.getElementById('liveArEntry');
+  liveArEntry.addEventListener('click', () => {
+    settingsMenu.classList.remove('show');
+    settingsBtn.setAttribute('aria-expanded', 'false');
+    openLiveCamera();
   });
 
   const geminiToggle = document.getElementById('geminiToggle');
