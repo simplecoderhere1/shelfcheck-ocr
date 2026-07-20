@@ -492,8 +492,6 @@
   // 96% recall on the 10-image ground truth (test_items/bench_js_port.py).
   // It races ocr.space on every scan: first success renders, the other fuses
   // in as a background refine, and a scan only fails when BOTH are down.
-  const OL_TIMEOUT_MS = 4000;   // Open Library is third-party; never let one slow request stall analysis
-  const OL_CONCURRENCY = 6;     // tie-break lookups in flight at once — polite, but not one-at-a-time
   // ?nolocal=1 disables the on-device engine — benchmarking the remote-only
   // path (how fast and how accurate the scan is with no local inference).
   let localOcrEnabled = new URLSearchParams(location.search).get('nolocal') === '1'
@@ -2451,180 +2449,6 @@
     return false;
   }
 
-  // For each label that sits in a tied group AND has an OCR title, query
-  // Open Library to confirm the title is real.  Confirmed titles are kept
-  // (replaced with the canonical OL form); unconfirmed titles are cleared so
-  // they don't pollute tiebreaking.
-  // Session-level memo of Open Library lookups, keyed by
-  // section + author-key + normalized title. In live AR mode the background
-  // refine re-runs every ~20s over a largely unchanged shelf; without this,
-  // every cycle re-queries Open Library for the identical tied titles. A hit
-  // replays the stored resolution and skips the network call entirely. Only
-  // definitive responses are cached — transient errors/timeouts are not, so a
-  // blip doesn't poison a title permanently.
-  const _olMemo = new Map();
-
-  async function verifyTitlesOpenLibrary(labels, section, signal) {
-    // Build a map of primary-key → [indices] to find tied groups.
-    const groups = new Map();
-    labels.forEach((lbl, i) => {
-      let k;
-      if (section === 'fiction') {
-        const p = parseSurnameAndFirst(lbl.text);
-        if (!p) return;
-        k = p.surname + '\x00' + (p.first || '');
-      } else {
-        const d = parseDewey(lbl.text);
-        if (!d) return;
-        k = String(d.num ?? '') + '\x00' + (d.cut || '');
-      }
-      if (!groups.has(k)) groups.set(k, []);
-      groups.get(k).push(i);
-    });
-
-    // Collect indices that actually need verification (tied + have a title).
-    const toVerify = [];
-    for (const [, idxs] of groups) {
-      if (idxs.length < 2) continue;
-      for (const i of idxs) { if (labels[i].title) toVerify.push(i); }
-    }
-    if (!toVerify.length) return;
-
-    const t0 = performance.now();
-    // Requests run through a small worker pool (OL_CONCURRENCY at a time)
-    // rather than strictly one-at-a-time. Serialising them made this the
-    // slowest blocking step in the whole analysis — a shelf with a dozen tied
-    // books paid a dozen round trips IN SERIES before anything could render.
-    // The pool keeps the outbound rate polite for a courtesy-rate free service
-    // while collapsing that into a couple of waves. Nothing about which calls
-    // are made or how their answers are judged changes, so accuracy is
-    // identical; only the scheduling is different. A slow/rate-limiting Open
-    // Library must still not stall the step, so a hard total budget aborts
-    // every remaining call once it elapses — finishLabels (and any render
-    // awaiting it) is never held up longer than this, regardless of how many
-    // labels needed verification.
-    const OL_BUDGET_MS = 5000;
-    const budgetCtrl  = new AbortController();
-    const budgetTimer = setTimeout(() => budgetCtrl.abort(), OL_BUDGET_MS);
-
-    // Apply a resolved OL outcome (fresh or memoized) to a label.
-    const applyOl = (lbl, r) => {
-      if (r.kind === 'verified') { lbl.title = r.title; lbl.title_verified = true; }
-      else if (r.kind === 'none') { lbl.title = null; lbl.title_verified = false; }
-      else { lbl.title_verified = false; }   // 'weak' — keep raw read, display only
-    };
-
-    let calls = 0, memoHits = 0;
-
-    // Group the tied labels by memo key first. Two copies of the same book (or
-    // two reads of one book) share a key, so they resolve from ONE request
-    // instead of one apiece — a strict reduction in calls with no change in
-    // outcome, since the memo already guaranteed they'd agree.
-    const jobs = new Map();
-    for (const i of toVerify) {
-      const lbl = labels[i];
-      // Author component of the memo key: surname for fiction, call number +
-      // cutter for nonfiction (both scope the OL query the same way).
-      let authorKey = '';
-      if (section === 'fiction') {
-        const p = parseSurnameAndFirst(lbl.text);
-        authorKey = p?.surname || '';
-      } else {
-        const d = parseDewey(lbl.text);
-        authorKey = d ? (String(d.num ?? '') + (d.cut || '')) : '';
-      }
-      const memoKey = section + '\x00' + authorKey + '\x00' + lettersLower(lbl.title);
-      if (_olMemo.has(memoKey)) { applyOl(lbl, _olMemo.get(memoKey)); memoHits++; continue; }
-      let job = jobs.get(memoKey);
-      if (!job) { job = { memoKey, authorKey, rawTitle: lbl.title, labels: [] }; jobs.set(memoKey, job); }
-      job.labels.push(lbl);
-    }
-
-    // Resolve one grouped query. Never throws: every failure path leaves the
-    // affected labels with their raw title marked unverified, which is the
-    // tie-safe state (an unverified title can't reorder a tie group, so it can
-    // never manufacture a misshelving flag).
-    const resolveJob = async (job) => {
-      const rawTitle = job.rawTitle;
-      const authorKey = job.authorKey;
-      // Default to unverified up front, so a budget abort mid-pool still
-      // leaves every remaining label in the safe state.
-      for (const lbl of job.labels) lbl.title_verified = false;
-
-      // Once the total budget is spent, stop making calls; remaining tied books
-      // keep their raw (unverified) title and stay tie-safe.
-      if (signal?.aborted || budgetCtrl.signal.aborted) return;
-
-      const params = new URLSearchParams({ title: rawTitle, limit: '3', fields: 'title,author_name' });
-      if (section === 'fiction' && authorKey) params.set('author', authorKey);
-      // Open Library is a third-party API with no SLA — a single slow request
-      // must never be able to hang the whole analysis. Bound each call and
-      // treat a timeout exactly like a network error: keep the raw title but
-      // mark it unverified rather than block.
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), OL_TIMEOUT_MS);
-      const onAbort = () => ctrl.abort();
-      if (signal) {
-        if (signal.aborted) ctrl.abort();
-        else signal.addEventListener('abort', onAbort, { once: true });
-      }
-      if (budgetCtrl.signal.aborted) ctrl.abort();
-      else budgetCtrl.signal.addEventListener('abort', onAbort, { once: true });
-      try {
-        calls++;
-        const res = await fetch(`https://openlibrary.org/search.json?${params}`,
-          { signal: ctrl.signal, headers: { 'Accept': 'application/json' } });
-        const data = await res.json();
-        const olTitle = data.numFound > 0 ? data.docs[0]?.title : null;
-        let result;
-        if (olTitle) {
-          // Guard against Open Library matching a DIFFERENT book by the same
-          // author: only trust the hit for ordering when its title words
-          // actually overlap what we read off the spine. A weak match keeps
-          // the raw read for display but stays unverified, so it can never
-          // reorder a same-author run into a false misshelving flag.
-          // Tokenize on >= 3-letter words AND pure-number runs, so short or
-          // numeric titles ("It", "1984", "Us") aren't left with zero tokens
-          // (which could never reach the >= 0.5 bar and so could never verify).
-          const tokenize = (s) => {
-            const low = String(s).toLowerCase();
-            return (low.match(/[a-z]{3,}/g) || []).concat(low.match(/\d+/g) || []);
-          };
-          const rTok = new Set(tokenize(rawTitle));
-          const oTok = tokenize(olTitle);
-          const overlap = oTok.length ? oTok.filter(w => rTok.has(w)).length / oTok.length : 0;
-          // Fallback: if the fully normalized (lowercase, alnum-only) strings
-          // are identical, trust the hit even when token overlap is 0/undefined
-          // — this recovers exact short/numeric titles. A merely-weak overlap
-          // still stays unverified, so it can't create a false misshelving flag.
-          const exact = lettersLower(rawTitle) !== '' && lettersLower(rawTitle) === lettersLower(olTitle);
-          result = (overlap >= 0.5 || exact) ? { kind: 'verified', title: olTitle } : { kind: 'weak' };
-        } else {
-          result = { kind: 'none' };   // unrecognised — don't use for ordering
-        }
-        _olMemo.set(job.memoKey, result);   // definitive response — safe to memoize
-        for (const lbl of job.labels) applyOl(lbl, result);
-      } catch {
-        // network error, timeout, or budget abort — keep raw title, don't
-        // memoize. Labels are already marked unverified above.
-      } finally {
-        clearTimeout(timer);
-        if (signal) signal.removeEventListener('abort', onAbort);
-        budgetCtrl.signal.removeEventListener('abort', onAbort);
-      }
-    };
-
-    // Drain the queue with a bounded pool. Post-budget jobs still get pulled
-    // (resolveJob returns immediately for them), so every tied label ends up
-    // explicitly marked rather than left in an indeterminate state.
-    const queue = [...jobs.values()];
-    await Promise.all(
-      Array.from({ length: Math.min(OL_CONCURRENCY, queue.length) }, async () => {
-        while (queue.length) await resolveJob(queue.shift());
-      }));
-    clearTimeout(budgetTimer);
-    console.log(`[perf] verifyTitlesOpenLibrary: ${calls} call(s), ${memoHits} memo hit(s), ${Math.round(performance.now() - t0)}ms`);
-  }
 
   // The on-device title reader returns the whole spine line (author name mixed
   // with the title, plus the odd stray glyph). Drop pure-symbol tokens and the
@@ -2807,24 +2631,11 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     const tieSect = autoDetectSection(rawBooks) || section;
     const needsTitles = hasPrimaryTies(labels, tieSect);
 
-    // Titles now come from Gemini (fused above) instead of a separate rotated
-    // ocr.space call. Only verify against Open Library when a tie genuinely
-    // needs a title to break it — cheap, parallel, ties only. If Gemini didn't
-    // run or found no titles, this simply no-ops and tied books fall into the
-    // existing tiedSlots handling (any order within a tie group is OK).
-    // Fiction ties are exempt groups (ordering ignores titles for fiction),
-    // so verifying their titles buys nothing — skip OL entirely for fiction.
-    // Fiction now also tie-breaks on verified titles (series/volume first, then
-    // title A-Z; see sortKey), so verify fiction ties against OL too. Only
-    // OL-verified titles feed ordering; a budget-abort/timeout leaves the title
-    // unverified so the tie stays a no-flag exempt group.
-    // Title reading is slow (~0.4s per tied book) and only refines ordering
-    // within same-key groups, so it runs solely in the background refine pass
-    // (opts.readTitles) — never on the blocking first render.
-    // Gemini's titles land first when available: they were read in parallel
-    // with the on-device pass, so they cost no wall time, and they come from a
-    // model that reads cover text better than a rotated-crop OCR pass does.
-    // Joined by label text (see titleJoinKey) — never by position.
+    // Titles come from Gemini, read in parallel with the on-device pass (so
+    // they cost no wall time) and joined onto our labels by LABEL TEXT — never
+    // by list position, since Gemini under-enumerates dense shelves and a
+    // positional join would attach titles to the wrong books. Titles are shown
+    // for the volunteer but no longer affect ordering (see below).
     if (needsTitles && opts.titleMap && opts.titleMap.size) {
       let joined = 0;
       for (const l of labels) {
@@ -2834,14 +2645,18 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       }
       console.log(`[perf] finishLabels: joined ${joined} Gemini title(s) by label text`);
     }
-    // Anything still untitled falls back to the on-device spine reader. With
-    // Gemini supplying most titles this usually has little left to do, so it
-    // rarely spends its budget.
-    if (needsTitles && opts.readTitles && labels.some(l => !l.title)) {
+    // Titles are DISPLAY-ONLY now — Open Library verification was removed. It
+    // only ever affected the sub-order WITHIN a same-author / same-call-number
+    // tie group, and every real misshelving on these shelves is wrong at the
+    // LABEL level (wrong author or call number), never merely a wrong title
+    // order within a tie. So OL caught nothing, while adding a third-party
+    // network dependency, latency, and a title-based false-flag vector. With no
+    // title feeding ordering, tie groups simply accept any internal order.
+    // Because titles no longer affect flags, we only read on-device titles when
+    // the online (Gemini) reader is OFF; otherwise the parallel Gemini titles
+    // are all we need for display and nothing blocks on title reading.
+    if (!geminiTitlesEnabled && needsTitles && opts.readTitles && labels.some(l => !l.title)) {
       await readTiedTitles(labels, imgW, imgH, tieSect, signal);
-    }
-    if (needsTitles && labels.some(l => l.title)) {
-      await verifyTitlesOpenLibrary(labels, tieSect, signal);
     }
 
     // Assign shelfRow via gap-based clustering (see clusterRowIndex) instead
@@ -3486,6 +3301,35 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   // ── Bounding box drawing (classic still-photo view only) ────────────────
   // The live AR loop draws its own boxes (arRenderOverlay) since it tracks a
   // still-playing video instead of a static photo.
+  // One physical sticker is often READ several times at different truncations
+  // ("VONNE" / "VONNEG" / "VONNEGUT"), so it can surface as several flagged
+  // books stacked on the same spot — each of which would otherwise draw its own
+  // box AND its own "check" row. Collapse boxes that heavily overlap the same
+  // location to a single representative: process most-severe-first (red beats
+  // yellow, then the longest / most-complete read), keep it, and suppress any
+  // later flagged book overlapping one already kept. Side-by-side distinct
+  // stickers barely overlap, so genuine neighbours are never merged. The same
+  // suppressed set is used for both the photo boxes and the flagged list, so
+  // box↔row numbering stays consistent.
+  function computeFlaggedSuppressed(checked) {
+    const flagged = checked.filter(b => b._bbox && (b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder));
+    const sev = b => b.outOfOrder ? 3 : b.possiblyOutOfOrder ? 2 : 1;
+    const order = flagged.slice().sort((a, b) =>
+      sev(b) - sev(a) || String(b.spine_label || '').length - String(a.spine_label || '').length);
+    const overlaps = (a, b) => {
+      const [ax, ay, aw, ah] = a._bbox, [bx, by, bw, bh] = b._bbox;
+      const ox = Math.min(ax + aw, bx + bw) - Math.max(ax, bx);
+      const oy = Math.min(ay + ah, by + bh) - Math.max(ay, by);
+      return ox > 0 && oy > 0 && ox >= 0.5 * Math.min(aw, bw) && oy >= 0.5 * Math.min(ah, bh);
+    };
+    const kept = [], suppressed = new Set();
+    for (const b of order) {
+      if (kept.some(k => overlaps(k, b))) suppressed.add(b);
+      else kept.push(b);
+    }
+    return suppressed;
+  }
+
   function drawBoundingBoxes(checkedBooks, sentW, sentH, target = snapshot, unreadRects = null) {
     const ctx = target.getContext('2d');
     const sx  = target.width  / sentW;
@@ -3500,7 +3344,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // Only flagged books (out of order, unverifiable, or possibly-out-of-order)
     // get a box — correct books are left unmarked so the photo isn't cluttered
     // with green boxes.
-    const flagged = checkedBooks.filter(b => b._bbox && (b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder));
+    const suppressed = computeFlaggedSuppressed(checkedBooks);
+    const flagged = checkedBooks.filter(b => b._bbox && !suppressed.has(b) &&
+      (b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder));
 
     flagged.forEach((book) => {
       const i = checkedBooks.indexOf(book);
@@ -4334,7 +4180,11 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   }
 
   function showFlaggedList(checked, panel = document.getElementById('flaggedList'), unreadCount = 0) {
-    const flagged = checked.filter(b => b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder);
+    // Same overlap-collapse the boxes use, so a sticker read several times is
+    // one row here too (not three near-identical "check" rows for one book).
+    const suppressed = computeFlaggedSuppressed(checked);
+    const flagged = checked.filter(b => !suppressed.has(b) &&
+      (b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder));
     panel.innerHTML = '';
     _flaggedRowMap.clear();
 
