@@ -277,6 +277,10 @@
       background: #14532d; color: #4ade80; font-size: 13px; font-weight: 700;
       display: flex; align-items: center; justify-content: center;
     }
+    .flagged-list-note {
+      padding: 10px 14px; font-size: 12px; line-height: 1.45;
+      color: #fde047; border-top: 1px solid #2a2a2a;
+    }
     .flagged-list-header {
       padding: 8px 14px 6px; font-size: 11px; font-weight: 700;
       letter-spacing: .07em; text-transform: uppercase; color: #555;
@@ -471,6 +475,7 @@
   // It races ocr.space on every scan: first success renders, the other fuses
   // in as a background refine, and a scan only fails when BOTH are down.
   const OL_TIMEOUT_MS = 4000;   // Open Library is third-party; never let one slow request stall analysis
+  const OL_CONCURRENCY = 6;     // tie-break lookups in flight at once — polite, but not one-at-a-time
   let localOcrEnabled = (localStorage.getItem('shelfcheck.localocr') ?? '1') === '1';
 
   // ── State ────────────────────────────────────────────────────────────────
@@ -481,6 +486,11 @@
   let lastRawBooks     = null;
   let lastCheckedBooks = [];
   let lastApiDims      = null;   // {sentW, sentH} of the image sent to OCR
+  // Sticker-sized regions the scan SAW but could not READ, as [x,y,w,h]
+  // fractions of the snapshot. Drawn yellow so the volunteer knows exactly
+  // which books still need a human eye — and, by omission, that every other
+  // book really was read.
+  let lastUnreadFrac   = [];
   let _flaggedRowMap   = new Map();  // book object → flagged-list DOM row
   let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
   let analysisCancelled = false;
@@ -517,6 +527,7 @@
   // shot, so go straight to results. Gallery upload (uploadInput) keeps the
   // review-then-Analyze step so the user can pick/replace the image first.
   function loadPhoto(file, autoAnalyze = false) {
+    lastUnreadFrac = [];   // stale unread boxes must not carry onto a new photo
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = async () => {
@@ -1576,8 +1587,17 @@
     // note: plausibility runs on the RAW text; normalization happens below in
     // the book mapping so truncation evidence (trailing "635.") survives
     // until the confidence decision.
-    const labels = (await LocalOCR.run(src, { signal }))
-      .filter(l => localLabelPlausible(l.text, section));
+    const rawLabels = await LocalOCR.run(src, { signal });
+    // Regions the detector saw but recognition couldn't read. A label that IS
+    // read but then fails the plausibility filter is just as unread from the
+    // volunteer's point of view, so it joins the same bucket — the whole point
+    // is that anything the scan couldn't turn into a usable label gets marked.
+    const unread = [...(rawLabels.unread || [])];
+    const labels = rawLabels.filter(l => {
+      if (localLabelPlausible(l.text, section)) return true;
+      if (l.bboxFrac) unread.push({ bboxFrac: l.bboxFrac });
+      return false;
+    });
     // 'high' is deliberately strict (0.97): raw OCR misreads ("NALKER" for
     // WALKER) usually dip below it, and only high-confidence books are ever
     // eligible for misshelving flags — a wrong flag is worse than a grey
@@ -1592,7 +1612,8 @@
       shelfRow: 0,
       bboxFrac: l.bboxFrac,
     }));
-    console.log(`[perf] callLocalOcr: ${books.length} book(s) at ${Math.round(performance.now() - t0)}ms`);
+    books.unread = unread;
+    console.log(`[perf] callLocalOcr: ${books.length} book(s), ${unread.length} unread at ${Math.round(performance.now() - t0)}ms`);
     return books;
   }
 
@@ -2344,14 +2365,18 @@
     if (!toVerify.length) return;
 
     const t0 = performance.now();
-    // Requests are issued SEQUENTIALLY (one at a time), not in parallel: Open
-    // Library is a courtesy-rate free service, and the AR refine loop can fire
-    // this repeatedly, so we keep the outbound rate polite (well under 1/sec
-    // given per-call latency). A slow/rate-limiting Open Library must still not
-    // stall the whole verification step, so a hard total budget aborts every
-    // remaining call once it elapses — finishLabels (and any render awaiting
-    // it) is never held up longer than this, regardless of how many labels
-    // needed verification.
+    // Requests run through a small worker pool (OL_CONCURRENCY at a time)
+    // rather than strictly one-at-a-time. Serialising them made this the
+    // slowest blocking step in the whole analysis — a shelf with a dozen tied
+    // books paid a dozen round trips IN SERIES before anything could render.
+    // The pool keeps the outbound rate polite for a courtesy-rate free service
+    // while collapsing that into a couple of waves. Nothing about which calls
+    // are made or how their answers are judged changes, so accuracy is
+    // identical; only the scheduling is different. A slow/rate-limiting Open
+    // Library must still not stall the step, so a hard total budget aborts
+    // every remaining call once it elapses — finishLabels (and any render
+    // awaiting it) is never held up longer than this, regardless of how many
+    // labels needed verification.
     const OL_BUDGET_MS = 5000;
     const budgetCtrl  = new AbortController();
     const budgetTimer = setTimeout(() => budgetCtrl.abort(), OL_BUDGET_MS);
@@ -2364,9 +2389,14 @@
     };
 
     let calls = 0, memoHits = 0;
+
+    // Group the tied labels by memo key first. Two copies of the same book (or
+    // two reads of one book) share a key, so they resolve from ONE request
+    // instead of one apiece — a strict reduction in calls with no change in
+    // outcome, since the memo already guaranteed they'd agree.
+    const jobs = new Map();
     for (const i of toVerify) {
       const lbl = labels[i];
-      const rawTitle = lbl.title;
       // Author component of the memo key: surname for fiction, call number +
       // cutter for nonfiction (both scope the OL query the same way).
       let authorKey = '';
@@ -2377,14 +2407,29 @@
         const d = parseDewey(lbl.text);
         authorKey = d ? (String(d.num ?? '') + (d.cut || '')) : '';
       }
-      const memoKey = section + '\x00' + authorKey + '\x00' + lettersLower(rawTitle);
+      const memoKey = section + '\x00' + authorKey + '\x00' + lettersLower(lbl.title);
       if (_olMemo.has(memoKey)) { applyOl(lbl, _olMemo.get(memoKey)); memoHits++; continue; }
+      let job = jobs.get(memoKey);
+      if (!job) { job = { memoKey, authorKey, rawTitle: lbl.title, labels: [] }; jobs.set(memoKey, job); }
+      job.labels.push(lbl);
+    }
+
+    // Resolve one grouped query. Never throws: every failure path leaves the
+    // affected labels with their raw title marked unverified, which is the
+    // tie-safe state (an unverified title can't reorder a tie group, so it can
+    // never manufacture a misshelving flag).
+    const resolveJob = async (job) => {
+      const rawTitle = job.rawTitle;
+      const authorKey = job.authorKey;
+      // Default to unverified up front, so a budget abort mid-pool still
+      // leaves every remaining label in the safe state.
+      for (const lbl of job.labels) lbl.title_verified = false;
 
       // Once the total budget is spent, stop making calls; remaining tied books
       // keep their raw (unverified) title and stay tie-safe.
-      if (signal?.aborted || budgetCtrl.signal.aborted) { lbl.title_verified = false; continue; }
+      if (signal?.aborted || budgetCtrl.signal.aborted) return;
 
-      const params = new URLSearchParams({ title: lbl.title, limit: '3', fields: 'title,author_name' });
+      const params = new URLSearchParams({ title: rawTitle, limit: '3', fields: 'title,author_name' });
       if (section === 'fiction' && authorKey) params.set('author', authorKey);
       // Open Library is a third-party API with no SLA — a single slow request
       // must never be able to hang the whole analysis. Bound each call and
@@ -2431,16 +2476,26 @@
         } else {
           result = { kind: 'none' };   // unrecognised — don't use for ordering
         }
-        _olMemo.set(memoKey, result);   // definitive response — safe to memoize
-        applyOl(lbl, result);
+        _olMemo.set(job.memoKey, result);   // definitive response — safe to memoize
+        for (const lbl of job.labels) applyOl(lbl, result);
       } catch {
-        lbl.title_verified = false;  // network error, timeout, or budget abort — keep raw title, don't memoize
+        // network error, timeout, or budget abort — keep raw title, don't
+        // memoize. Labels are already marked unverified above.
       } finally {
         clearTimeout(timer);
         if (signal) signal.removeEventListener('abort', onAbort);
         budgetCtrl.signal.removeEventListener('abort', onAbort);
       }
-    }
+    };
+
+    // Drain the queue with a bounded pool. Post-budget jobs still get pulled
+    // (resolveJob returns immediately for them), so every tied label ends up
+    // explicitly marked rather than left in an indeterminate state.
+    const queue = [...jobs.values()];
+    await Promise.all(
+      Array.from({ length: Math.min(OL_CONCURRENCY, queue.length) }, async () => {
+        while (queue.length) await resolveJob(queue.shift());
+      }));
     clearTimeout(budgetTimer);
     console.log(`[perf] verifyTitlesOpenLibrary: ${calls} call(s), ${memoHits} memo hit(s), ${Math.round(performance.now() - t0)}ms`);
   }
@@ -2494,11 +2549,14 @@
     const fx = snapshot.width / imgW, fy = snapshot.height / imgH;
     const t0 = performance.now();
     let got = 0, read = 0;
-    // Hard time budget: reading titles is ~0.4s each, and a shelf can carry
-    // dozens of tied books. This runs in the background refine (never blocks
-    // first render), but still cap it so it can't run for half a minute. Tie
-    // groups not reached simply stay tie-safe (any order, no flag).
-    const TITLE_BUDGET_MS = 6000;
+    // Hard time budget: reading titles is ~0.4-0.8s each, and a shelf can carry
+    // dozens of tied books. Still-photo mode now renders once, when everything
+    // is done, so this sits ON the blocking path and was measured as the single
+    // biggest remaining cost (5.4s of a 14.6s scan). Keep it tight: tie groups
+    // not reached in time simply stay tie-safe (any order within a tie is
+    // accepted, so an unread title can only ever cost a detection, never cause
+    // a false accusation).
+    const TITLE_BUDGET_MS = 2000;
     for (const i of tied) {
       if (signal?.aborted || performance.now() - t0 > TITLE_BUDGET_MS) break;
       const b = labels[i].bbox;
@@ -2741,6 +2799,10 @@
   // promise carries the improved result so the caller can update the
   // already-rendered UI in place.
   const LOCAL_GRACE_MS = 1500;
+  // Still-photo mode waits for the on-device engine so it can answer once.
+  // This cap is the escape hatch: past it we render what the remote engine
+  // gave us rather than leave the volunteer staring at a spinner.
+  const LOCAL_HARD_CAP_MS = 30000;
 
   // Run the full OCR pipeline; returns {labels, ms, imageSize, n, refine}.
   // `refine` is null when local OCR either was disabled or answered within
@@ -2822,6 +2884,65 @@
       ocrP.then(() => { arRemoteDown = false; }, () => { arRemoteDown = true; });
     }
 
+    // ── Still-photo mode: ONE result, once everything is in ──────────────────
+    // The old progressive path rendered the fast engine immediately and then
+    // re-rendered when the slower one landed. That produced two answers for one
+    // photo — a small one, then a noticeably bigger one — which reads as the
+    // app changing its mind rather than making progress. For a single still
+    // photo there's nothing to track and no reason to publish a provisional
+    // answer, so both engines are awaited, fused, title-checked, and rendered
+    // exactly once. (The live AR loop below keeps the progressive path: there,
+    // showing something immediately genuinely matters.)
+    if (!arMode) {
+      // A wedged on-device pass must not hold the result hostage — cap it and
+      // fall back to whatever the remote engine produced.
+      let capTimer;
+      const capP = new Promise(r => { capTimer = setTimeout(() => r(null), LOCAL_HARD_CAP_MS); });
+      const [remote, local] = await Promise.all([
+        ocrP.then(r => r, () => null),
+        Promise.race([localP, capP]).catch(() => null),
+      ]);
+      clearTimeout(capTimer);
+      const localOk = local && local.length ? local : null;
+      if (!remote && !localOk) throw await ocrP.then(() => new Error('analysis failed'), e => e);
+
+      let baseLabels, imgW, imgH, gemPx;
+      if (remote) {
+        imgW = remote.imgW; imgH = remote.imgH;
+        baseLabels = remote.labels;
+        gemPx = localOk ? mapGemToPixels(localOk, imgW, imgH) : null;
+      } else {
+        // Remote engine down: render the on-device reads on their own boxes.
+        // Single-engine reads score below the 0.65 fuse bar, so — per the
+        // flag-safety invariant — none of them can raise a red flag.
+        imgW = snapshot.width; imgH = snapshot.height;
+        baseLabels = mapGemToPixels(localOk, imgW, imgH)
+          .filter(b => b.spine_label)
+          .map(b => ({
+            text: b.spine_label, bbox: b.bbox,
+            score: b.confidence === 'high' ? 0.6 : 0.4,
+            src: 'gemini', title: b.title || null,
+            title_score: b.confidence === 'high' ? 0.9 : 0.5,
+          }));
+        gemPx = null;
+      }
+      // Both engines are in; the remaining work really is titles + ordering,
+      // so advancing the stage here keeps the progress readout honest.
+      if (onCall1Done) onCall1Done();
+      const finished = await finishLabels(
+        baseLabels.map(l => ({ ...l })), imgW, imgH, gemPx, section, signal, { readTitles: true });
+      console.log(`[perf] runOcr: single fused render ready at ${Math.round(performance.now() - t0)}ms ` +
+                  `(${remote ? 'remote' : 'no remote'}${localOk ? ' + local' : ', no local'})`);
+      return {
+        labels: finished,
+        ms: Math.round(performance.now() - t0),
+        imageSize: [imgW, imgH],
+        n: finished.length,
+        unread: (localOk && localOk.unread) || [],
+        refine: null,   // nothing follows — this IS the answer
+      };
+    }
+
     // First-success race. Whichever engine produces a usable result first
     // drives the first render; the other fuses in later as a background
     // refine. A local null/empty result counts as a loss, never a win.
@@ -2863,13 +2984,14 @@
       const refine = ocrP.then(async ({ labels: oLabels, imgW: oW, imgH: oH }) => {
         const gemPx = mapGemToPixels(first.g, oW, oH);
         const refined = await finishLabels(oLabels.map(l => ({ ...l })), oW, oH, gemPx, section, signal, { readTitles: true });
-        return { labels: refined, imageSize: [oW, oH], n: refined.length };
+        return { labels: refined, imageSize: [oW, oH], n: refined.length, unread: first.g.unread || [] };
       }).catch(() => null);
       return {
         labels: finishedLabels,
         ms: Math.round(performance.now() - t0),
         imageSize: [imgW, imgH],
         n: finishedLabels.length,
+        unread: first.g.unread || [],
         refine,
       };
     }
@@ -2905,7 +3027,7 @@
         if (!gem || !gem.length) return null;
         const gemPx = mapGemToPixels(gem, imgW, imgH);
         const refinedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gemPx, section, signal, { readTitles: true });
-        return { labels: refinedLabels, imageSize: [imgW, imgH], n: refinedLabels.length };
+        return { labels: refinedLabels, imageSize: [imgW, imgH], n: refinedLabels.length, unread: gem.unread || [] };
       }).catch(() => null);
     } else if (gemOnTime) {
       // Local already fused into the first render, so there's no engine still
@@ -2913,7 +3035,7 @@
       // order. Schedule that as a background title-only refine.
       refine = (async () => {
         const refinedLabels = await finishLabels(labels.map(l => ({ ...l })), imgW, imgH, gemOnTime, section, signal, { readTitles: true });
-        return { labels: refinedLabels, imageSize: [imgW, imgH], n: refinedLabels.length };
+        return { labels: refinedLabels, imageSize: [imgW, imgH], n: refinedLabels.length, unread: raced?.unread || [] };
       })().catch(() => null);
     }
 
@@ -2922,6 +3044,9 @@
       ms: Math.round(performance.now() - t0),
       imageSize: [imgW, imgH],
       n: finishedLabels.length,
+      // Only known once the local engine has actually run; when it lost the
+      // grace race this is empty and the refine pass fills it in.
+      unread: (raced && raced !== GRACE_TIMEOUT && raced.unread) || [],
       refine,
     };
   }
@@ -2998,7 +3123,10 @@
     badge.id = 'refiningBadge'; badge.className = 'refining-badge';
     badge.setAttribute('role', 'status');
     badge.setAttribute('aria-live', 'polite');
-    badge.innerHTML = `Refining results${_dotsHtml()}`;
+    // Say what's actually happening. The second pass usually ADDS books (the
+    // slower engine's reads fuse in), and an unexplained jump from "18 read"
+    // to "31 read" reads as a bug rather than as progress.
+    badge.innerHTML = `Still reading — more books may appear${_dotsHtml()}`;
     parent.appendChild(badge);
   }
   function hideRefiningBadge() { document.getElementById('refiningBadge')?.remove(); }
@@ -3070,6 +3198,7 @@
 
     lastRawBooks = labelsToBooks(ocrData.labels);
     lastApiDims  = { sentW: ocrData.imageSize[0], sentH: ocrData.imageSize[1] };
+    lastUnreadFrac = ocrData.unread || [];
 
     // Auto-detect section from label patterns and switch tab if confident
     const detected = autoDetectSection(lastRawBooks);
@@ -3094,6 +3223,7 @@
         if (!refined) return;
         lastRawBooks = labelsToBooks(refined.labels);
         lastApiDims  = { sentW: refined.imageSize[0], sentH: refined.imageSize[1] };
+        lastUnreadFrac = refined.unread || lastUnreadFrac;
         showResults(lastRawBooks, getSection());
       });
     }
@@ -3122,7 +3252,7 @@
   // ── Bounding box drawing (classic still-photo view only) ────────────────
   // The live AR loop draws its own boxes (arRenderOverlay) since it tracks a
   // still-playing video instead of a static photo.
-  function drawBoundingBoxes(checkedBooks, sentW, sentH, target = snapshot) {
+  function drawBoundingBoxes(checkedBooks, sentW, sentH, target = snapshot, unreadRects = null) {
     const ctx = target.getContext('2d');
     const sx  = target.width  / sentW;
     const sy  = target.height / sentH;
@@ -3162,7 +3292,52 @@
       ctx.fillText(num, cx + 3, cy - 2);
     });
 
+    // Books the scan SAW but could not READ get a dashed yellow box. This is
+    // what lets a volunteer trust the result: anything unmarked was genuinely
+    // read and checked, so the only books needing a manual look are the ones
+    // wearing a box.
+    for (const r of (unreadRects || unreadBoxesForDraw(checkedBooks, sentW, sentH, target))) {
+      ctx.strokeStyle = '#eab308';
+      ctx.lineWidth   = lw;
+      ctx.setLineDash([7, 5]);
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+      ctx.setLineDash([]);
+    }
+
     ctx.restore();
+  }
+
+  // Resolve the stored unread regions into drawable rectangles on `target`,
+  // dropping the ones that aren't really unread books:
+  //   • regions that overlap a label we DID read (the other engine got it), and
+  //   • regions without a pale sticker background — the detector fires on
+  //     vertical spine titles too, and boxing those would bury the real
+  //     signal in noise (the exact failure that sank the live AR view).
+  function unreadBoxesForDraw(checkedBooks, sentW, sentH, target) {
+    if (!lastUnreadFrac.length || !target.width || !target.height) return [];
+    const ctx = target.getContext('2d', { willReadFrequently: true });
+    const tw = target.width, th = target.height;
+    // Read labels live in OCR-sent pixel space; normalise to fractions so both
+    // sides of the overlap test are resolution-independent.
+    const readFrac = checkedBooks
+      .filter(b => b._bbox && sentW && sentH)
+      .map(b => [b._bbox[0] / sentW, b._bbox[1] / sentH, b._bbox[2] / sentW, b._bbox[3] / sentH]);
+
+    const out = [];
+    for (const u of lastUnreadFrac) {
+      const [ux, uy, uw, uh] = u.bboxFrac;
+      if (!(uw > 0 && uh > 0)) continue;
+      const overlapsRead = readFrac.some(([rx, ry, rw, rh]) => {
+        const ox = Math.min(ux + uw, rx + rw) - Math.max(ux, rx);
+        const oy = Math.min(uy + uh, ry + rh) - Math.max(uy, ry);
+        return ox > 0 && oy > 0 && (ox * oy) / (uw * uh) >= 0.3;
+      });
+      if (overlapsRead) continue;
+      const x = ux * tw, y = uy * th, w = uw * tw, h = uh * th;
+      if (!hasWhiteBg(ctx, x, y, w, h)) continue;
+      out.push({ x, y, w, h });
+    }
+    return out;
   }
 
   // Whether the live AR camera loop is currently running — used so
@@ -3457,7 +3632,29 @@
       : '';
     function strKey(s) {
       const a = parseSurnameAndFirst(s);
-      return a ? { kind: 'str', val: a.surname, first: a.first, vol, title } : null;
+      if (!a) return null;
+      let surname = a.surname, first = a.first;
+      // Fiction spine labels lead with the surname ("WALLACE, David Foster").
+      // With the comma present the parser gets this right. When OCR drops the
+      // comma — which is common, it's a tiny mark on a small sticker — the
+      // parser falls back to reading the LAST word as the surname, so
+      // "VONNEGUT Kurt" sorts under "kurt" and "VON KREISLER Kristin" under
+      // "kristin". Those land nowhere near where the book physically sits, and
+      // a run of them drags the longest-in-order chain off its true path until
+      // a perfectly shelved neighbour is the thing that looks wrong (measured:
+      // "VODOLAZKIN" flagged red with an ideal slot of 9 while sitting first
+      // and correct). With no comma to go on, trust the shelf's own convention
+      // and take the leading word(s) as the surname.
+      const raw = String(s).trim();
+      if (!raw.includes(',')) {
+        const words = raw.split(/\s+/).filter(w => /[A-Za-z]/.test(w));
+        if (words.length > 1) {
+          const norm = t => t.toLowerCase().replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
+          const lead = norm(words.slice(0, -1).join(' '));
+          if (lead) { surname = lead; first = norm(words[words.length - 1]); }
+        }
+      }
+      return { kind: 'str', val: surname, first, vol, title };
     }
     if (section === 'fiction')    return book.spine_label ? strKey(book.spine_label) : null;
     if (section === 'nonfiction') { const d = parseDewey(book.spine_label); return d ? { kind: 'dewey', val: d, vol, title } : null; }
@@ -3560,6 +3757,41 @@
                               : a.val.num === b.val.num && a.val.cut === b.val.cut;
     }
     function primaryStr(k) { return k.kind === 'str' ? (k.val || '') : String(k.val.num ?? ''); }
+
+    // Pre-pass: collapse re-reads of the SAME physical sticker. The two engines
+    // crop slightly differently, so one label routinely lands as several
+    // entries at different truncations ("VONNE" / "VONNEG" / "VONNEGUT") and as
+    // leading/trailing fragments of a neighbour ("ARNIM ," sitting beside
+    // "VON ARNIM, Elizabeth"). Those fragments sort nowhere near their true
+    // position, and the longest-in-order run can then route THROUGH the
+    // fragments and around a genuinely correct book — which is exactly how a
+    // correctly shelved book gets accused (measured: "VODOLAZKIN" flagged red
+    // while sitting in perfect order).
+    //
+    // A key that is a proper prefix or suffix of a nearby neighbour's key is a
+    // truncated re-read of that neighbour, not a second book, so it's dropped
+    // from ordering. EQUAL keys are deliberately left alone: a shelf really can
+    // hold several books by the same author. Dropping only ever moves a book to
+    // "check by hand" — it can never manufacture a flag.
+    // Every decision is made against the ORIGINAL keys and applied afterwards.
+    // Dropping as we scan would let an already-dropped fragment stop counting
+    // as evidence that its neighbour is a fragment too, so a run of
+    // progressively truncated reads only ever lost its first member.
+    const DUP_WINDOW = 3;   // physical neighbours to compare against
+    const dupDrops = new Set();
+    for (let i = 0; i < keys.length; i++) {
+      if (!keys[i] || keys[i].kind !== 'str') continue;
+      const a = String(keys[i].val || '');
+      if (!a) continue;
+      for (let j = Math.max(0, i - DUP_WINDOW); j <= Math.min(keys.length - 1, i + DUP_WINDOW); j++) {
+        if (j === i || !keys[j] || keys[j].kind !== 'str') continue;
+        if ((books[j].shelfRow ?? 0) !== (books[i].shelfRow ?? 0)) continue;
+        const b = String(keys[j].val || '');
+        if (b.length <= a.length) continue;            // only ever drop the SHORTER read
+        if (b.startsWith(a) || b.endsWith(a)) { dupDrops.add(i); break; }
+      }
+    }
+    for (const i of dupDrops) keys[i] = null;
 
     // Pre-pass: demote obvious OCR outliers before LIS
     const misreads = [];
@@ -3732,7 +3964,13 @@
     // score/src metadata (offline ordering GT) are trusted and keep red, so the
     // ordering suite is byte-for-byte unaffected.
     for (const b of checked) {
-      if (b.outOfOrder && b._src && b._src !== 'both' && !(b._score >= 0.65)) {
+      // Red requires BOTH conditions, not either one: the read must be
+      // cross-confirmed by both engines AND clear the 0.65 confidence bar.
+      // Accepting either alone let a two-engine agreement at 0.6 raise a red
+      // flag (measured: "635.04 Col", a misread cutter, accusing a correctly
+      // shelved book) — which is precisely the case the fused-confidence rule
+      // exists to stop.
+      if (b.outOfOrder && b._src && !(b._src === 'both' && b._score >= 0.65)) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
       }
     }
@@ -3794,18 +4032,23 @@
     restoreCleanPhoto();   // redraw the clean photo before overlaying boxes
 
     const panel = document.getElementById('flaggedList');
-    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH, snapshot);
+    // Resolve the unread regions once: they're both drawn on the photo and
+    // counted into the "to check" summary, and each resolve samples pixels.
+    const unreadRects = lastApiDims
+      ? unreadBoxesForDraw(checked, lastApiDims.sentW, lastApiDims.sentH, snapshot) : [];
+    if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH, snapshot, unreadRects);
 
     const total        = checked.length;
     const outCount     = checked.filter(b => b.outOfOrder).length;
     const unvCount     = checked.filter(b => b.unverifiable).length;
     const possiblyCount = checked.filter(b => b.possiblyOutOfOrder).length;
+    const unreadCount  = unreadRects.length;
 
     // Test hook (harmless in prod): record each render's result + timestamp so
     // the e2e harness (e2e_pipeline_test.mjs) can read the real pipeline output
     // and measure first-vs-final (refine) render latency. Never read by the app.
     (window.__shelfcheckRenders = window.__shelfcheckRenders || []).push({
-      t: performance.now(), section, total, outCount, unvCount, possiblyCount, ar: false,
+      t: performance.now(), section, total, outCount, unvCount, possiblyCount, unreadCount, ar: false,
       books: checked.map(b => ({
         spine_label:        b.spine_label,
         title:              b.title || null,
@@ -3814,6 +4057,11 @@
         unverifiable:       !!b.unverifiable,
         possiblyOutOfOrder: !!b.possiblyOutOfOrder,
         shelfRow:           b.shelfRow ?? null,
+        _src:               b._src ?? null,
+        _score:             b._score ?? null,
+        shelfIndex:         b.shelfIndex ?? null,
+        shelfPosition:      b.shelfPosition ?? null,
+        idealPosition:      b.idealPosition ?? null,
       })),
     });
 
@@ -3825,8 +4073,10 @@
 
     // "possibly out of order" is a soft, unsure state — fold it into the same
     // "to check" bucket as unverifiable labels for the summary count.
-    showSummaryBadge(total, outCount, unvCount + possiblyCount);
-    showFlaggedList(checked, panel);
+    // Unread regions join the same "to check" bucket: from the volunteer's
+    // side they mean the same thing — this one needs your eyes.
+    showSummaryBadge(total, outCount, unvCount + possiblyCount + unreadCount);
+    showFlaggedList(checked, panel, unreadCount);
   }
 
   function showNoBooksBadge() {
@@ -3849,10 +4099,24 @@
     photoArea.appendChild(overlay);
   }
 
-  function showFlaggedList(checked, panel = document.getElementById('flaggedList')) {
+  function showFlaggedList(checked, panel = document.getElementById('flaggedList'), unreadCount = 0) {
     const flagged = checked.filter(b => b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder);
     panel.innerHTML = '';
     _flaggedRowMap.clear();
+
+    // Unread books have no label to list, so they get one summary line instead
+    // of a row each. Saying it out loud is the point: it's what makes the
+    // ABSENCE of a mark trustworthy everywhere else on the photo.
+    const unreadNote = () => {
+      if (!unreadCount) return null;
+      const note = document.createElement('div');
+      note.className = 'flagged-list-note';
+      note.setAttribute('role', 'status');
+      note.textContent = `${unreadCount} book${unreadCount === 1 ? " couldn't" : "s couldn't"} be read ` +
+        `(boxed yellow on the photo) — check ${unreadCount === 1 ? 'it' : 'those'} by hand.`;
+      return note;
+    };
+
     if (!flagged.length) {
       // Distinct success state: books were read and none needed flagging —
       // don't just leave the panel looking empty/broken.
@@ -3861,8 +4125,13 @@
         success.className = 'flagged-list-success';
         success.setAttribute('role', 'status');
         success.innerHTML = `<span class="flagged-list-success-icon" aria-hidden="true">&#10003;</span>
-          <span>Shelf looks correct — ${checked.length} book${checked.length === 1 ? '' : 's'} read, none out of order.</span>`;
+          <span>${unreadCount ? '' : 'Shelf looks correct — '}${checked.length} book${checked.length === 1 ? '' : 's'} read, none out of order.</span>`;
         panel.appendChild(success);
+        const n = unreadNote();
+        if (n) panel.appendChild(n);
+        panel.classList.add('show');
+      } else if (unreadCount) {
+        panel.appendChild(unreadNote());
         panel.classList.add('show');
       } else {
         panel.classList.remove('show');
@@ -3933,6 +4202,8 @@
       panel.appendChild(row);
       panel.appendChild(detail);
     }
+    const note = unreadNote();
+    if (note) panel.appendChild(note);
     panel.classList.add('show');
   }
 
@@ -3941,7 +4212,7 @@
     document.getElementById('debugOverlay')?.remove();
     const panel = document.getElementById('flaggedList');
     panel.classList.remove('show'); panel.innerHTML = '';
-    lastRawBooks = null; lastCheckedBooks = [];
+    lastRawBooks = null; lastCheckedBooks = []; lastUnreadFrac = [];
     retake();
   }
 

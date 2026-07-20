@@ -17,6 +17,8 @@
 //   preload(onProgress)-> Promise<void>  idempotent warm-up (models+sessions)
 //   run(sourceCanvas, {signal}) -> Promise<Array<{text, conf, bboxFrac}>>
 //      bboxFrac = [x, y, w, h] as fractions of the source canvas.
+//      The returned array also carries `.unread`: Array<{bboxFrac}> of
+//      sticker-sized regions detected but NOT successfully recognized.
 //   detect(sourceCanvas, {signal}) -> Promise<Array<{bboxFrac}>>
 //      detection-only (single cheap det pass, no recognition) — used by the
 //      live AR loop to paint "seen, still reading" boxes near-instantly.
@@ -29,7 +31,12 @@
   const DICT_URL = 'models/rec_dict.txt';
   const CACHE_NAME = 'shelfcheck-ocr-models-v1';
 
-  const DET_MAX_SIDE = 2048;
+  // Detection input size dominates det time (roughly quadratically) and sets
+  // the floor on how small a sticker can still be found: STICK_H_MIN is a
+  // fraction of this, so at 2048 the smallest findable sticker is ~8px tall in
+  // det space. Overridable via ?det= purely so the benchmark suite can A/B it
+  // — the shipped default is whatever measured best on the test set.
+  const DET_MAX_SIDE = Number(new URLSearchParams(location.search).get('det')) || 2048;
   const DET_THRESH = 0.3;
   const DET_BOX_MIN_PROB = 0.5;
   const DET_DILATE = 0.55;      // box expansion, fraction of component height
@@ -481,7 +488,7 @@
       byWidth.get(pre.tw).push({ box, data: pre.data });
     }
     const recs = [];
-    const REC_BATCH = 16;
+    const REC_BATCH = Number(new URLSearchParams(location.search).get('recb')) || 16;
     for (const [tw, items] of byWidth) {
       for (let s0 = 0; s0 < items.length; s0 += REC_BATCH) {
         throwIfAborted(signal);
@@ -507,9 +514,21 @@
       conf: l.conf,
       bboxFrac: [l.box[0] / W, l.box[1] / H, l.box[2] / W, l.box[3] / H],
     }));
+
+    // Sticker-sized regions the detector found but recognition could not turn
+    // into text — blurred, glare-washed, angled, or below REC_MIN_CONF. These
+    // are books the scan SAW but failed to READ, and the UI marks them yellow
+    // ("check this one yourself") so a volunteer can trust that every book
+    // NOT marked was actually read. Exposed as a property on the returned
+    // array so existing callers that just iterate labels are unaffected.
+    const readBoxes = new Set(recs.map(r => r.box));
+    labels.unread = stick.filter(b => !readBoxes.has(b))
+      .map(b => ({ bboxFrac: [b[0] / W, b[1] / H, b[2] / W, b[3] / H] }));
+
     console.log(`[perf] localocr: det ${Math.round(tDet - t0)}ms (${allBoxes.length} boxes, ` +
                 `${stick.length} sticker-sized), rec ${Math.round(tRec - tDet)}ms ` +
-                `(${recs.length} lines) -> ${labels.length} labels, ep=${activeEP}`);
+                `(${recs.length} lines) -> ${labels.length} labels, ` +
+                `${labels.unread.length} unread, ep=${activeEP}`);
     return labels;
   }
 
