@@ -391,6 +391,10 @@
         <span>On-device AI OCR</span>
         <div class="settings-toggle" id="geminiToggleSwitch"></div>
       </div>
+      <div class="settings-item" id="titleToggle" role="menuitemcheckbox" aria-checked="true" tabindex="0">
+        <span>Read titles online (faster)</span>
+        <div class="settings-toggle" id="titleToggleSwitch"></div>
+      </div>
       <div class="settings-item" id="liveArEntry" role="menuitem" tabindex="0" style="display:none">
         <span>Live scan (experimental)</span>
         <span aria-hidden="true" style="color:#777">&rsaquo;</span>
@@ -466,6 +470,16 @@
   // All OCR calls go through a Cloudflare Worker that injects the ocr.space API key.
   // Replace this URL with your own Worker URL after deploying worker/index.js.
   const WORKER_URL = 'https://shelfcheck-ocr-proxy.krish-sundareswar.workers.dev';
+  // Gemini proxy (shared with the shelfchecker app — same free AI Studio key,
+  // held as a Worker secret so it never reaches the browser). Used ONLY to read
+  // spine titles, which is the job it's actually good at; labels and geometry
+  // stay with the engines that measured best at them.
+  const GEMINI_URL   = 'https://selfcheck-proxy.krish-sundareswar.workers.dev/';
+  const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+  // Titles ride alongside the on-device pass (~7s), so this budget only has to
+  // cover the case where Gemini is slower than the local engine. Past it we
+  // fall back to on-device title reading rather than hold up the result.
+  const GEMINI_TITLE_TIMEOUT_MS = 9000;
   const OCR_TIMEOUT_MS = 20000;
 
   // Local OCR (ocr_local.js): PP-OCRv6 det+rec running in the browser via
@@ -494,6 +508,9 @@
   // which books still need a human eye — and, by omission, that every other
   // book really was read.
   let lastUnreadFrac   = [];
+  // Gemini spine-title reading. ?notitles=1 disables it for benchmarking.
+  let geminiTitlesEnabled = new URLSearchParams(location.search).get('notitles') === '1'
+    ? false : (localStorage.getItem('shelfcheck.gemtitles') ?? '1') === '1';
   let _flaggedRowMap   = new Map();  // book object → flagged-list DOM row
   let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
   let analysisCancelled = false;
@@ -2538,6 +2555,90 @@
   // never read for the whole shelf. Populated titles are confirmed against
   // Open Library by the caller; an unconfirmed read is dropped and never feeds
   // ordering, so a garbled title can't create a false flag.
+  // Join key for matching a Gemini row to one of our labels. Titles are matched
+  // by LABEL TEXT, never by list position: Gemini routinely under-enumerates a
+  // dense shelf (measured: 25 rows for a 39-book shelf), so positional matching
+  // would silently attach titles to the wrong books — and a wrong title that
+  // then passes Open Library verification can reorder a tie group and
+  // manufacture a red flag. Text matching just fails to match instead, which
+  // leaves the tie exempt and is harmless.
+  function titleJoinKey(s) {
+    return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  }
+
+  // Ask Gemini for [sticker_label, title] pairs. Deliberately minimal: no
+  // boxes, no confidence, no row index — a vision model's wall time is
+  // dominated by what it has to decode, and everything except the title is
+  // already known from engines that read labels better than it does.
+  async function callGeminiTitles(blob, section, signal) {
+    const t0 = performance.now();
+    const b64 = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result).split(',')[1]);
+      fr.onerror = rej;
+      fr.readAsDataURL(blob);
+    });
+    const sticker = section === 'fiction'
+      ? 'the author label (e.g. "BLACK, Cara")'
+      : 'the call-number label (e.g. "973.7 HAR")';
+    const prompt = `This is a library ${section === 'fiction' ? 'FICTION' : 'NONFICTION'} shelf photo.
+For every book spine you can see, return the white sticker text and the book's TITLE.
+Return ONLY a JSON array of 2-element arrays: [sticker_text, title].
+0: full text on the white sticker at the bottom of the spine — ${sticker}. Copy it exactly as printed; return null if you cannot read it.
+1: the book's title as printed on the spine, or null if unreadable.
+Do not guess a sticker that is cut off or hidden. Never copy a neighbour's text.
+Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), GEMINI_TITLE_TIMEOUT_MS);
+    const onAbort = () => ctrl.abort();
+    if (signal) {
+      if (signal.aborted) ctrl.abort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    try {
+      const res = await fetch(GEMINI_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          model: GEMINI_MODEL,
+          generationConfig: {
+            temperature: 0,
+            response_mime_type: 'application/json',
+            thinkingConfig: { thinkingBudget: 0 },   // thinking adds seconds, not accuracy, here
+          },
+          contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: 'image/jpeg', data: b64 } }] }],
+        }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const json = await res.json();
+      const txt = json.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+      let rows;
+      try { rows = JSON.parse(txt); }
+      catch { rows = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1)); }
+      const map = new Map();
+      for (const r of (Array.isArray(rows) ? rows : [])) {
+        if (!Array.isArray(r)) continue;
+        const k = titleJoinKey(r[0]), title = r[1];
+        // A label Gemini read two different ways is ambiguous — drop it rather
+        // than pick one and risk attaching a title to the wrong book.
+        if (!k || !title) continue;
+        if (map.has(k) && map.get(k) !== title) { map.set(k, null); continue; }
+        if (!map.has(k)) map.set(k, String(title));
+      }
+      for (const [k, v] of [...map]) if (v == null) map.delete(k);
+      console.log(`[perf] callGeminiTitles: ${map.size} title(s) at ${Math.round(performance.now() - t0)}ms`);
+      return map;
+    } catch (e) {
+      console.log(`[perf] callGeminiTitles: unavailable (${e.message}) at ${Math.round(performance.now() - t0)}ms`);
+      return null;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+  }
+
   async function readTiedTitles(labels, imgW, imgH, tieSect, signal) {
     if (!(localOcrEnabled && window.LocalOCR && LocalOCR.available() && snapshot.width)) return;
     const groups = new Map();
@@ -2621,7 +2722,23 @@
     // Title reading is slow (~0.4s per tied book) and only refines ordering
     // within same-key groups, so it runs solely in the background refine pass
     // (opts.readTitles) — never on the blocking first render.
-    if (needsTitles && opts.readTitles) {
+    // Gemini's titles land first when available: they were read in parallel
+    // with the on-device pass, so they cost no wall time, and they come from a
+    // model that reads cover text better than a rotated-crop OCR pass does.
+    // Joined by label text (see titleJoinKey) — never by position.
+    if (needsTitles && opts.titleMap && opts.titleMap.size) {
+      let joined = 0;
+      for (const l of labels) {
+        if (l.title) continue;
+        const t = opts.titleMap.get(titleJoinKey(l.text));
+        if (t) { l.title = t; l.title_score = 0.9; joined++; }
+      }
+      console.log(`[perf] finishLabels: joined ${joined} Gemini title(s) by label text`);
+    }
+    // Anything still untitled falls back to the on-device spine reader. With
+    // Gemini supplying most titles this usually has little left to do, so it
+    // rarely spends its budget.
+    if (needsTitles && opts.readTitles && labels.some(l => !l.title)) {
       await readTiedTitles(labels, imgW, imgH, tieSect, signal);
     }
     if (needsTitles && labels.some(l => l.title)) {
@@ -2904,13 +3021,23 @@
     // exactly once. (The live AR loop below keeps the progressive path: there,
     // showing something immediately genuinely matters.)
     if (!arMode) {
+      // Titles are read by Gemini CONCURRENTLY with the on-device pass. The
+      // two take about the same wall time (~6s vs ~7s), so titles arrive for
+      // free instead of costing a serial title-reading step after the labels
+      // are known. Never awaited on its own: it's folded into the same
+      // Promise.all, and a failure just returns null.
+      const titlesP = (geminiTitlesEnabled && encoded?.blob)
+        ? callGeminiTitles(encoded.blob, section, signal)
+        : Promise.resolve(null);
+
       // A wedged on-device pass must not hold the result hostage — cap it and
       // fall back to whatever the remote engine produced.
       let capTimer;
       const capP = new Promise(r => { capTimer = setTimeout(() => r(null), LOCAL_HARD_CAP_MS); });
-      const [remote, local] = await Promise.all([
+      const [remote, local, titleMap] = await Promise.all([
         ocrP.then(r => r, () => null),
         Promise.race([localP, capP]).catch(() => null),
+        titlesP.catch(() => null),
       ]);
       clearTimeout(capTimer);
       const localOk = local && local.length ? local : null;
@@ -2940,7 +3067,8 @@
       // so advancing the stage here keeps the progress readout honest.
       if (onCall1Done) onCall1Done();
       const finished = await finishLabels(
-        baseLabels.map(l => ({ ...l })), imgW, imgH, gemPx, section, signal, { readTitles: true });
+        baseLabels.map(l => ({ ...l })), imgW, imgH, gemPx, section, signal,
+        { readTitles: true, titleMap });
       console.log(`[perf] runOcr: single fused render ready at ${Math.round(performance.now() - t0)}ms ` +
                   `(${remote ? 'remote' : 'no remote'}${localOk ? ' + local' : ', no local'})`);
       return {
@@ -4278,6 +4406,19 @@
     if (localOcrEnabled && window.LocalOCR && LocalOCR.available()) {
       LocalOCR.preload().catch(() => {});
     }
+  });
+
+  const titleToggle = document.getElementById('titleToggle');
+  const titleSwitch = document.getElementById('titleToggleSwitch');
+  titleSwitch.classList.toggle('on', geminiTitlesEnabled);
+  titleToggle.setAttribute('aria-checked', String(geminiTitlesEnabled));
+  titleToggle.addEventListener('click', () => {
+    geminiTitlesEnabled = !geminiTitlesEnabled;
+    localStorage.setItem('shelfcheck.gemtitles', geminiTitlesEnabled ? '1' : '0');
+    titleSwitch.classList.toggle('on', geminiTitlesEnabled);
+    titleToggle.setAttribute('aria-checked', String(geminiTitlesEnabled));
+    settingsMenu.classList.remove('show');
+    settingsBtn.setAttribute('aria-expanded', 'false');
   });
 
   // Warm the local engine as soon as the page is idle: the one-time ~31MB
