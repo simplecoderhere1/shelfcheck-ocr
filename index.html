@@ -476,7 +476,10 @@
   // in as a background refine, and a scan only fails when BOTH are down.
   const OL_TIMEOUT_MS = 4000;   // Open Library is third-party; never let one slow request stall analysis
   const OL_CONCURRENCY = 6;     // tie-break lookups in flight at once — polite, but not one-at-a-time
-  let localOcrEnabled = (localStorage.getItem('shelfcheck.localocr') ?? '1') === '1';
+  // ?nolocal=1 disables the on-device engine — benchmarking the remote-only
+  // path (how fast and how accurate the scan is with no local inference).
+  let localOcrEnabled = new URLSearchParams(location.search).get('nolocal') === '1'
+    ? false : (localStorage.getItem('shelfcheck.localocr') ?? '1') === '1';
 
   // ── State ────────────────────────────────────────────────────────────────
   const MAX_CANVAS_DIM = 4096;   // keep native resolution — nonfiction tiles need it
@@ -2263,10 +2266,17 @@
     const t0 = performance.now();
     const W = snapshot.width, H = snapshot.height;
     const ov = Math.round(W * 0.05);
-    const cuts = [
-      { x: 0,                      w: Math.floor(W / 2) + ov },
-      { x: Math.floor(W / 2) - ov, w: W - (Math.floor(W / 2) - ov) },
-    ];
+    // Tile count is tunable (?tiles=N) for benchmarking: each tile is JPEG'd
+    // down to fit ocr.space's size limit, so more tiles means less compression
+    // per tile and potentially better reads, at the cost of more API calls.
+    const nTiles = Math.max(2, Math.min(6, Number(new URLSearchParams(location.search).get('tiles')) || 2));
+    const cuts = [];
+    for (let i = 0; i < nTiles; i++) {
+      const x0 = Math.floor(W * i / nTiles), x1 = Math.floor(W * (i + 1) / nTiles);
+      const lo = Math.max(0, x0 - (i ? ov : 0));
+      const hi = Math.min(W, x1 + (i < nTiles - 1 ? ov : 0));
+      cuts.push({ x: lo, w: hi - lo });
+    }
     // Crop straight from the snapshot and apply the contrast/saturate
     // enhancement per tile, instead of first filtering a whole extra
     // full-resolution (up to 4096px) canvas just to crop plain copies out of

@@ -26,8 +26,13 @@
   'use strict';
 
   const ORT_DIR = 'vendor/ort/';
-  const DET_URL = 'models/det.onnx';
-  const REC_URL = 'models/rec.onnx';
+  // ?q=int8 swaps in the dynamically-quantized models. Benchmark switch only —
+  // whichever variant measures better on the test set becomes the default.
+  const _qp = new URLSearchParams(location.search);
+  // ?qd=/?qr= name a model-file suffix (e.g. ?qr=mm -> models/rec.mm.onnx).
+  const _sfx = v => (v ? '.' + v : '');
+  const DET_URL = `models/det${_sfx(_qp.get('qd'))}.onnx`;
+  const REC_URL = `models/rec${_sfx(_qp.get('qr'))}.onnx`;
   const DICT_URL = 'models/rec_dict.txt';
   const CACHE_NAME = 'shelfcheck-ocr-models-v1';
 
@@ -142,8 +147,9 @@
       // absolute URL: ort's proxy/thread workers resolve paths against their
       // own blob origin, so a relative path would 404 there
       ort.env.wasm.wasmPaths = new URL(ORT_DIR, location.href).href;
+      const THREAD_CAP = Number(_qp.get('thr')) || 4;
       const threads = (self.crossOriginIsolated && navigator.hardwareConcurrency)
-        ? Math.min(4, navigator.hardwareConcurrency) : 1;
+        ? Math.min(THREAD_CAP, navigator.hardwareConcurrency) : 1;
       ort.env.wasm.numThreads = threads;
       try { ort.env.wasm.proxy = true; } catch { /* keep main thread */ }
       const [detBuf, recBuf, dictBuf] = await Promise.all([
@@ -256,14 +262,20 @@
   // background) up to the bucket width; CTC emits blanks over the padding.
   const REC_WIDTH_BUCKETS = [64, 96, 128, 160, 224, 320, 480, 640];
 
-  function recPreprocess(src, box, allowDark) {
+  // ?fix=shape pins every rec crop to one tensor width so WebGPU compiles a
+  // single shader instead of one per bucket; ?fix=batch additionally pads the
+  // batch dimension to a constant. Padding is white (sticker background) and
+  // CTC emits blanks over it, so neither changes what the model reads.
+  const FIX_MODE = _qp.get('fix') || '';
+
+  function recPreprocess(src, box, allowDark, forceW) {
     const [bx, by, bw, bh] = box;
     const x = Math.max(0, Math.round(bx)), y = Math.max(0, Math.round(by));
     const w = Math.min(src.width - x, Math.round(bw));
     const h = Math.min(src.height - y, Math.round(bh));
     if (w < 4 || h < 6) return null;
     const nat = Math.min(REC_MAX_WIDTH, Math.max(16, Math.round(w * REC_HEIGHT / h)));
-    const tw = REC_WIDTH_BUCKETS.find(b => b >= nat) || REC_MAX_WIDTH;
+    const tw = forceW || REC_WIDTH_BUCKETS.find(b => b >= nat) || REC_MAX_WIDTH;
     const c = document.createElement('canvas');
     c.width = tw; c.height = REC_HEIGHT;
     const ctx = c.getContext('2d', { willReadFrequently: true });
@@ -480,28 +492,32 @@
     // Batch recognition per width bucket: one inference call per bucket
     // instead of one per line — per-call overhead (worker round trips)
     // otherwise dominates rec time on 100+ lines.
+    const forceW = FIX_MODE ? REC_MAX_WIDTH : 0;
     const byWidth = new Map();
     for (const box of stick) {
-      const pre = recPreprocess(src, box);
+      const pre = recPreprocess(src, box, false, forceW);
       if (!pre) continue;
       if (!byWidth.has(pre.tw)) byWidth.set(pre.tw, []);
       byWidth.get(pre.tw).push({ box, data: pre.data });
     }
     const recs = [];
-    const REC_BATCH = Number(new URLSearchParams(location.search).get('recb')) || 16;
+    const REC_BATCH = Number(_qp.get('recb')) || 16;
     for (const [tw, items] of byWidth) {
       for (let s0 = 0; s0 < items.length; s0 += REC_BATCH) {
         throwIfAborted(signal);
         const chunk = items.slice(s0, s0 + REC_BATCH);
         const per = 3 * REC_HEIGHT * tw;
-        const batch = new Float32Array(chunk.length * per);
+        // ?fix=batch pads the final short chunk up to REC_BATCH so the batch
+        // dimension is constant too — one tensor shape for the whole run.
+        const rows = FIX_MODE === 'batch' ? REC_BATCH : chunk.length;
+        const batch = new Float32Array(rows * per);
         chunk.forEach((it, i) => batch.set(it.data, i * per));
         const out = await recSess.run({
-          x: new ort.Tensor('float32', batch, [chunk.length, 3, REC_HEIGHT, tw]),
+          x: new ort.Tensor('float32', batch, [rows, 3, REC_HEIGHT, tw]),
         });
         const t = out[recSess.outputNames[0]];
-        const [B, T, C] = t.dims;
-        for (let i = 0; i < B; i++) {
+        const [, T, C] = t.dims;
+        for (let i = 0; i < chunk.length; i++) {   // ignore any padded rows
           const { text, conf } = ctcDecode(t.data.subarray(i * T * C, (i + 1) * T * C), T, C);
           if (text && conf > REC_MIN_CONF) recs.push({ text, conf, box: chunk[i].box });
         }

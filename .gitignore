@@ -13,3 +13,7 @@ test_env/
 __pycache__/
 *.pyc
 .env
+
+# Local-only fp32 recognition model kept for A/B benchmarking
+# (the shipped rec.onnx is the MatMul-int8 build; fp32 is in git history)
+models/rec.fp32.onnx
