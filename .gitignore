@@ -17,3 +17,6 @@ __pycache__/
 # Local-only fp32 recognition model kept for A/B benchmarking
 # (the shipped rec.onnx is the MatMul-int8 build; fp32 is in git history)
 models/rec.fp32.onnx
+
+# Modal: keep the fp32 rec model out of git (large; lives locally + in history)
+modal_server/**/rec.fp32.onnx

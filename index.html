@@ -395,6 +395,10 @@
         <span>Read titles online (faster)</span>
         <div class="settings-toggle" id="titleToggleSwitch"></div>
       </div>
+      <div class="settings-item" id="cloudToggle" role="menuitemcheckbox" aria-checked="true" tabindex="0" style="display:none">
+        <span>Cloud OCR (GPU, fast)</span>
+        <div class="settings-toggle" id="cloudToggleSwitch"></div>
+      </div>
       <div class="settings-item" id="liveArEntry" role="menuitem" tabindex="0" style="display:none">
         <span>Live scan (experimental)</span>
         <span aria-hidden="true" style="color:#777">&rsaquo;</span>
@@ -511,6 +515,24 @@
   // Gemini spine-title reading. ?notitles=1 disables it for benchmarking.
   let geminiTitlesEnabled = new URLSearchParams(location.search).get('notitles') === '1'
     ? false : (localStorage.getItem('shelfcheck.gemtitles') ?? '1') === '1';
+
+  // Cloud OCR (Modal GPU) — runs the same PP-OCR models on a GPU for a
+  // sub-second read instead of the ~7s on-device pass. Empty URL = disabled
+  // (on-device only), which is the default until a Modal endpoint is deployed
+  // and its URL pasted here (or via ?cloud=URL / localStorage override below).
+  // The on-device engine stays as the automatic fallback when the cloud call
+  // fails, so a server hiccup degrades gracefully rather than breaking a scan.
+  // ↓↓↓ AFTER DEPLOYING TO MODAL, paste your endpoint URL here (the web URL
+  // `modal deploy` prints, WITHOUT a trailing /ocr — e.g.
+  // 'https://yourname--shelfcheck-ocr-ocr-web.modal.run'). That turns cloud OCR
+  // on for every volunteer. Leave empty to stay on-device only.
+  const CLOUD_OCR_URL_DEFAULT = '';
+  const _cloudQS = new URLSearchParams(location.search).get('cloud');
+  if (_cloudQS != null) localStorage.setItem('shelfcheck.cloudurl', _cloudQS);
+  const CLOUD_OCR_URL = ((localStorage.getItem('shelfcheck.cloudurl') || CLOUD_OCR_URL_DEFAULT) ?? '').trim();
+  const CLOUD_OCR_TIMEOUT_MS = 30000;   // cold start can be slow; fall back past this
+  let cloudOcrEnabled = !!CLOUD_OCR_URL &&
+    (localStorage.getItem('shelfcheck.cloud') ?? '1') === '1';
   let _flaggedRowMap   = new Map();  // book object → flagged-list DOM row
   let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
   let analysisCancelled = false;
@@ -568,11 +590,12 @@
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
       pendingEncode = encodeForOCR();
       pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
-      // Speculatively run the local engine while the user reviews the photo —
-      // det + rec (and any first-scan GPU shader compile) hide behind the
-      // review pause, so Analyze usually has local results waiting in memory.
-      if (localOcrEnabled && window.LocalOCR && LocalOCR.available()) {
-        pendingLocal = callLocalOcr(snapshot, null).catch(() => null);
+      // Speculatively run the device engine (cloud GPU or on-device) while the
+      // user reviews the photo — the read hides behind the review pause, so
+      // Analyze usually has results waiting in memory.
+      if ((cloudOcrEnabled && CLOUD_OCR_URL) ||
+          (localOcrEnabled && window.LocalOCR && LocalOCR.available())) {
+        pendingLocal = deviceOcr(snapshot, null);
       }
       // Take-photo → results with no extra tap (native camera only). Retake
       // stays available for a redo; analyzeShelf flips Analyze to "Reading…".
@@ -621,7 +644,10 @@
   // for tiny sticker OCR than the live preview — and gives the user its own
   // shutter/confirm step. The in-app live-AR camera is now an experimental
   // extra reachable only from the settings menu (see the AR debug entry below).
-  takePicBtn.addEventListener('click', () => photoInput.click());
+  // Tapping Take Photo opens the native camera; the volunteer then spends a few
+  // seconds framing. Warm the GPU container now so it's hot by the time the
+  // photo comes back.
+  takePicBtn.addEventListener('click', () => { warmCloud(); photoInput.click(); });
 
   // ── Live in-app camera ────────────────────────────────────────────────────
   const cameraLive   = document.getElementById('cameraLive');
@@ -1601,17 +1627,15 @@
     return s;
   }
 
-  async function callLocalOcr(src, signal) {
-    const t0 = performance.now();
-    const section = getSection();
-    // note: plausibility runs on the RAW text; normalization happens below in
-    // the book mapping so truncation evidence (trailing "635.") survives
-    // until the confidence decision.
-    const rawLabels = await LocalOCR.run(src, { signal });
-    // Regions the detector saw but recognition couldn't read. A label that IS
-    // read but then fails the plausibility filter is just as unread from the
-    // volunteer's point of view, so it joins the same bucket — the whole point
-    // is that anything the scan couldn't turn into a usable label gets marked.
+  // Shared raw-labels -> books mapping. Both the on-device engine and the
+  // Modal cloud engine emit the SAME raw shape ({text, conf, bboxFrac} plus
+  // .unread), so both run through this one function — the plausibility filter,
+  // the strict 0.97 'high' gate, the truncated-number demotion, and the
+  // normalization are byte-identical whichever engine produced the reads. That
+  // is what lets the GPU server be a true drop-in: nothing downstream can tell
+  // the difference, so the measured accuracy and the zero-false-positive rule
+  // carry over unchanged.
+  function rawLabelsToBooks(rawLabels, section) {
     const unread = [...(rawLabels.unread || [])];
     const labels = rawLabels.filter(l => {
       if (localLabelPlausible(l.text, section)) return true;
@@ -1633,8 +1657,83 @@
       bboxFrac: l.bboxFrac,
     }));
     books.unread = unread;
-    console.log(`[perf] callLocalOcr: ${books.length} book(s), ${unread.length} unread at ${Math.round(performance.now() - t0)}ms`);
     return books;
+  }
+
+  async function callLocalOcr(src, signal) {
+    const t0 = performance.now();
+    const section = getSection();
+    // note: plausibility runs on the RAW text; normalization happens in
+    // rawLabelsToBooks so truncation evidence (trailing "635.") survives
+    // until the confidence decision.
+    const rawLabels = await LocalOCR.run(src, { signal });
+    const books = rawLabelsToBooks(rawLabels, section);
+    console.log(`[perf] callLocalOcr: ${books.length} book(s), ${books.unread.length} unread at ${Math.round(performance.now() - t0)}ms`);
+    return books;
+  }
+
+  // Cloud OCR: the same PP-OCR det+rec models on a Modal GPU. Sends the full
+  // snapshot as a JPEG and gets back the identical raw shape LocalOCR.run
+  // produces, so it slots into rawLabelsToBooks and the fusion exactly like the
+  // on-device engine — just an order of magnitude faster on a warm container.
+  // Throws on any failure so the caller can fall back to the on-device engine.
+  async function callCloudOcr(src, signal) {
+    const t0 = performance.now();
+    const section = getSection();
+    const blob = await new Promise((res, rej) =>
+      src.toBlob(b => b ? res(b) : rej(new Error('encode failed')), 'image/jpeg', 0.9));
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), CLOUD_OCR_TIMEOUT_MS);
+    const onAbort = () => ctrl.abort();
+    if (signal) {
+      if (signal.aborted) ctrl.abort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    try {
+      const res = await fetch(CLOUD_OCR_URL.replace(/\/$/, '') + '/ocr', {
+        method: 'POST', body: blob,
+        headers: { 'Content-Type': 'application/octet-stream' },
+        signal: ctrl.signal,
+      });
+      if (!res.ok) throw new Error('cloud OCR ' + res.status);
+      const data = await res.json();
+      const raw = data.labels || [];
+      raw.unread = data.unread || [];
+      const books = rawLabelsToBooks(raw, section);
+      console.log(`[perf] callCloudOcr: ${books.length} book(s), ${books.unread.length} unread, server ${data.ms}ms (${data.provider}) at ${Math.round(performance.now() - t0)}ms`);
+      return books;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  // Warm the Modal container the instant the app is usable, so a cold GPU spins
+  // up during the seconds the volunteer spends walking to the shelf and framing
+  // — by the time the photo lands the container is hot and the read is
+  // sub-second. Fire-and-forget; failure is harmless.
+  let _cloudWarmedAt = 0;
+  function warmCloud() {
+    if (!cloudOcrEnabled || !CLOUD_OCR_URL) return;
+    if (Date.now() - _cloudWarmedAt < 30000) return;   // don't spam
+    _cloudWarmedAt = Date.now();
+    fetch(CLOUD_OCR_URL.replace(/\/$/, '') + '/warm', { method: 'GET' }).catch(() => {});
+  }
+
+  // The engine that fills the "device" slot in the fusion: cloud when enabled
+  // and configured (falling back to on-device if the call fails), else the
+  // on-device engine. One place decides, so runOcr and the speculative
+  // pre-encode path stay in sync.
+  function deviceOcr(src, signal) {
+    if (cloudOcrEnabled && CLOUD_OCR_URL) {
+      return callCloudOcr(src, signal).catch(err => {
+        console.log('[perf] cloud OCR failed, falling back to on-device:', err.message);
+        return (localOcrEnabled && window.LocalOCR && LocalOCR.available())
+          ? callLocalOcr(src, signal).catch(() => null) : null;
+      });
+    }
+    return (localOcrEnabled && window.LocalOCR && LocalOCR.available())
+      ? callLocalOcr(src, signal).catch(() => null) : Promise.resolve(null);
   }
 
   // Project fraction-space gem boxes into a target pixel space (the same
@@ -2965,10 +3064,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // it). They fail independently (device too old / models still downloading
     // vs 502 rate limits), so racing both means a scan only dies when BOTH
     // fail — and first render comes from whichever answers first.
-    const localP = pendingLocal
-      ?? ((localOcrEnabled && window.LocalOCR && LocalOCR.available())
-        ? callLocalOcr(snapshot, signal).catch(() => null)
-        : Promise.resolve(null));
+    const localP = pendingLocal ?? deviceOcr(snapshot, signal);
     pendingLocal = null;
 
     const ocrP = skipRemote ? Promise.reject(new Error('remote skipped (AR throttle)')) : (async () => {
@@ -4421,9 +4517,31 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     settingsBtn.setAttribute('aria-expanded', 'false');
   });
 
-  // Warm the local engine as soon as the page is idle: the one-time ~31MB
-  // model download plus session compile happens while the user lines up the
-  // shot instead of inside the first scan.
+  // The Cloud OCR toggle only appears once a Modal endpoint URL is configured
+  // (constant, ?cloud=, or localStorage). Off falls back to the on-device
+  // engine, so a volunteer can always run without the server.
+  const cloudToggle = document.getElementById('cloudToggle');
+  const cloudSwitch = document.getElementById('cloudToggleSwitch');
+  if (CLOUD_OCR_URL) {
+    cloudToggle.style.display = '';
+    cloudSwitch.classList.toggle('on', cloudOcrEnabled);
+    cloudToggle.setAttribute('aria-checked', String(cloudOcrEnabled));
+    cloudToggle.addEventListener('click', () => {
+      cloudOcrEnabled = !cloudOcrEnabled;
+      localStorage.setItem('shelfcheck.cloud', cloudOcrEnabled ? '1' : '0');
+      cloudSwitch.classList.toggle('on', cloudOcrEnabled);
+      cloudToggle.setAttribute('aria-checked', String(cloudOcrEnabled));
+      settingsMenu.classList.remove('show');
+      settingsBtn.setAttribute('aria-expanded', 'false');
+      if (cloudOcrEnabled) warmCloud();
+    });
+  }
+
+  // Warm the engine as soon as the page is idle. For the on-device engine that
+  // means the one-time model download + compile; for the cloud engine it means
+  // spinning the GPU container up early. Both happen while the user lines up
+  // the shot instead of inside the first scan.
+  if (cloudOcrEnabled) warmCloud();
   if (localOcrEnabled) {
     const warm = () => {
       if (window.LocalOCR && LocalOCR.available()) LocalOCR.preload().catch(() => {});
