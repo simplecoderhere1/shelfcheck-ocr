@@ -3322,9 +3322,27 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       const oy = Math.min(ay + ah, by + bh) - Math.max(ay, by);
       return ox > 0 && oy > 0 && ox >= 0.5 * Math.min(aw, bw) && oy >= 0.5 * Math.min(ah, bh);
     };
+    // Same physical author read repeatedly at different truncations ("VONNE" /
+    // "VONNEG" / "VONNEGUT") produces several flagged books that DON'T overlap
+    // (they sit at different spots on a long same-author run), so the box-
+    // overlap test alone leaves a wall of yellow on one correctly-shelved
+    // author. Also collapse flagged books on the SAME shelf row whose labels
+    // share a long common prefix — a strong signal they're the same author.
+    // This only ever hides a redundant flag (can never create a red one), and
+    // full high-confidence reads of that author are GREEN (not in this flagged
+    // set), so they're never collapsed away.
+    const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const sharePrefix = (a, b) => {
+      const na = norm(a.spine_label), nb = norm(b.spine_label);
+      let n = 0; const m = Math.min(na.length, nb.length);
+      while (n < m && na[n] === nb[n]) n++;
+      return n >= 5;   // 5+ shared leading chars: same author, not a coincidence
+    };
+    const sameGroup = (k, b) =>
+      overlaps(k, b) || ((k.shelfRow ?? 0) === (b.shelfRow ?? 0) && sharePrefix(k, b));
     const kept = [], suppressed = new Set();
     for (const b of order) {
-      if (kept.some(k => overlaps(k, b))) suppressed.add(b);
+      if (kept.some(k => sameGroup(k, b))) suppressed.add(b);
       else kept.push(b);
     }
     return suppressed;
@@ -4118,10 +4136,14 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       ? unreadBoxesForDraw(checked, lastApiDims.sentW, lastApiDims.sentH, snapshot) : [];
     if (lastApiDims) drawBoundingBoxes(checked, lastApiDims.sentW, lastApiDims.sentH, snapshot, unreadRects);
 
+    // Count against the SAME collapsed set the boxes and list use, so the
+    // "N to check" summary matches what's actually shown (a sticker read three
+    // times is one thing to check, not three).
+    const suppressed   = computeFlaggedSuppressed(checked);
     const total        = checked.length;
-    const outCount     = checked.filter(b => b.outOfOrder).length;
-    const unvCount     = checked.filter(b => b.unverifiable).length;
-    const possiblyCount = checked.filter(b => b.possiblyOutOfOrder).length;
+    const outCount     = checked.filter(b => b.outOfOrder && !suppressed.has(b)).length;
+    const unvCount     = checked.filter(b => b.unverifiable && !suppressed.has(b)).length;
+    const possiblyCount = checked.filter(b => b.possiblyOutOfOrder && !suppressed.has(b)).length;
     const unreadCount  = unreadRects.length;
 
     // Test hook (harmless in prod): record each render's result + timestamp so
