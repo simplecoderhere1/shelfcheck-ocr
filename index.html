@@ -3342,10 +3342,32 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       overlaps(k, b) || ((k.shelfRow ?? 0) === (b.shelfRow ?? 0) && sharePrefix(k, b));
     const kept = [], suppressed = new Set();
     for (const b of order) {
+      // Two adjacent stickers read as ONE label — the box straddled a seam or
+      // two engines' reads concatenated — produce garbage like "641.5676
+      // 641.56STA SIV" or "WALKE Karen WALKEKARM": a call number or surname
+      // repeated inside one label. A volunteer can't act on those, so drop them
+      // from the shown flags. Only ever hides a YELLOW ("check") flag — a real
+      // red misshelving is never suppressed this way.
+      if (!b.outOfOrder && isGarbageLabel(b.spine_label)) { suppressed.add(b); continue; }
       if (kept.some(k => sameGroup(k, b))) suppressed.add(b);
       else kept.push(b);
     }
     return suppressed;
+  }
+
+  // A label is "garbage" when a token repeats inside it — the fingerprint of two
+  // stickers merged into one read (exact repeat "635 … 635", or one token a
+  // prefix of another "WALKE" / "WALKEKARM"). Clean labels ("VONNEGUT Kurt",
+  // "641.5676 SHO") have no repeated token, so they pass untouched.
+  function isGarbageLabel(label) {
+    const toks = String(label || '').toUpperCase().match(/[A-Z0-9]{3,}/g) || [];
+    for (let i = 0; i < toks.length; i++) {
+      for (let j = i + 1; j < toks.length; j++) {
+        if (toks[i] === toks[j]) return true;
+        if (toks[i].length >= 4 && (toks[j].startsWith(toks[i]) || toks[i].startsWith(toks[j]))) return true;
+      }
+    }
+    return false;
   }
 
   function drawBoundingBoxes(checkedBooks, sentW, sentH, target = snapshot, unreadRects = null) {
