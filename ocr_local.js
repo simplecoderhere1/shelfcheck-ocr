@@ -34,7 +34,10 @@
   const DET_URL = `models/det${_sfx(_qp.get('qd'))}.onnx`;
   const REC_URL = `models/rec${_sfx(_qp.get('qr'))}.onnx`;
   const DICT_URL = 'models/rec_dict.txt';
-  const CACHE_NAME = 'shelfcheck-ocr-models-v1';
+  // Bump this whenever a model FILE changes (det/rec/dict): the Cache API keys
+  // on URL, so returning devices keep the old cached model until the cache name
+  // changes. v2 = quantized rec model (2026-07-20).
+  const CACHE_NAME = 'shelfcheck-ocr-models-v2';
 
   // Detection input size dominates det time (roughly quadratically) and sets
   // the floor on how small a sticker can still be found: STICK_H_MIN is a
