@@ -1778,9 +1778,28 @@
     return light / (w * h);
   }
 
-  // Sample canvas pixels to determine if a region has a predominantly white background.
-  function hasWhiteBg(ctx, x, y, w, h, thresh = 150, ratio = 0.55) {
-    return lightRatio(ctx, x, y, w, h, thresh) >= ratio;
+  // Sample canvas pixels to determine if a region has a predominantly white
+  // background — a real spine sticker, not a pale/colorful book cover behind
+  // title text. Luminance alone isn't enough: a pastel cover reads as "light"
+  // too, so also require the light pixels be low-saturation (true white/cream
+  // paper) — colored covers rarely are, even when pale.
+  function hasWhiteBg(ctx, x, y, w, h, thresh = 150, ratio = 0.55, neutralRatio = 0.7, maxSpread = 40) {
+    const cw = ctx.canvas.width, ch = ctx.canvas.height;
+    x = Math.max(0, Math.round(x)); y = Math.max(0, Math.round(y));
+    w = Math.min(cw - x, Math.max(1, Math.round(w)));
+    h = Math.min(ch - y, Math.max(1, Math.round(h)));
+    if (w <= 0 || h <= 0) return false;
+    const px = ctx.getImageData(x, y, w, h).data;
+    let light = 0, neutral = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      const r = px[i], g = px[i + 1], b = px[i + 2];
+      if (0.299 * r + 0.587 * g + 0.114 * b >= thresh) {
+        light++;
+        if (Math.max(r, g, b) - Math.min(r, g, b) <= maxSpread) neutral++;
+      }
+    }
+    const total = w * h;
+    return light / total >= ratio && (light === 0 || neutral / light >= neutralRatio);
   }
 
   // Extract individual words with bboxes from ocr.space TextOverlay.
@@ -4270,7 +4289,12 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     const multiShelf = new Set(checked.map(b => b.shelfIndex).filter(i => i >= 0)).size > 1;
     const header = document.createElement('div');
     header.className = 'flagged-list-header';
-    header.textContent = `Flagged books (${flagged.length})`;
+    // Count matches the badge's "N to check" total (flagged rows + unread
+    // books), even though unread books get one note below instead of a row
+    // each — otherwise the header number and the badge number disagree.
+    header.textContent = unreadCount
+      ? `To check (${flagged.length + unreadCount})`
+      : `Flagged books (${flagged.length})`;
     panel.appendChild(header);
 
     // Build a global index map: book → arrow number (1-based position in checked array)
