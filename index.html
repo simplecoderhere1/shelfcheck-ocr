@@ -2037,13 +2037,16 @@
   // Gemini is better than no reading at all.
   const AZURE_ONLY = typeof location === 'undefined' ||
     new URLSearchParams(location.search).get('azureonly') !== '0';
-  // Defaults to the co-hosted Static Web Apps function ("/api/ocr"), which holds
-  // the subscription key server-side. ?azure=<origin> overrides it — the test
-  // harness points that at the local proxy. On a host with no /api (e.g. the old
-  // GitHub Pages copy) the first call fails, azureDown latches, and the app
-  // falls back to its other engines rather than hanging.
+  // Defaults to the Cloudflare Worker that holds the subscription key. The page
+  // itself is static on GitHub Pages, which can only serve files, so the key
+  // cannot live here — the Worker adds it server-side and is the only reason
+  // this stays free without exposing it.
+  // ?azure=<origin> overrides it; the test harness points that at a local proxy.
+  // If the Worker is unreachable the first call fails, azureDown latches, and
+  // the app falls back to its other engines rather than hanging.
   const AZURE_URL = (typeof location !== 'undefined'
-    ? (new URLSearchParams(location.search).get('azure') ?? '/api') : '').trim();
+    ? (new URLSearchParams(location.search).get('azure')
+       ?? 'https://shelfcheck-azure-ocr.krish-sundareswar.workers.dev') : '').trim();
 
   function azureBox(poly) {
     const xs = poly.map(p => p.x), ys = poly.map(p => p.y);

@@ -1,9 +1,0 @@
-{
-  "name": "shelfcheck-api",
-  "version": "1.0.0",
-  "description": "Key-holding proxy for Azure AI Vision Read. The subscription key never reaches the browser.",
-  "main": "src/functions/*.js",
-  "dependencies": {
-    "@azure/functions": "^4.5.0"
-  }
-}
