@@ -10,18 +10,23 @@
 // origin on every response — including errors, since a response without the
 // header is unreadable by the page even when the status is 200.
 //
-// Configure ONE thing (Worker -> Settings -> Variables and Secrets):
-//   AZURE_VISION_KEY   <the key>   type: Secret
-//
-// The endpoint is hardcoded below on purpose. It was briefly a second variable,
-// and having two boxes side by side -- one public URL, one secret, told apart
-// only by name -- invited pasting the key into the wrong one, which fails in a
-// way that looks like the key is missing. The resource host is not a credential
-// and does not change, so it belongs in the code.
+// The endpoint is hardcoded on purpose. It was briefly a second variable, and
+// two boxes side by side -- one public URL, one secret, told apart only by name
+// -- invited pasting the key into the wrong one. It is a public host, not a
+// credential, so it belongs in the code.
 const VISION_ENDPOINT = 'https://shelfcheck-vision.cognitiveservices.azure.com';
 
 const VISION_PATH =
   '/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read';
+
+// The key is read from EITHER secret name. AZURE_VISION_KEY is the intended one;
+// AZURE_VISION_ENDPOINT is where the key actually lives on this account, left
+// over from when the endpoint was a separate setting. Accepting both means the
+// Worker works as configured today and keeps working if the secret is later
+// re-added under the clearer name.
+function visionKey(env) {
+  return env.AZURE_VISION_KEY || env.AZURE_VISION_ENDPOINT || '';
+}
 
 const ALLOWED_ORIGINS = new Set([
   'https://simplecoderhere1.github.io',
@@ -57,10 +62,9 @@ export default {
       return json({ error: 'not found' }, 404, cors);
     }
 
-    const key = env.AZURE_VISION_KEY || '';
+    const key = visionKey(env);
     if (!key) {
-      // Name the missing setting so this is diagnosable, never echo its value.
-      return json({ error: 'AZURE_VISION_KEY secret is not set on this Worker' }, 500, cors);
+      return json({ error: 'no vision key secret set on this Worker' }, 500, cors);
     }
 
     const body = await request.arrayBuffer();
