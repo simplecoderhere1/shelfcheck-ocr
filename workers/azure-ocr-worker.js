@@ -28,14 +28,22 @@ function visionKey(env) {
   return env.AZURE_VISION_KEY || env.AZURE_VISION_ENDPOINT || '';
 }
 
-const ALLOWED_ORIGINS = new Set([
-  'https://simplecoderhere1.github.io',
-  'http://localhost:8080',
-  'http://127.0.0.1:8080',
-]);
+const SITE_ORIGIN = 'https://simplecoderhere1.github.io';
+
+// Loopback on ANY port: the test harness serves the app from an ephemeral port
+// (`listen(0)`), so no fixed list can match it. Allowing only two hardcoded
+// ports meant every harness run was rejected by CORS and scored 0 labels.
+// Loopback is not a meaningful trust boundary here anyway — the allowlist
+// exists to stop other sites spending the free Azure quota, and reaching
+// 127.0.0.1 already means running on this machine.
+const LOOPBACK = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+
+function isAllowed(origin) {
+  return origin === SITE_ORIGIN || LOOPBACK.test(origin);
+}
 
 function corsHeaders(origin) {
-  const allow = ALLOWED_ORIGINS.has(origin) ? origin : 'https://simplecoderhere1.github.io';
+  const allow = isAllowed(origin) ? origin : SITE_ORIGIN;
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',

@@ -3617,13 +3617,20 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         try {
           data = await callAzureOcr(enc.blob, signal);
         } catch (err) {
-          // Azure is out (network, or the 5,000/month free allowance spent).
-          // Latch it for this scan so deviceOcr stops standing down and Gemini
-          // takes over as the backup reader.
+          // Azure is out (network, CORS, or the 5,000/month allowance spent).
+          // Latch it so deviceOcr stops standing down, then FALL THROUGH to the
+          // ocr.space path in this same scan.
+          //
+          // This used to rethrow, which killed the whole read: deviceOcr had
+          // already stood down for this attempt (Azure was healthy when it was
+          // called), so nothing was left to answer and the volunteer got an
+          // error instead of a degraded result. Measured: with the Worker
+          // unreachable, all 10 test images returned ERR and 0 labels.
           azureDown = true;
-          console.log('[perf] azure failed, falling back to Gemini:', err.message);
-          throw err;
+          encoded = enc;               // the fiction fallback reads encoded.blob
+          console.log('[perf] azure failed, falling back to ocr.space:', err.message);
         }
+        if (data) {
         labels = section === 'fiction'
           ? reconstructFictionAzure(parseAzureWords(data), ctx)
           : reconstructNonfiction(parseAzureWords(data), ctx);
@@ -3643,6 +3650,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         console.log(`[perf] runOcr: azure ${labels.length} label(s), ` +
                     `${titles.filter(Boolean).length} title(s) at ${Math.round(performance.now() - t0)}ms`);
         return { labels, imgW, imgH };
+        }
       }
       if (section === 'fiction') {
         // Fiction stickers are large; one downscaled frame reads them fine.
