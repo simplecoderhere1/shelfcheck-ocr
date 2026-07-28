@@ -10,9 +10,15 @@
 // origin on every response — including errors, since a response without the
 // header is unreadable by the page even when the status is 200.
 //
-// Configure (Worker -> Settings -> Variables and Secrets):
-//   AZURE_VISION_ENDPOINT   https://<resource>.cognitiveservices.azure.com  (plaintext)
-//   AZURE_VISION_KEY        <the key>                                       (SECRET)
+// Configure ONE thing (Worker -> Settings -> Variables and Secrets):
+//   AZURE_VISION_KEY   <the key>   type: Secret
+//
+// The endpoint is hardcoded below on purpose. It was briefly a second variable,
+// and having two boxes side by side -- one public URL, one secret, told apart
+// only by name -- invited pasting the key into the wrong one, which fails in a
+// way that looks like the key is missing. The resource host is not a credential
+// and does not change, so it belongs in the code.
+const VISION_ENDPOINT = 'https://shelfcheck-vision.cognitiveservices.azure.com';
 
 const VISION_PATH =
   '/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read';
@@ -51,11 +57,10 @@ export default {
       return json({ error: 'not found' }, 404, cors);
     }
 
-    const endpoint = (env.AZURE_VISION_ENDPOINT || '').replace(/\/+$/, '');
     const key = env.AZURE_VISION_KEY || '';
-    if (!endpoint || !key) {
-      // Name the missing setting, never echo its value.
-      return json({ error: 'vision credentials not configured' }, 500, cors);
+    if (!key) {
+      // Name the missing setting so this is diagnosable, never echo its value.
+      return json({ error: 'AZURE_VISION_KEY secret is not set on this Worker' }, 500, cors);
     }
 
     const body = await request.arrayBuffer();
@@ -67,7 +72,7 @@ export default {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 20000);
     try {
-      const res = await fetch(endpoint + VISION_PATH, {
+      const res = await fetch(VISION_ENDPOINT + VISION_PATH, {
         method: 'POST',
         headers: {
           'Ocp-Apim-Subscription-Key': key,
