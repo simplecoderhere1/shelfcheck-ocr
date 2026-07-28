@@ -20,3 +20,13 @@ models/rec.fp32.onnx
 
 # Modal: keep the fp32 rec model out of git (large; lives locally + in history)
 modal_server/**/rec.fp32.onnx
+
+# Staged copies for the HF Space (assembled by hf_space/prepare_space.sh)
+hf_space/models/
+hf_space/ocr_pipeline.py
+
+# Azure AI Vision key (local only — never commit; production home is a Worker secret)
+.azure_key*
+
+# Azure Functions deps (installed by the SWA build)
+api/node_modules/
