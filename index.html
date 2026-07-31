@@ -3938,7 +3938,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         const m = /^\s*(\d{1,3})(\.\d+)?/.exec(l.text);
         if (!m || m[2]) continue;
         const r = rows.get(l._row);
-        if (r && r.dec >= 4 && r.bare / (r.bare + r.dec) <= 0.2) l.score = 0.6;
+        if (r && r.dec >= 4 && r.bare / (r.bare + r.dec) <= 0.2) l.score = DEMOTE_SCORE;
       }
     }
 
@@ -4001,134 +4001,51 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     if (demoted) console.log(`[perf] finishLabels: ${demoted} malformed label(s) demoted below the flag bar`);
 
     // Verify-before-accusing: a false misshelving flag is the worst mistake
-    // this app can make, so every label a provisional order check would flag
-    // gets one extra high-zoom local re-read of its own sticker. A longer
-    // Dewey decimal that extends the current read repairs a truncation (the
-    // common false-flag cause — "635.04" read off a 635.0484 sticker); a
-    // conflicting key demotes the label below the flag bar; agreement keeps
-    // the flag. The final checkOrder in showResults then re-derives flags
-    // from the corrected labels.
-    // This stays ON even with the Gemini reader driving, despite costing the
-    // on-device engine's ~3.2s startup on the blocking path. Gating it off was
-    // tried and measured: false positives went 2 -> 10 (recall 93.6% -> 95.6%,
-    // but 8 more books wrongly accused). The block's value is overwhelmingly in
-    // its DEMOTE verdicts — in a sample recheck run, 5 of 6 outcomes were
-    // demotions and only 1 was the "repair" that mis-extended "635.04 SMI" to
-    // "635.043 SMI". Removing a safety net because it occasionally misfires
-    // costs far more than the misfire.
-    if (localOcrEnabled && window.LocalOCR && LocalOCR.available() && snapshot.width) {
-      try {
-        const provisional = checkOrder(labelsToBooks(out), tieSect);
-        const fx = snapshot.width / imgW, fy = snapshot.height / imgH;
-        // Per-row Dewey class census: a lone class one character off from the
-        // row's dominant class ("535.048" in a row of 635.048s) is a
-        // correlated misread — both engines confuse the same glyph — not a
-        // misshelved book, so it must never flag.
-        const rowClass = new Map();
-        if (tieSect === 'nonfiction') {
-          for (const o of out) {
-            const m = /^\s*(\d{3})\./.exec(o.text);
-            if (!m || o.score < 0.65) continue;
-            if (!rowClass.has(o.shelfRow)) rowClass.set(o.shelfRow, new Map());
-            const cm = rowClass.get(o.shelfRow);
-            cm.set(m[1], (cm.get(m[1]) || 0) + 1);
-          }
+    // this app can make, so a label the provisional order check would flag gets
+    // one more chance to be shown innocent before it reaches the volunteer.
+    //
+    // This used to re-read each accused sticker with the on-device engine. That
+    // engine is retired, and the job it did now happens EARLIER and better in
+    // the closer-look pass, which crops every shaky sticker out of the native
+    // photo and re-reads it with Azure before ordering runs at all. Left in
+    // place it stopped being a safety net and became a blanket: measured over
+    // the ten test shelves, it demoted away EVERY true detection (TP 3 -> 0),
+    // because the on-device re-read disagrees with Azure far more often than it
+    // corrects it.
+    //
+    // What remains is the half that never needed an engine. Per-row Dewey class
+    // census: a lone class one character off from the row's dominant class
+    // ("535.048" in a row of 635.048s) is a correlated misread, not a misshelved
+    // book — and re-reading would not have fixed it anyway, since both passes
+    // confuse the same glyph.
+    try {
+      const provisional = checkOrder(labelsToBooks(out), tieSect);
+      const rowClass = new Map();
+      if (tieSect === 'nonfiction') {
+        for (const o of out) {
+          const m = /^\s*(\d{3})\./.exec(o.text);
+          if (!m || o.score < 0.65) continue;
+          if (!rowClass.has(o.shelfRow)) rowClass.set(o.shelfRow, new Map());
+          const cm = rowClass.get(o.shelfRow);
+          cm.set(m[1], (cm.get(m[1]) || 0) + 1);
         }
-        for (let i = 0; i < provisional.length; i++) {
-          if (!provisional[i].outOfOrder || !out[i].bbox) continue;
-          if (signal?.aborted) break;
-          if (tieSect === 'nonfiction') {
-            const myCls = (/^\s*(\d{3})\./.exec(out[i].text) || [])[1];
-            const cm = rowClass.get(out[i].shelfRow);
-            if (myCls && cm) {
-              let modal = null, modalN = 0;
-              for (const [c, n] of cm) if (n > modalN) { modal = c; modalN = n; }
-              if (modal !== myCls && modalN >= 4 && (cm.get(myCls) || 0) <= 1 &&
-                  fuseEditDist(myCls, modal) === 1) {
-                out[i].score = Math.min(out[i].score, 0.6);
-                console.log(`[perf] finishLabels: class-outlier demote "${out[i].text}" (row modal ${modal})`);
-                continue;
-              }
-            }
-          }
-          const b = out[i].bbox;
-          const rr = await LocalOCR.readRegion(snapshot, [b[0] * fx, b[1] * fy, b[2] * fx, b[3] * fy])
-            .catch(() => null);
-          if (!rr || !rr.text) { out[i].score = Math.min(out[i].score, 0.6); continue; }
-          const rTxt = normalizeLocalText(rr.text, tieSect);
-          const oldP = fuseParse(fuseNorm(out[i].text)), newP = fuseParse(fuseNorm(rTxt));
-          let verdict;
-          if (tieSect === 'nonfiction') {
-            // A crop that caught more than one sticker (two number tokens in
-            // the re-read) proves nothing about THIS sticker — inconclusive,
-            // so don't accuse.
-            const numToks = (rTxt.match(/\d{1,3}\.\d+|\b\d{3}\b/g) || []).length;
-            // Truncation-shaped flag: this book's number is a strict prefix
-            // of BOTH in-order neighbors' numbers ("641.567" between two
-            // 641.5676s). Stickers folded around the spine edge produce
-            // exactly this, so only an exact re-read confirmation may keep
-            // the flag — a shorter second read demotes it.
-            const truncShape = (() => {
-              if (!oldP.num) return false;
-              let ext = 0;
-              for (let j = 0; j < out.length; j++) {
-                if (j === i || out[j].shelfRow !== out[i].shelfRow) continue;
-                const nj = fuseParse(fuseNorm(out[j].text)).num;
-                if (nj && nj !== oldP.num && nj.startsWith(oldP.num)) ext++;
-              }
-              return ext >= 3;
-            })();
-            if (!oldP.num || !newP.num || !oldP.cut || !newP.cut) verdict = 'demote';
-            else if (numToks !== 1) verdict = 'demote';
-            else if (newP.cut.slice(0, 3) !== oldP.cut.slice(0, 3)) verdict = 'demote';
-            // Truncation-shaped flags can't be confirmed by re-reading the
-            // same prefix — the hidden trailing digit is exactly what's in
-            // question (stickers fold around the spine edge). Demote; only a
-            // re-read that extends or contradicts the number resolves one.
-            else if (newP.num === oldP.num) verdict = truncShape ? 'demote' : 'keep';
-            // NOTE: withholding this 'repair' when Gemini is the reader was
-            // tried (the rewrite had fabricated "635.043" from a correct
-            // "635.04 SMI"). It does NOT recover the missed "635.04 HEM" and
-            // costs a false positive: without the rewrite the verdict becomes
-            // 'keep', so SMI stays flagged instead — live FP 2 -> 3, TP
-            // unchanged. The real blocker is the tie-break below, not this.
-            else if (newP.num.startsWith(oldP.num) && rr.conf >= 0.9) verdict = 'repair';
-            // recheck read LESS of the number than the original (a shorter
-            // prefix): the original stands — don't punish the flag for a
-            // worse second read (unless the flag is truncation-shaped)
-            else if (oldP.num.startsWith(newP.num)) verdict = truncShape ? 'demote' : 'keep';
-            else verdict = 'demote';
-          } else {
-            // Fiction flags usually hinge on a single character of the
-            // surname, so a re-read that differs at all (even edit 1) is not
-            // confirmation — only an exact surname match keeps the flag.
-            // And a surname that's a strict prefix of several same-row
-            // surnames ("WALD" among WALDMAN/WALDON) is truncation-shaped:
-            // re-reading the same prefix proves nothing, so demote unless
-            // the re-read extends it.
-            const truncShapeF = (() => {
-              if (!oldP.sur) return false;
-              let ext = 0;
-              for (let j = 0; j < out.length; j++) {
-                if (j === i || out[j].shelfRow !== out[i].shelfRow) continue;
-                const sj = fuseParse(fuseNorm(out[j].text)).sur;
-                if (sj && sj !== oldP.sur && sj.startsWith(oldP.sur)) ext++;
-              }
-              return ext >= 2;
-            })();
-            if (!oldP.sur || !newP.sur) verdict = 'demote';
-            else if (truncShapeF && newP.sur.length > oldP.sur.length &&
-                     newP.sur.startsWith(oldP.sur) && rr.conf >= 0.9) verdict = 'repair';
-            else if (truncShapeF) verdict = 'demote';
-            else verdict = oldP.sur === newP.sur ? 'keep' : 'demote';
-          }
-          if (verdict === 'repair') { out[i].text = rTxt; }
-          else if (verdict === 'demote') { out[i].score = Math.min(out[i].score, 0.6); }
-          console.log(`[perf] finishLabels: recheck "${provisional[i].spine_label}" -> "${rTxt}" (${verdict})`);
-        }
-      } catch (e) {
-        console.warn('flag recheck skipped:', e.message || e);
       }
+      for (let i = 0; i < provisional.length; i++) {
+        if (!provisional[i].outOfOrder || !out[i].bbox) continue;
+        if (tieSect !== 'nonfiction') continue;
+        const myCls = (/^\s*(\d{3})\./.exec(out[i].text) || [])[1];
+        const cm = rowClass.get(out[i].shelfRow);
+        if (!myCls || !cm) continue;
+        let modal = null, modalN = 0;
+        for (const [c, n] of cm) if (n > modalN) { modal = c; modalN = n; }
+        if (modal !== myCls && modalN >= 4 && (cm.get(myCls) || 0) <= 1 &&
+            fuseEditDist(myCls, modal) === 1) {
+          out[i].score = Math.min(out[i].score, DEMOTE_SCORE);
+          console.log(`[perf] finishLabels: class-outlier demote "${out[i].text}" (row modal ${modal})`);
+        }
+      }
+    } catch (e) {
+      console.warn('flag recheck skipped:', e.message || e);
     }
 
     return out;
@@ -5146,6 +5063,15 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   // 0.60 down to 0.40 gives identical results. 0.60 is the top of that
   // plateau — the most conservative setting that still detects anything.
   const RED_MIN_SCORE = 0.60;
+
+  // What a demote writes. Several passes lower a label's score to say "this one
+  // must not be flagged" — the row-consensus bare-number rule, the class-outlier
+  // rule, the verify-before-accusing recheck. Every one of them used to hardcode
+  // 0.6, a value chosen because the bar happened to be 0.65. Moving the bar to
+  // 0.60 turned all of them into no-ops in one stroke, which is exactly how five
+  // correctly-shelved books came to be accused. Derive it from the bar so the
+  // two can never drift apart again.
+  const DEMOTE_SCORE = RED_MIN_SCORE - 0.05;
 
   const SURNAME_PREFIXES = new Set([
     'de','del','dela','di','du','la','le','les','lo','mac','mc',
