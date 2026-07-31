@@ -2920,7 +2920,15 @@
       if (upp / first.length < 0.6) continue;      // surname line is CAPITALISED
       const ux = Math.min(...g.map(w => w.x)), uy = Math.min(...g.map(w => w.y));
       const ur = Math.max(...g.map(w => w.x + w.w)), ub = Math.max(...g.map(w => w.y + w.h));
-      out.push({ text, bbox: [ux, uy, ur - ux, ub - uy], score: 0.9 });
+      // Azure's real confidence, MINIMUM across the words making up the label —
+      // the same statistic the nonfiction reconstructor uses. This was a flat
+      // 0.9, which meant the misshelving confidence bar could not discriminate
+      // between fiction labels AT ALL: a cleanly-read "VUONG, Ocean" and a
+      // half-read "WALKER Karen Thomp" arrived with identical scores, so either
+      // both were eligible to be flagged or neither was.
+      const conf = Math.min(...g.map(w => w.c ?? 0.9));
+      out.push({ text, bbox: [ux, uy, ur - ux, ub - uy], score: conf,
+                 unclear: conf < AZ_MIN_NUM_CONF });
     }
     return out;
   }
