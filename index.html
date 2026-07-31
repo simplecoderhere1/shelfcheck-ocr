@@ -2347,7 +2347,10 @@
   //
   // This is a local convention, not a universal one. Re-derive it before
   // pointing the app at a library that files differently.
-  const PLAUSIBLE_NF = /^\s*\d{1,3}(?:\.\d+)?\s+[A-Za-z]{3}\s*$/;
+  // No Dewey class starts with a zero, so a leading 0 means the "number" is a
+  // decimal TAIL that broke loose from its class — Azure splits "641.568" into
+  // two words and an orphaned "048" then looks exactly like a call number.
+  const PLAUSIBLE_NF = /^\s*[1-9]\d{0,2}(?:\.\d+)?\s+[A-Za-z]{3}\s*$/;
   const PLAUSIBLE_PREFIXES = new Set([
     'de','del','dela','di','du','la','le','les','lo','mac','mc',
     'o','van','von','st','san','santa','el','al','bin','ibn','da','das','dos',
@@ -2378,7 +2381,11 @@
     const given = toks.slice(i);
     const sur = toks.slice(0, i);
     if (!sur.length || !given.length || given.length > 2) return false;
-    if (given.some(g => g.length < 2 || !/^[A-Za-z][A-Za-z'’-]*$/.test(g))) return false;
+    // A given name starts with a capital. A lowercase opening means the read
+    // lost the first letter — "WALKER aren Com" is "WALKER, Karen Thompson"
+    // with the K and most of the surname gone, and it files under the wrong
+    // name entirely.
+    if (given.some(g => g.length < 2 || !/^[A-Z][A-Za-z'’-]*$/.test(g))) return false;
 
     // Every ALL-CAPS word before the surname must be a filing prefix. Anything
     // else is a second sticker that got welded on.
@@ -3374,6 +3381,57 @@
   // Build full-resolution left/right tile blobs for nonfiction OCR.
   // Sticker text is tiny; sending native-resolution halves instead of one
   // downscaled frame nearly doubles the pixels per sticker.
+  // Crop the shaky stickers out of the NATIVE snapshot and grid-pack them onto
+  // ONE composite sheet, so the whole closer-look pass costs a single Azure
+  // call. The cell rectangles come back alongside so readZoomCells can map each
+  // word to the sticker it came from.
+  //
+  // `sentW` is the width of the frame the label coordinates are in; the crop
+  // boxes are scaled from that into native pixels. Scale is derived from WIDTH
+  // here because both are the same frame — do not substitute maxDim.
+  async function encodeZoomSheet(labels, idxs, sentW) {
+    if (!idxs.length || !snapshot.width) return null;
+    const s = snapshot.width / sentW;
+    const crops = [];
+    for (const i of idxs) {
+      const nb = labels[i].numBox || labels[i].bbox;
+      if (!nb) continue;
+      const [x, y, w, h] = nb;
+      const x0 = Math.max(0, Math.round((x - h * 2.2) * s));
+      const y0 = Math.max(0, Math.round((y - h * 2.2) * s));
+      const x1 = Math.min(snapshot.width,  Math.round((x + w + h * 2.2) * s));
+      const y1 = Math.min(snapshot.height, Math.round((y + h * 4.0) * s));
+      if (x1 - x0 < 8 || y1 - y0 < 8) continue;
+      crops.push({ i, x0, y0, w: x1 - x0, h: y1 - y0 });
+    }
+    if (!crops.length) return null;
+
+    // 2x helps Azure's detector find text it otherwise skips, but the sheet must
+    // stay inside a sane upload size — drop to 1x rather than send a huge JPEG.
+    const G = 40;                       // white gutters keep neighbouring crops
+    const cols = Math.max(1, Math.ceil(Math.sqrt(crops.length)));
+    const cw = Math.max(...crops.map(c => c.w)), ch = Math.max(...crops.map(c => c.h));
+    const rows = Math.ceil(crops.length / cols);
+    let z = 2;
+    if ((cols * (cw * z + G) + G) > 4000 || (rows * (ch * z + G) + G) > 4000) z = 1;
+
+    const cvW = cols * (cw * z + G) + G, cvH = rows * (ch * z + G) + G;
+    const cv = document.createElement('canvas');
+    cv.width = cvW; cv.height = cvH;
+    const cx = cv.getContext('2d');
+    cx.fillStyle = '#fff'; cx.fillRect(0, 0, cvW, cvH);
+    const rects = [];
+    crops.forEach((c, k) => {
+      const px = G + (k % cols) * (cw * z + G);
+      const py = G + ((k / cols) | 0) * (ch * z + G);
+      cx.drawImage(snapshot, c.x0, c.y0, c.w, c.h, px, py, c.w * z, c.h * z);
+      rects.push([px, py, c.w * z, c.h * z]);
+    });
+    const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.9));
+    if (!blob) return null;
+    return { blob, rects, idxs: crops.map(c => c.i) };
+  }
+
   async function encodeTilesForOCR() {
     const t0 = performance.now();
     const W = snapshot.width, H = snapshot.height;
@@ -3930,7 +3988,13 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     let demoted = 0;
     for (const o of out) {
       if (labelPlausible(o.text, tieSect)) continue;
-      o.score = Math.min(o.score, 0.6);
+      // A FLAG, not a score penalty. This used to write score = 0.6, chosen to
+      // sit under a 0.65 confidence bar — so the moment that bar moved to 0.55
+      // every malformed label sailed through it and the gate silently stopped
+      // working. Shape and confidence are different questions and must not
+      // share a channel: "635 ICON" is not a low-confidence reading of a real
+      // label, it is not a label at all.
+      o.malformed = true;
       o.unclear = true;
       demoted++;
     }
@@ -4120,17 +4184,42 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
 
     const ocrP = skipRemote ? Promise.reject(new Error('remote skipped (AR throttle)')) : (async () => {
       let labels, imgW, imgH;
-      // Azure path: ONE call for the whole frame — no L/R tiling, because the
-      // tiling exists to give ocr.space enough resolution on tiny stickers and
-      // Azure doesn't need it. Words/lines feed the SAME reconstructors, and the
-      // luminance context is the very canvas that was uploaded, so the
-      // light-background sticker gate still lines up with the coordinates.
+      // Azure path. The luminance context is the very canvas that was uploaded,
+      // so the light-background sticker gate lines up with the coordinates.
       if (AZURE_URL && !azureDown) {
         const enc = encoded ?? await encodeForOCR();
         const ctx = enc.canvas.getContext('2d');
-        let data;
+        let data, tileWords = null;
         try {
-          data = await callAzureOcr(enc.blob, signal);
+          // NONFICTION: read native-resolution vertical strips too, in parallel
+          // with the full frame.
+          //
+          // Azure silently DROPS legible text when it is tiny relative to a
+          // whole-shelf photo — omissions, not misreads. On 195907424 a "635"
+          // printed large and sharp above a "WEA" it read at 0.993 simply had no
+          // word in the response at all. Handing it the same shelf as two
+          // half-width strips makes that text bigger relative to the frame and
+          // it comes back. Measured over the 8 nonfiction photos, labels with
+          // BOTH parts present: 79.7% -> 90.1%. A 2x2 grid reaches 92.7% but
+          // costs 5 calls for the last 2.6 points.
+          //
+          // Resolution is NOT the lever — re-reading the originals at full
+          // 4080px changed nothing. It is how much of the FRAME the text
+          // occupies, which is why tiling works and upscaling does not.
+          const tilesP = section !== 'fiction'
+            ? (pendingTiles ?? encodeTilesForOCR()).then(async ({ tiles }) => {
+                pendingTiles = null;
+                const ds = await Promise.all(
+                  tiles.map(t => callAzureOcr(t.blob, signal).catch(() => null)));
+                const out = [];
+                ds.forEach((d, i) => {
+                  if (!d) return;
+                  for (const w of parseAzureWords(d)) { w.x += tiles[i].xoff; out.push(w); }
+                });
+                return out;
+              }).catch(() => null)
+            : Promise.resolve(null);
+          [data, tileWords] = await Promise.all([callAzureOcr(enc.blob, signal), tilesP]);
         } catch (err) {
           // Azure is out (network, CORS, or the 5,000/month allowance spent).
           // Latch it so deviceOcr stops standing down, then FALL THROUGH to the
@@ -4148,7 +4237,33 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         if (data) {
         labels = section === 'fiction'
           ? reconstructFictionAzure(parseAzureWords(data), ctx)
-          : reconstructNonfiction(parseAzureWords(data), ctx);
+          : reconstructNonfictionAzure(
+              mergeAzureWordSets(parseAzureWords(data), tileWords,
+                                 enc.sentW / snapshot.width), ctx, true);
+        // Closer look at the stickers this read is shaky on. ONE extra call, and
+        // a failure here is never fatal — the labels stand as they are.
+        if (section !== 'fiction') {
+          try {
+            const zt0 = performance.now();
+            const idxs = zoomCandidates(labels).slice(0, AZ_ZOOM_MAX);
+            if (idxs.length) {
+              const sheet = await encodeZoomSheet(labels, idxs, enc.sentW);
+              if (sheet) {
+                const zt1 = performance.now();
+                const zd = await callAzureOcr(sheet.blob, signal);
+                const n = mergeZoomReads(labels, sheet.idxs,
+                            readZoomCells(parseAzureWords(zd), sheet.rects));
+                // Broken out because this pass is pure ADDED latency: it cannot
+                // start until the first read has said which stickers are shaky.
+                console.log(`[perf] closer look: ${n} of ${sheet.idxs.length} sharpened` +
+                  ` — sheet ${(zt1 - zt0) | 0}ms, total ${(performance.now() - zt0) | 0}ms`);
+              }
+            }
+          } catch (e) { console.log('[perf] closer look skipped:', e.message); }
+          // Anchors that still have no author tag cannot be sorted, so they stop
+          // here rather than reaching the volunteer as half a label.
+          labels = labels.filter(l => l.cut);
+        }
         // Marks these as the trusted sole engine (see the oOnly branch in
         // fuseLabels) and attaches the spine titles Azure returned in the same
         // response — no separate title call is needed.
@@ -4422,6 +4537,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       _score:         label.score,
       _title_score:   label.title_score || null,
       _truncated:     !!label.truncated,
+      _unclear:       !!label.unclear,
+      _malformed:     !!label.malformed,
       _src:           label.src || 'ocr',
     }));
   }
@@ -5011,6 +5128,25 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   snapshot.addEventListener('click', e => handleCanvasTap(snapshot, e));
 
   // ── Ordering logic (identical to shelfcheck/index.html) ──────────────────
+  // How sure the reader must be before a book may be called misshelved.
+  //
+  // This used to be 0.65 against a score that was effectively a two-value flag:
+  // parseAzureWords discarded Azure's per-word confidence, so every read
+  // arrived as a flat 0.9 and the bar only ever excluded the 0.6 "one engine
+  // saw it" reads. Now the score carries Azure's real confidence — the MINIMUM
+  // across the words making up the label — and 0.65 turned out to block every
+  // detection on the test shelves, including three misfilings confirmed by eye.
+  //
+  // The minimum is a harsh statistic: one shaky glyph in a three-letter tag
+  // drags the whole label down, even when the number and the rest of the tag
+  // came back at 0.99.
+  //
+  // Swept over the ten test shelves (`node replay_order.mjs --red=`). There is
+  // a cliff, not a slope: 0.65 detects nothing at all, and every value from
+  // 0.60 down to 0.40 gives identical results. 0.60 is the top of that
+  // plateau — the most conservative setting that still detects anything.
+  const RED_MIN_SCORE = 0.60;
+
   const SURNAME_PREFIXES = new Set([
     'de','del','dela','di','du','la','le','les','lo','mac','mc',
     'o','van','von','st','san','santa','el','al','bin','ibn','da','das','dos',
@@ -5565,7 +5701,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // read, and requiring two engines there would bar every flag outright.
       // Everything else still needs cross-engine agreement.
       if (b.outOfOrder && b._src &&
-          !((b._src === 'both' || b._src === 'azure') && b._score >= 0.65)) {
+          !((b._src === 'both' || b._src === 'azure') && b._score >= RED_MIN_SCORE)) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
       }
       // A truncated read can never be red, whatever the ordering says. We do not
@@ -5574,6 +5710,13 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // this one needs a human's eyes. idealPosition is cleared for the same
       // reason — we cannot name a slot we cannot compute.
       if (b._truncated && b.outOfOrder) {
+        b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+      }
+      // A malformed label can never be red either, for a stronger reason than
+      // truncation: there is no single book it reliably refers to.
+      // "BOO WAL WALKER, Boo" is two stickers welded together, so flagging it
+      // accuses whichever of the two the sort happened to land on.
+      if (b._malformed && b.outOfOrder) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
       }
     }
