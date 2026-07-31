@@ -1,0 +1,40 @@
+{
+  "image": "PXL_20260607_195909571.MP.jpg",
+  "section": "nonfiction",
+  "labels": [
+    {"n": 1, "verdict": "ok", "text": "635.04 MOS"},
+    {"n": 2, "verdict": "ok", "text": "635.04 NOW"},
+    {"n": 3, "verdict": "illegible", "text": "635.? ROS", "note": "sticker is on a very narrow spine; only \"635.\" is visible before the label wraps out of view, no decimal digits visible. Tag ROS is clear."},
+    {"n": 4, "verdict": "ok", "text": "635.04 ROG"},
+    {"n": 5, "verdict": "illegible", "text": "635.0? ROG", "note": "narrow spine, sticker cut off right after \"635.0\"; any further digit is hidden around the curve of the spine. Tag ROG is clear."},
+    {"n": 6, "verdict": "illegible", "text": "635.0? ROG", "note": "only \"635\" is inside the ringed box; a faint \".0\" continues onto the wrapped edge of the spine and nothing further is visible. Tag ROG is clear."},
+    {"n": 7, "verdict": "ok", "text": "635.04 SMI"},
+    {"n": 8, "verdict": "ok", "text": "635.043 SMI"},
+    {"n": 9, "verdict": "illegible", "text": "635.0? HEM", "note": "sticker ends right where the spine meets the next (orange) book; only \"635.0\" is visible, cannot confirm whether more digits exist."},
+    {"n": 10, "verdict": "ok", "text": "635.048 MCL"},
+    {"n": 11, "verdict": "illegible", "text": "635.? MIL", "note": "only \"635.\" visible before the sticker wraps around the spine edge; digit(s) not visible. Tag MIL is clear."},
+    {"n": 12, "verdict": "illegible", "text": "635.0? SIM", "note": "\"635.0\" visible, cut off immediately by the spine's rounded edge/crease."},
+    {"n": 13, "verdict": "illegible", "text": "635.? SIM", "note": "only \"635.\" visible before the spine crease; no decimal digits visible."},
+    {"n": 14, "verdict": "corrected", "text": "635.? VIA", "note": "leading digit is clearly \"6\", not \"5\" as read by automation (\"535 VIA\" is wrong). Only \"635.\" is visible before the sticker wraps around the spine edge; decimal digits not visible."},
+    {"n": 15, "verdict": "ok", "text": "635.0483 BRO"},
+    {"n": 16, "verdict": "ok", "text": "635.04 BAK", "note": "digit by digit: 6, 3, 5, ., 0, 4 — tag B-A-K. Fully legible with clear white space after the \"4\" before the spine edge, no further digits present."},
+    {"n": 17, "verdict": "illegible", "text": "635.? BEL", "note": "only \"635.\" visible before the sticker is cut by the spine's curve. Tag BEL legible."},
+    {"n": 18, "verdict": "illegible", "text": "635.? BEL", "note": "sticker is faint/worn; \"635\" and a following mark are visible but not confidently readable. Tag BEL legible."},
+    {"n": 19, "verdict": "ok", "text": "635.0484 BIG"},
+    {"n": 20, "verdict": "illegible", "text": "635.048? BEN", "note": "\"635.048\" is clearly visible and then the sticker is cut off right at the spine crease bordering the next book (COB); cannot confirm whether a further digit (e.g. matching neighbors' \"...84\") exists."},
+    {"n": 21, "verdict": "ok", "text": "635.0484 COB"},
+    {"n": 22, "verdict": "ok", "text": "635.04 COF"},
+    {"n": 23, "verdict": "ok", "text": "635.048 COL"},
+    {"n": 24, "verdict": "ok", "text": "635.048 MAR"},
+    {"n": 25, "verdict": "ok", "text": "635.048 MIL"},
+    {"n": 26, "verdict": "ok", "text": "635.04 COL", "note": "handwritten lowercase-style \"Col\", but reads clearly as 635.04 COL."},
+    {"n": 27, "verdict": "ok", "text": "635.0 COM", "note": "handwritten sticker IS present at this spot and reads exactly \"635.0\" over \"COM\" as the automation captured. The sticker is cut off by the spine's curve right after the \"0\", so it is possible (not confirmed) that more digits exist out of view; nothing visible contradicts \"635.0 COM\"."}
+  ],
+  "missing": [
+    {"row": 0, "betweenN": [0, 1], "text": "635.? CAM", "note": "two adjacent books, both with white call-number stickers reading \"635.\" + CAM, sitting at the very start of the row (left of label 1, MOS). Decimal digits are hidden in the fold between the two spines and are not visible. Both missed entirely by the automation."},
+    {"row": 0, "betweenN": [6, 7], "text": "635.? ULA", "note": "a clearly visible white sticker reading \"635.\" then \"ULA\" sits directly between label 6 (ROG) and label 7 (SMI). No green box on it; decimal digits hidden by the spine's edge fold."},
+    {"row": 0, "betweenN": [23, 24], "text": "635.? CO_", "note": "a white sticker reading \"635.\" then \"CO\" plus a final letter (appears to start with a diagonal stroke, most consistent with \"X\", possibly \"COX\") sits between label 23 (COL) and label 24 (MAR). No green box on it; number's decimal digits and the tag's final letter are cut off by the spine's curve/crease."}
+  ],
+  "orderFindings": "HEM (n=9, visible number 635.0) sits between SMI (n=8, 635.043) and MCL (n=10, 635.048) — its short visible number (635.0) is numerically lower than both neighbors, so as read it does not belong between them; consistent with being misshelved. BAK (n=16, 635.04 — fully legible, confirmed digit-by-digit) sits between BRO (n=15, 635.0483) and BEL (n=17, illegible ~635.?) — 635.04 is numerically lower than 635.0483, so BAK should sort before BRO, not after; it is misshelved. BEN (n=20, visible 635.048, possibly 635.0484) sits between BIG (n=19, 635.0484) and COB (n=21, 635.0484) — if BEN shares the same full number as its neighbors, correct cutter-order would place BEN (E) before BIG (I) alphabetically, but it is shelved after BIG; it is misshelved (or at minimum out of alphabetical order for its number cluster).",
+  "confidence": "High confidence on tags and on the numbers that terminate with clear white space before the next spine (marked ok/corrected); low confidence — deliberately marked illegible rather than guessed — on roughly a third of the labels (3,5,6,9,11,12,13,14,17,18,20) where the printed sticker is cut off by the physical curve/fold of a narrow paperback spine and no further digits are visible from this angle. Three call-number stickers (two \"CAM\" copies at the very start of the row, one \"ULA\" between labels 6-7, one \"CO_\" between labels 23-24) were found with no automation box at all. Label 14's automation read (\"535 VIA\") has a confirmed wrong leading digit (should be 6, not 5)."
+}

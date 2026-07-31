@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: shelfcheck-ocr-backend
+    runtime: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
+      # Optional: uncomment and set a key to protect the /ocr endpoint
+      # - key: SHELFCHECK_API_KEY
+      #   generateValue: true

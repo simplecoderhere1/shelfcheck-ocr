@@ -1,0 +1,28 @@
+{
+  "image": "PXL_20260607_195907424.jpg",
+  "section": "nonfiction",
+  "labels": [
+    {"n": 1, "verdict": "ok", "text": "635 WEA"},
+    {"n": 2, "verdict": "ok", "text": "635 WEA"},
+    {"n": 3, "verdict": "ok", "text": "635 WEI"},
+    {"n": 4, "verdict": "ok", "text": "635 WHI"},
+    {"n": 5, "verdict": "ok", "text": "635 WHA"},
+    {"n": 6, "verdict": "ok", "text": "635 WIL"},
+    {"n": 7, "verdict": "ok", "text": "635 YOE"},
+    {"n": 8, "verdict": "ok", "text": "635 ZAC"},
+    {"n": 9, "verdict": "ok", "text": "635 ZIE"},
+    {"n": 10, "verdict": "ok", "text": "635 ZIE"},
+    {"n": 11, "verdict": "ok", "text": "635 ZIE"},
+    {"n": 12, "verdict": "ok", "text": "635 ZON"},
+    {"n": 13, "verdict": "ok", "text": "635.01 ROA"},
+    {"n": 14, "verdict": "ok", "text": "635.01 ROA"},
+    {"n": 15, "verdict": "ok", "text": "635.02 EDW"},
+    {"n": 16, "verdict": "ok", "text": "635.0222 MUS"},
+    {"n": 17, "verdict": "ok", "text": "635.0222 WOO"},
+    {"n": 18, "verdict": "ok", "text": "635.028 HOL"},
+    {"n": 19, "verdict": "ok", "text": "635.03 AME"},
+    {"n": 20, "verdict": "ok", "text": "635.03 ENC"}
+  ],
+  "missing": [],
+  "confidence": "High confidence overall - all 20 labels were legible in the coverage segments and matched the automation's readings exactly; the only mildly uncertain reads were label 4 (635 WHI, on a narrow spine squeezed between two other books) and label 18 (635.028 HOL, partly overlapped by the neighboring book's TIMBER title text), but both were still clearly readable. I checked every book spine across all four segments left to right and found no white call-number sticker lacking a green box; the one large apparent gap in bounding-box x-coordinates (between labels 19 and 20) is explained by book 19 being a wide encyclopedia-style volume, confirmed visually by the sliver of book 20's spine already visible at the edge of segment 3."
+}

@@ -1,0 +1,34 @@
+{
+  "image": "PXL_20260607_195853918.jpg",
+  "section": "nonfiction",
+  "labels": [
+    {"n": 1, "verdict": "ok", "text": "641.568 COM"},
+    {"n": 2, "verdict": "ok", "text": "641.5686 FOR"},
+    {"n": 3, "verdict": "ok", "text": "641.5686 FOR"},
+    {"n": 4, "verdict": "ok", "text": "641.568 GEI"},
+    {"n": 5, "verdict": "ok", "text": "641.5686 GOO"},
+    {"n": 6, "verdict": "ok", "text": "641.5686 GOO"},
+    {"n": 7, "verdict": "ok", "text": "641.5686 HAV"},
+    {"n": 8, "verdict": "ok", "text": "641.5686 JOH"},
+    {"n": 9, "verdict": "ok", "text": "641.5686 KLY"},
+    {"n": 10, "verdict": "ok", "text": "641.5686 LAI"},
+    {"n": 11, "verdict": "ok", "text": "641.5686 LAW"},
+    {"n": 12, "verdict": "ok", "text": "641 MCI", "note": "sticker is small/compressed at the spine corner but '641' and 'MCI' are both legible with clear white borders; no additional digits visible"},
+    {"n": 13, "verdict": "ok", "text": "641.568 OHR"},
+    {"n": 14, "verdict": "ok", "text": "641.5686 OLI"},
+    {"n": 15, "verdict": "ok", "text": "641.5686 ROM"},
+    {"n": 16, "verdict": "ok", "text": "641.5686 ROM"},
+    {"n": 17, "verdict": "ok", "text": "641.5 RIV"},
+    {"n": 18, "verdict": "ok", "text": "641.5686 ROS"},
+    {"n": 19, "verdict": "ok", "text": "641.56 RUT"},
+    {"n": 20, "verdict": "ok", "text": "641.568 SIM"},
+    {"n": 21, "verdict": "ok", "text": "641.568 TAS"},
+    {"n": 22, "verdict": "junk", "note": "ringed spot is the printed title '100' on a book's front/back cover art ('100 Recipes That Redefine Outdoor Cooking', Symon), not a white call-number sticker; no sticker exists at this location"}
+  ],
+  "missing": [
+    {"row": 0, "betweenN": [1, 2], "text": "641.5686 DEV", "note": "clear white sticker on the book directly right of label 1, no green box"},
+    {"row": 0, "betweenN": [20, 21], "text": "641.5686 SOU", "note": "clear white sticker just right of label 20, no green box"},
+    {"row": 0, "betweenN": [20, 21], "text": "641.5686 STI", "note": "clear white sticker right of the SOU sticker (further right than SOU, still left of label 21), no green box"}
+  ],
+  "confidence": "High confidence on row 0 — all 21 ringed row-0 labels match the pixels and three unboxed stickers (DEV, SOU, STI) were found by scanning the gaps between numbered boxes. Row 1 is essentially unreadable in this photo: all four row-1 coverage segments show book fore-edges/page-tops rather than spines, so no call-number stickers are visible there at all, and the single row-1 entry (n22, '100 THAT') turned out to be book-cover title text mistaken for a sticker, not a real label — I could not check for missing row-1 stickers because none are visible in any segment. Label 12 (641 MCI) is genuinely legible but unusually short (no decimal); I read it as-is rather than guessing hidden digits."
+}

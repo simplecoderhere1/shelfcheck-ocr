@@ -1,0 +1,613 @@
+{
+ "_notes": "Human-verified ground truth v3 (2026-07-29). Rebuilt because v2 listed only about half the books physically present: a crop-by-crop audit of the labels v2 did not account for found them to be real, legible stickers (17 of 17 on 195911082, 17 of 17 on 195849222). Every label here was checked against the pixels of the native photo, and each shelf was swept again for stickers no automated read had boxed. Labels are in physical left-to-right order per row — do NOT sort them, the ordering tests replay the row as a sequence. \"uncertain\" lists labels whose sticker is real but not confidently readable (blurred, wrapped round the spine, cropped by the frame); they are excluded from the recall denominator but kept for ordering.",
+ "PXL_20260607_195849222.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "641.5676 SAL",
+     "641.5676 SAR",
+     "641.5676 SET",
+     "641.5676 SET",
+     "641.567 SHO",
+     "641.567 SHO",
+     "641.5676 SIM",
+     "641 SIV",
+     "641.5676 STA",
+     "641.5676 STR",
+     "641.5676 TWI",
+     "641.5676 ZUS",
+     "641.5677 HEL",
+     "641.5677 HUS",
+     "641.568 ALL",
+     "641.568 ALL",
+     "641.56 AMI",
+     "641.568 BAT",
+     "641.568 COS",
+     "641.568 CRA",
+     "641.568 CRA",
+     "641.568 CUL",
+     "641.568 DEA",
+     "641.568 DRU",
+     "641.568 GAL",
+     "641.568 GAL",
+     "641.568 GAL"
+    ],
+    "uncertain": [
+     "641 SIV",
+     "641.56 AMI"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "641.5 MAL",
+     "641.568 MIC",
+     "641.568 OLS",
+     "641.568 OSO",
+     "641.568 POT",
+     "641.568 PRO",
+     "641.5 RIG",
+     "641.5 RIG",
+     "641.568 ROS",
+     "641.568 ROS",
+     "641.568 SHE",
+     "641.568 SIF",
+     "641.568 SIF",
+     "641.568 SOU 2019",
+     "641.568 STO",
+     "641.568 TAS 2019",
+     "641.568 TAS 2020",
+     "641.568 TAS 2021",
+     "641.568 TAS 2021",
+     "641.5 TED",
+     "641.568 WAL",
+     "641.568 WOO",
+     "641.56 BES",
+     "641.5 PEL",
+     "641.5681 CAR"
+    ],
+    "uncertain": [
+     "641.5681 CAR",
+     "641.5 TED",
+     "641.5 PEL"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195853918.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "641.568 COM",
+     "641.5686 DEV",
+     "641.5686 FOR",
+     "641.5686 FOR",
+     "641.568 GEI",
+     "641.5686 GOO",
+     "641.5686 GOO",
+     "641.5686 HAV",
+     "641.5686 JOH",
+     "641.5686 KLY",
+     "641.5686 LAI",
+     "641.5686 LAW",
+     "641 MCI",
+     "641.568 OHR",
+     "641.5686 OLI",
+     "641.5686 ROM",
+     "641.5686 ROM",
+     "641.5 RIV",
+     "641.5686 ROS",
+     "641.56 RUT",
+     "641.568 SIM",
+     "641.5686 STI",
+     "641.5686 SOU",
+     "641.568 TAS"
+    ],
+    "uncertain": [
+     "641.568 GEI",
+     "641 MCI",
+     "641.5 RIV",
+     "641.56 RUT"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195858362.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635 DON",
+     "635 DOU",
+     "635 DOW",
+     "635 DOW",
+     "635 EAS",
+     "635 ECK",
+     "635 EDD",
+     "635 EDW",
+     "635 ELL",
+     "635 ELZ",
+     "635 ENC",
+     "635 ESE",
+     "635 FAR",
+     "635 FIN",
+     "635 FOR",
+     "635 FOR",
+     "635 FRO",
+     "635 FRA",
+     "635 FRE",
+     "635 GAL",
+     "635 GAR",
+     "635 GAR",
+     "635 GET",
+     "635 GIA",
+     "635 GIL"
+    ],
+    "uncertain": []
+   },
+   {
+    "row": 1,
+    "labels": [
+     "635 GOD",
+     "635 GRO",
+     "635 GRO",
+     "635 GRO",
+     "635 HAG",
+     "635 HAR",
+     "635 HAR",
+     "635 HEI",
+     "635 HIR",
+     "635 HOM",
+     "635 HOM",
+     "635 HUT",
+     "635 JAB",
+     "635 JAB",
+     "635 JAB",
+     "635 JAB",
+     "635 JEW",
+     "635 JOH",
+     "635 JON",
+     "635 KAR",
+     "635 KAR",
+     "635 KAR",
+     "635 KIA",
+     "635 KLE",
+     "635 KOS",
+     "635 LAU",
+     "635 LAV",
+     "635 LIV",
+     "635 LOA"
+    ],
+    "uncertain": []
+   }
+  ]
+ },
+ "PXL_20260607_195901698.MP.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635 BAK",
+     "635 BOH",
+     "635 BRE",
+     "635 BUC",
+     "635 BUR",
+     "635 BUR",
+     "635 BUR",
+     "635 CAL",
+     "635 CAR",
+     "635 CER",
+     "635 CHA",
+     "635 CHI",
+     "635 GAR",
+     "635 COL",
+     "635 COL",
+     "635 CON",
+     "635 COP",
+     "635 COR",
+     "635 COU",
+     "635 DAM",
+     "635 DAM",
+     "635 DEA",
+     "635 DEL",
+     "635 DER"
+    ],
+    "uncertain": []
+   },
+   {
+    "row": 1,
+    "labels": [
+     "635 DON",
+     "635 DOU",
+     "635 DOW",
+     "635 DOW",
+     "635 FAS",
+     "635 ECK",
+     "635 EDD",
+     "635 EDW",
+     "635 ELL",
+     "635 ELZ",
+     "635 ENC",
+     "635 ESP",
+     "635 FAR",
+     "635 FIN",
+     "635 FOR",
+     "635 FOR",
+     "635 FRO",
+     "635 FRA",
+     "635 FRE",
+     "635 GAL",
+     "635 GAR",
+     "635 GAR",
+     "635 GET",
+     "635 GIA",
+     "635 GIL",
+     "635 EYE"
+    ],
+    "uncertain": [
+     "635 EYE"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195903035.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635 BAK",
+     "635 BOH",
+     "635 BRE",
+     "635 BUC",
+     "635 BUR",
+     "635 BUR",
+     "635 BUR",
+     "635 CAL",
+     "635 CAR",
+     "635 CER",
+     "635 CHA",
+     "635 CHI",
+     "635 GAR",
+     "635 COL",
+     "635 COL",
+     "635 CON",
+     "635 COP",
+     "635 COR",
+     "635 COU",
+     "635 DAM",
+     "635 DAM",
+     "635 DEA",
+     "635 DEL",
+     "635 DER"
+    ],
+    "uncertain": []
+   }
+  ]
+ },
+ "PXL_20260607_195907424.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635 WEA",
+     "635 WEA",
+     "635 WEI",
+     "635 WHI",
+     "635 WHA",
+     "635 WIL",
+     "635 YOE",
+     "635 ZAC",
+     "635 ZIE",
+     "635 ZIE",
+     "635 ZIE",
+     "635 ZON",
+     "635.01 ROA",
+     "635.01 ROA",
+     "635.02 EDW",
+     "635.0222 MUS",
+     "635.0222 WOO",
+     "635.028 HOL",
+     "635.03 AME",
+     "635.03 ENC"
+    ],
+    "uncertain": []
+   }
+  ]
+ },
+ "PXL_20260607_195909571.MP.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635.04 MOS",
+     "635.04 NOW",
+     "635 ROS",
+     "635.04 ROG",
+     "635.0 ROG",
+     "635.0 ROG",
+     "635 ULA",
+     "635.04 SMI",
+     "635.043 SMI",
+     "635.0 HEM",
+     "635.048 MCL",
+     "635 MIL",
+     "635.0 SIM",
+     "635 SIM",
+     "635 VIA",
+     "635.0483 BRO",
+     "635.04 BAK",
+     "635 BEL",
+     "635 BEL",
+     "635.0484 BIG",
+     "635.048 BEN",
+     "635.0484 COB",
+     "635.04 COF",
+     "635.048 COL",
+     "635 CO",
+     "635.048 MAR",
+     "635.048 MIL",
+     "635.04 COL",
+     "635.0 COM",
+     "635 CAM"
+    ],
+    "uncertain": [
+     "635 ROS",
+     "635.0 ROG",
+     "635.0 ROG",
+     "635 ULA",
+     "635.0 HEM",
+     "635 MIL",
+     "635.0 SIM",
+     "635 SIM",
+     "635 VIA",
+     "635 BEL",
+     "635 BEL",
+     "635.048 BEN",
+     "635 CO",
+     "635 CAM",
+     "635.04 COF"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195911082.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635.04 MOS",
+     "635.04 NOW",
+     "635.04 ROG",
+     "635.0 ROS",
+     "635.0 ROG",
+     "635.04 ROG",
+     "635.043 SMI",
+     "635.04 SMI",
+     "635.0 HEM",
+     "635.048 MCL",
+     "635 MIL",
+     "635 SIM",
+     "635.0 SIM",
+     "635.0 VIA",
+     "635.0483 BRO",
+     "635.04 BAK",
+     "635.0 BEL",
+     "635.0 BEL",
+     "635.0484 BIG",
+     "635.048 BEN",
+     "635.048 COB",
+     "635.04 COF",
+     "635.048 COL",
+     "635.0 COX",
+     "635.048 MAR",
+     "635.048 MIL",
+     "635.04 COL",
+     "635.0 COM"
+    ],
+    "uncertain": [
+     "635.0 ROS",
+     "635.0 HEM",
+     "635.0 COX",
+     "635.04 COF"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "635.0 COR",
+     "635.04 ESP",
+     "635.0 FER",
+     "635.048 GRE",
+     "635.0484 HOU",
+     "635.04 LAM",
+     "635.0484 MAR",
+     "635.0484 MAR",
+     "635.04 MAY",
+     "635.0 MCM",
+     "635.048 MUR",
+     "635.0 REE",
+     "635.0484 ROD",
+     "635.0484 ROD",
+     "(unreadable)",
+     "635.048 YAR",
+     "(unreadable)",
+     "(unreadable)",
+     "(unreadable)",
+     "635.0484 WAL",
+     "635.0484 WAL",
+     "635.0484 WAL"
+    ],
+    "uncertain": [
+     "635.0 COR",
+     "635.04 LAM",
+     "635.0 MCM",
+     "(unreadable)",
+     "635.048 YAR",
+     "(unreadable)",
+     "(unreadable)",
+     "(unreadable)",
+     "635.0 FER",
+     "635.0 REE"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_200004299.MP.jpg": {
+  "section": "fiction",
+  "rows": [
+   {
+    "row": 1,
+    "labels": [
+     "VODOLAZKI, Eugene",
+     "VON ARNIM, Elizab",
+     "VON ARNIM, Elizabeth",
+     "VON KREISLER, Kristin",
+     "VON KREISLER, Kristin",
+     "VON ZIEGESAR, ZIE cecily",
+     "VONNE NNE, Kurt",
+     "VONNE, Kurt",
+     "VON",
+     "VONNEG",
+     "VONNEG",
+     "VONNEGUT, Kurt",
+     "VONNEGU, Kur+",
+     "VONNEGUT, Kurt",
+     "VONNEGU, Kurt",
+     "VONNEGUT, Kurt",
+     "VONNEGUT, Kurt",
+     "VONNE, Kurt",
+     "VONNEGUT, Kurt"
+    ],
+    "uncertain": [
+     "VON",
+     "VONNEG",
+     "VONNEG"
+    ]
+   },
+   {
+    "row": 2,
+    "labels": [
+     "VREELA, Susan",
+     "VREELAND, Susan",
+     "VREELAND, Susan",
+     "VROMEN, Galina",
+     "VUONG, Ocean",
+     "VUONG, Ocean",
+     "VUONG, Ocean",
+     "VUONG, Ocean",
+     "VUONG, Ocean",
+     "WACHMAN, Sam",
+     "WACHTEL, Shirley Russak",
+     "WACHTEL, Shirley Russak",
+     "WACLAWIAK, Karolina",
+     "WADE WADE, Becky",
+     "WADE, Becky",
+     "WADE, Becky"
+    ],
+    "uncertain": []
+   },
+   {
+    "row": 4,
+    "labels": [
+     "WADE, James",
+     "WAGAMESE, Richard",
+     "WAGAMESE, Richard",
+     "WAGGONER, Tim",
+     "WAGGONER, Tim",
+     "WAGGONER, Tim",
+     "WAGNER, Bruce",
+     "WAGNER, Bruce",
+     "WAHEED, Mirza",
+     "WAHLGREN, Anna E.",
+     "WAHRER, Caitlin",
+     "WAID, Isabel",
+     "WAIT, Rebecca",
+     "WAIT, Rebecca",
+     "WAITE, Jen",
+     "WAITES, Martyn",
+     "WAITES, Martyn",
+     "WAKE, Jules",
+     "WAK, Vikk"
+    ],
+    "uncertain": []
+   }
+  ]
+ },
+ "PXL_20260607_200006014.jpg": {
+  "section": "fiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "WAGGONER, Tim",
+     "WAGGONER, Tim",
+     "WAGGONER, Tim",
+     "WAGNER, Bruce",
+     "WAGNER, Bruce",
+     "WAHEED, Mirza",
+     "WAHLGREN, Anna E.",
+     "WAHRER, Caitlin",
+     "WAIDN",
+     "WAIT, Rebecca",
+     "WAIT, Rebecca",
+     "WAITE, Jen",
+     "WAITES, Maryn",
+     "WAITES, Martyn",
+     "WAKE, Jules",
+     "WAKEFIELD, Vikki",
+     "WALBER Kate ALDE",
+     "WALBERT, Kate",
+     "WALDFOG, Sabra",
+     "WALDHERR, Kris",
+     "WALDMAN, Adelle",
+     "WALDMAN, Adelle",
+     "WADE, James",
+     "WAGAMESE, Richard"
+    ],
+    "uncertain": [
+     "WAIDN",
+     "WALBER Kate ALDE",
+     "WALDFOG, Sabra"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "WALLACE, David Foster",
+     "WALDMAN, Amy",
+     "WALDON, Lacie",
+     "WALDON, Lacie",
+     "WALDON, Lacie",
+     "WALKER, Alice Alice",
+     "WALKER, Alice",
+     "WALKER, Ann Marie",
+     "WALKER, Ann Marie",
+     "WALKER, Boo",
+     "WALKER, Carlie",
+     "WALKER, Carlie",
+     "WALKER, Caroline",
+     "WALKER, Harriet",
+     "WALKER, Karen Thompson",
+     "WALKER, Karen Thompson",
+     "WALKER, Karen Thompson",
+     "WALKER, Karen Thompson",
+     "WALKER, Karen Thompson",
+     "WALKER, Megan",
+     "WALKER, Megan",
+     "WALKER, Megan"
+    ],
+    "uncertain": []
+   }
+  ]
+ }
+}

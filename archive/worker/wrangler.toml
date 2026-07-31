@@ -1,0 +1,6 @@
+name            = "shelfcheck-ocr-proxy"
+main            = "index.js"
+compatibility_date = "2024-09-23"
+
+# OCRSPACE_API_KEY is stored as a secret (not here).
+# Set it once with:  wrangler secret put OCRSPACE_API_KEY

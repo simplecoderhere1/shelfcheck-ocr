@@ -1,0 +1,570 @@
+{
+ "_notes": "Human-verified GT (Claude vision, June 2026). Labels in physical left→right order per row. 'uncertain' lists labels where the sticker was partially obscured or too small to read confidently — these are excluded from the recall denominator but kept for ordering checks.",
+ "PXL_20260607_195849222.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "641.5676 SAL",
+     "641.5676 SAR",
+     "641.5676 SET",
+     "641.5676 SHO",
+     "641.5676 SIV",
+     "641.5676 STR",
+     "641.5676 TWI",
+     "641.5676 ZUS",
+     "641.5677 HEL",
+     "641.568 ALL",
+     "641.568 ALL",
+     "641.568 AMI",
+     "641.568 BAT",
+     "641.568 CRA",
+     "641.568 CUL",
+     "641.568 DEA",
+     "641.568 GAL",
+     "641.568 GAL",
+     "641.568 GAL"
+    ],
+    "uncertain": [
+     "641.5676 SHO",
+     "641.5676 SIV"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "641.566 MAL",
+     "641.566 MIC",
+     "641.568 OLS",
+     "641.568 OSO",
+     "641.568 POT",
+     "641.568 PRO",
+     "641.568 ROS",
+     "641.568 ROS",
+     "641.568 SHE",
+     "641.568 SIF",
+     "641.568 TAS",
+     "641.568 TAS",
+     "641.568 TAS",
+     "641.568 TED",
+     "641.568 WAL",
+     "641.568 WOO"
+    ],
+    "uncertain": [
+     "641.566 MIC"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195853918.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "641.5686 COM",
+     "641.5686 DEV",
+     "641.5686 FOR",
+     "641.5686 FOR",
+     "641.5686 GEI",
+     "641.5686 GOO",
+     "641.5686 GOO",
+     "641.5686 HAV",
+     "641.5686 JOH",
+     "641.5686 KLY",
+     "641.5686 LAI",
+     "641.5686 LAW",
+     "641.5686 OLI",
+     "641.5686 ROM",
+     "641.5686 ROM",
+     "641.5686 RUT",
+     "641.5686 SIM",
+     "641.5686 SOU",
+     "641.5686 STI",
+     "641.5686 TAS"
+    ],
+    "uncertain": [
+     "641.5686 SOU",
+     "641.5686 STI"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195858362.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635 DON",
+     "635 DOU",
+     "635 DOW",
+     "635 EAS",
+     "635 ECK",
+     "635 EDD",
+     "635 EDW",
+     "635 ELZ",
+     "635 ENC",
+     "635 ESP",
+     "635 FAR",
+     "635 FIN",
+     "635 FOR",
+     "635 FOR",
+     "635 FRO",
+     "635 GAL",
+     "635 GAR",
+     "635 GAR",
+     "635 GET",
+     "635 GIA",
+     "635 GIL"
+    ],
+    "uncertain": [
+     "635 EAS",
+     "635 ECK",
+     "635 ESP",
+     "635 GAL",
+     "635 GIA"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "635 GOO",
+     "635 GRO",
+     "635 GRO",
+     "635 GRO",
+     "635 HAR",
+     "635 HEI",
+     "635 HOM",
+     "635 HOM",
+     "635 JAB",
+     "635 JAB",
+     "635 JAB",
+     "635 JEW",
+     "635 JOH",
+     "635 KAR",
+     "635 KAR",
+     "635 KIA",
+     "635 KLE",
+     "635 KOS",
+     "635 LAU",
+     "635 LAV",
+     "635 LOA"
+    ],
+    "uncertain": [
+     "635 GOO",
+     "635 GIA",
+     "635 JOH",
+     "635 KIA"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195901698.MP.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635 BOH",
+     "635 BRE",
+     "635 BUC",
+     "635 BUR",
+     "635 BUR",
+     "635 CAR",
+     "635 CER",
+     "635 CHA",
+     "635 CHI",
+     "635 COL",
+     "635 COL",
+     "635 COP",
+     "635 COU",
+     "635 DAM",
+     "635 DAM",
+     "635 DEA",
+     "635 DEL",
+     "635 DER"
+    ],
+    "uncertain": [
+     "635 BRE",
+     "635 CER",
+     "635 CHI",
+     "635 COU"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "635 DON",
+     "635 DOU",
+     "635 DOW",
+     "635 EDD",
+     "635 EDW",
+     "635 ELZ",
+     "635 ENC",
+     "635 ESP",
+     "635 FAR",
+     "635 FIN",
+     "635 FOR",
+     "635 FOR",
+     "635 FRO",
+     "635 GAL",
+     "635 GAR",
+     "635 GAR",
+     "635 GET",
+     "635 GIA",
+     "635 GIL"
+    ],
+    "uncertain": [
+     "635 EDD",
+     "635 ELZ",
+     "635 GAL",
+     "635 GIA"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195903035.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635 BAK",
+     "635 BOH",
+     "635 BRE",
+     "635 BUC",
+     "635 BUR",
+     "635 BUR",
+     "635 CAL",
+     "635 CAR",
+     "635 CER",
+     "635 CHA",
+     "635 CHI",
+     "635 GAR",
+     "635 COL",
+     "635 COL",
+     "635 COP",
+     "635 COR",
+     "635 COU",
+     "635 DAM",
+     "635 DAM",
+     "635 DEA",
+     "635 DEL",
+     "635 DER"
+    ],
+    "uncertain": [
+     "635 BRE",
+     "635 CER",
+     "635 COU",
+     "635 BAK"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195907424.jpg": {
+  "section": "nonfiction",
+  "ordering_notes": "WHI (pos 4) before WHA (pos 5) — WHA < WHI alphabetically, may be genuine shelving error",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635 WEA",
+     "635 WEA",
+     "635 WEI",
+     "635 WHI",
+     "635 WHA",
+     "635 WIL",
+     "635 YOE",
+     "635 ZAC",
+     "635 ZIE",
+     "635 ZIE",
+     "635 ZIE",
+     "635 ZON",
+     "635.01 ROA",
+     "635.01 ROA",
+     "635.02 EDW",
+     "635.0222 MUS",
+     "635.0222 WOO",
+     "635.03 HOL",
+     "635.03 AME",
+     "635.03 ENC"
+    ],
+    "uncertain": [
+     "635 WHA",
+     "635 ZIE",
+     "635 ZIE",
+     "635 ZIE",
+     "635.03 HOL"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195909571.MP.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635.04 CAR",
+     "635.04 MOS",
+     "635.04 NOW",
+     "635.04 ROS",
+     "635.04 ROG",
+     "635.04 ROG",
+     "635.04 BLA",
+     "635.04 SMI",
+     "635.04 SMI",
+     "635.04 HEM",
+     "635.048 MCL",
+     "635.048 MIL",
+     "635.048 SIM",
+     "635.048 SIM",
+     "635.0483 BRO",
+     "635.0483 VIA",
+     "635.0483 BAK",
+     "635.0484 BEL",
+     "635.0484 BIG",
+     "635.0484 BEN",
+     "635.0484 COB",
+     "635.0484 COF",
+     "635.0484 COL",
+     "635.0484 MAR",
+     "635.0484 MIL",
+     "635.0484 COM"
+    ],
+    "uncertain": [
+     "635.04 CAR",
+     "635.04 MOS",
+     "635.04 ROS",
+     "635.04 BLA",
+     "635.0483 VIA",
+     "635.0484 BEL",
+     "635.0484 BEN",
+     "635.0484 COL",
+     "635.0484 COM"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_195911082.jpg": {
+  "section": "nonfiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "635.04 CAR",
+     "635.04 MOS",
+     "635.04 NOW",
+     "635.04 ROS",
+     "635.04 ROG",
+     "635.04 ROG",
+     "635.04 BLA",
+     "635.04 SMI",
+     "635.04 SMI",
+     "635.04 HEM",
+     "635.048 MCL",
+     "635.048 MIL",
+     "635.048 SIM",
+     "635.048 SIM",
+     "635.0483 BRO",
+     "635.0483 VIA",
+     "635.0483 BAK",
+     "635.0484 BEL",
+     "635.0484 BIG"
+    ],
+    "uncertain": [
+     "635.04 CAR",
+     "635.04 MOS",
+     "635.04 ROS",
+     "635.04 BLA",
+     "635.0483 VIA",
+     "635.0484 BEL"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "635.0484 PER",
+     "635.04 MAR",
+     "635.04 MAY",
+     "635.0484 REE",
+     "635.0484 MUR",
+     "635.0484 ROD",
+     "635.0484 ROD",
+     "635.0484 BIO",
+     "635.0484 MCG",
+     "635.0484 HOW",
+     "635.0484 SEV",
+     "635.0484 COF",
+     "635.0484 FAR",
+     "635.0484 HIG",
+     "635.0484 REI"
+    ],
+    "uncertain": [
+     "635.0484 PER",
+     "635.04 MAR",
+     "635.04 MAY",
+     "635.0484 REE",
+     "635.0484 MUR",
+     "635.0484 ROD",
+     "635.0484 BIO",
+     "635.0484 MCG",
+     "635.0484 HOW",
+     "635.0484 SEV",
+     "635.0484 COF",
+     "635.0484 FAR",
+     "635.0484 HIG",
+     "635.0484 REI"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_200004299.MP.jpg": {
+  "section": "fiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "VON ARNIM, Elizabeth",
+     "VON KREISLER, Kristin",
+     "VON KREISLER, Kristin",
+     "VON REINHOLD, Shola",
+     "VON ZIEGESAR, Cecily",
+     "VON ZIEGESAR, Cecily",
+     "VON ZIEGESAR, Cecily",
+     "VONNEGUT, Kurt",
+     "VONNEGUT, Kurt",
+     "VONNEGUT, Kurt",
+     "VONNEGUT, Kurt",
+     "VONNEGUT, Kurt",
+     "VONNEGUT, Kurt",
+     "VONNEGUT, Kurt"
+    ],
+    "uncertain": [
+     "VON ARNIM, Elizabeth",
+     "VON KREISLER, Kristin",
+     "VON KREISLER, Kristin"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "VREELAND, Susan",
+     "VREELAND, Susan",
+     "VROMEN, Galina",
+     "VUONG, Ocean",
+     "VUONG, Ocean",
+     "VUONG, Ocean",
+     "VUONG, Ocean",
+     "WACHMAN, Sam",
+     "WACHTEL, Shirley Russan",
+     "WACHTEL, Shirley Russan",
+     "WACLAWSKA, Karolina",
+     "WADE, Becky",
+     "WADE, Becky",
+     "WADE, Becky"
+    ],
+    "uncertain": [
+     "WACLAWSKA, Karolina"
+    ]
+   },
+   {
+    "row": 2,
+    "labels": [
+     "WADE, James",
+     "WAGAMESE, Richard",
+     "WAGAMESE, Richard",
+     "WAGGONER, Tim",
+     "WAGGONER, Tim",
+     "WAGGONER, Tim",
+     "WAGNER, Bruce",
+     "WAHEED, Mirza",
+     "WAHLGREN, Anna E.",
+     "WAHRER, Caitlin",
+     "WAIT, Isabelle",
+     "WAIT, Rebecca",
+     "WAITE, Jen",
+     "WAITES, Martyn",
+     "WAITES, Martyn",
+     "WAITES, Martyn",
+     "WAKE, Jules"
+    ],
+    "uncertain": [
+     "WAIT, Isabelle",
+     "WAIT, Rebecca"
+    ]
+   }
+  ]
+ },
+ "PXL_20260607_200006014.jpg": {
+  "section": "fiction",
+  "rows": [
+   {
+    "row": 0,
+    "labels": [
+     "WADE, James",
+     "WAGAMESE, Richard",
+     "WAGAMESE, Richard",
+     "WAGGONER, Tim",
+     "WAGGONER, Tim",
+     "WAGGONER, Tim",
+     "WAGNER, Bruce",
+     "WAHEED, Mirza",
+     "WAHLGREN, Anna E.",
+     "WAHRER, Caitlin",
+     "WAIT, Isabelle",
+     "WAIT, Rebecca",
+     "WAITE, Jen",
+     "WAITES, Martyn",
+     "WAITES, Martyn",
+     "WAKE, Jules",
+     "WAKEFIELD, Kate",
+     "WAKEFIELD, Kate",
+     "WALBER, Kate",
+     "WALBER, Kate",
+     "WALDFOGEL, Kris",
+     "WALDMAN, Adelle",
+     "WALDMAN, Adelle"
+    ],
+    "uncertain": [
+     "WAIT, Isabelle",
+     "WAIT, Rebecca",
+     "WALBER, Kate",
+     "WALBER, Kate"
+    ]
+   },
+   {
+    "row": 1,
+    "labels": [
+     "WALLACE, David Foster",
+     "WALDMAN, Amy",
+     "WALDON, Lacie",
+     "WALDON, Lacie",
+     "WALKER, Alice",
+     "WALKER, Alice",
+     "WALKER, Alice",
+     "WALKER, Ann Marie",
+     "WALKER, Ann Marie",
+     "WALKER, Boo",
+     "WALKER, Boo",
+     "WALKER, Boo",
+     "WALKER, Carlie",
+     "WALKER, Carlie",
+     "WALKER, Caroline Louise",
+     "WALKER, Harriet",
+     "WALKER, Karen Thompson",
+     "WALKER, Karen Thompson",
+     "WALKER, Karen Thompson",
+     "WALKER, Megan",
+     "WALKER, Morgan"
+    ],
+    "uncertain": [
+     "WALKER, Megan",
+     "WALKER, Morgan"
+    ]
+   }
+  ]
+ }
+}

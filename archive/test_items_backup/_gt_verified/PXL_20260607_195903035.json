@@ -1,0 +1,33 @@
+{
+  "image": "PXL_20260607_195903035.jpg",
+  "section": "nonfiction",
+  "labels": [
+    {"n": 1, "verdict": "ok", "text": "635 BAK"},
+    {"n": 2, "verdict": "ok", "text": "635 BOH"},
+    {"n": 3, "verdict": "ok", "text": "635 BRE"},
+    {"n": 4, "verdict": "ok", "text": "635 BUC"},
+    {"n": 5, "verdict": "ok", "text": "635 BUR"},
+    {"n": 6, "verdict": "ok", "text": "635 BUR"},
+    {"n": 7, "verdict": "ok", "text": "635 BUR"},
+    {"n": 8, "verdict": "ok", "text": "635 CAL"},
+    {"n": 9, "verdict": "ok", "text": "635 CAR"},
+    {"n": 10, "verdict": "ok", "text": "635 CER"},
+    {"n": 11, "verdict": "ok", "text": "635 CHA"},
+    {"n": 12, "verdict": "ok", "text": "635 CHI"},
+    {"n": 13, "verdict": "ok", "text": "635 GAR"},
+    {"n": 14, "verdict": "ok", "text": "635 COL"},
+    {"n": 15, "verdict": "ok", "text": "635 COL"},
+    {"n": 16, "verdict": "corrected", "text": "635 CON", "note": "The sticker is real but is on the extreme edge of the spine (heavily foreshortened by the camera angle). It clearly reads '635 CON', three letters, not '635 ICON'. Confirmed by zooming the full-resolution source image."},
+    {"n": 17, "verdict": "ok", "text": "635 COP"},
+    {"n": 18, "verdict": "ok", "text": "635 COR"},
+    {"n": 19, "verdict": "ok", "text": "635 COU"},
+    {"n": 20, "verdict": "ok", "text": "635 DAM"},
+    {"n": 21, "verdict": "ok", "text": "635 DAM"},
+    {"n": 22, "verdict": "ok", "text": "635 DEA"},
+    {"n": 23, "verdict": "ok", "text": "635 DEL"},
+    {"n": 24, "verdict": "ok", "text": "635 DER"}
+  ],
+  "missing": [],
+  "garFinding": "The GAR sticker (box 13, '635 GAR') sits directly between box 12 ('635 CHI') and box 14 ('635 COL') with no other book in between. Alphabetically GAR belongs after COU, not right after CHI/before COL, so this book is confirmed out of order on the shelf, filed between CHI and COL exactly as suspected.",
+  "confidence": "High confidence for boxes 1-24: every ringed/boxed sticker in seg1 and seg2 was checked against a zoomed crop and matches one-to-one with the plan text, with the single correction at box 16 (real sticker reading '635 CON', misread by automation as '635 ICON' due to the extreme foreshortening of that spine edge). Coverage of seg1/seg2 is complete book-by-book with no gaps, so no missed stickers were found there. Segments 3 and 4 (the remainder of the shelf past box 24) are severely out of focus/motion-blurred in the source photos - no sticker text is legible in that region at all, so I could not verify or find any labels there; this is a limitation of the source photo, not something I skimmed past."
+}
