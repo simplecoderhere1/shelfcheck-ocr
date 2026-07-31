@@ -2108,7 +2108,10 @@
           const t = (wd.text || '').trim();
           if (!t || !wd.boundingPolygon?.length) continue;
           const b = azureBox(wd.boundingPolygon);
-          words.push({ t, x: b.x, y: b.y, w: b.w, h: b.h });
+          // Carry Azure's per-word confidence. Without it every read defaults to
+          // 0.9, so nothing is ever marked unclear and the closer-look pass has
+          // no candidates to re-read — the second pass silently does nothing.
+          words.push({ t, x: b.x, y: b.y, w: b.w, h: b.h, c: wd.confidence ?? 0.9 });
         }
       }
     }
@@ -2186,6 +2189,42 @@
   const RX_NUM3     = /^\d{3}$/;
   const RX_DEC      = /^[.,](\d+)$/;
   const RX_CUTTER   = /^[A-Za-z]{2,4}$/;
+
+  // ── Azure reconstruction tunables ────────────────────────────────────────
+  // Azure returns ~350 disconnected words with pixel boxes, not assembled
+  // labels. Re-attaching each number to its own author tag on a packed shelf —
+  // forty spines all reading "635", stickers ~30px apart — is the core problem,
+  // and these are the constants that were swept against the cached responses in
+  // test_items/azure_tiled. The shared reconstructNonfiction above is tuned to
+  // ocr.space's word geometry and only assembles about half the labels from
+  // Azure's, which is why Azure gets its own reconstructor rather than a
+  // retuned shared one.
+  //
+  // How far sideways a cutter may sit from its number, in units of text height,
+  // ON TOP of the shared width term.
+  const AZ_CUT_DX_H = 3.0;
+  // Below this Azure word confidence a call number is more likely wrong than
+  // right, so the label is marked unclear rather than trusted.
+  const AZ_MIN_NUM_CONF = 0.70;
+  // Cutter shapes Azure actually emits. Looser than RX_CUTTER because Azure
+  // reads lowercase tags and swaps letters for digits on small text.
+  const AZ_RX_CUTTER = /^[A-Z][A-Z'.-]{1,3}$/;
+
+  // "Look closer" second pass. Azure reads a lone sticker far better than the
+  // same sticker inside a photo of a packed shelf — measured, "635 BUC" comes
+  // back as 655/535 on the full frame and "635" at 0.99 once cropped out, with
+  // NO upscaling. So the pass is about ISOLATION, not resolution.
+  const AZ_ZOOM_MIN_CONF = 0.80;   // a re-read below this is not trusted
+  const AZ_ZOOM_MAX      = 36;     // cap crops per sheet (one Azure call)
+  const AZ_ZOOM_CENTRE   = 0.22;   // re-read number must be near the cell centre
+  const AZ_ZOOM_CUT_DX   = 1.5;    // tag must sit this close under its number
+
+  // Truncation test: is there ink to the RIGHT of the number, i.e. digits that
+  // ran off the curve of the spine? A first-hit scan fired on the sticker's own
+  // border, so this measures a column ink PROFILE and stops at a solid wall.
+  const AZ_INK_MIN      = 0.65;
+  const AZ_INK_WALL     = 0.85;
+  const AZ_INK_WALL_RUN = 4;
 
   // AZURE RECONSTRUCTION — unfinished, see memory. Azure's raw text is good
   // (16 of 17 label parts present on the shelf that fails worst, deep decimals
@@ -2287,6 +2326,382 @@
 
     // Bare numbers without a cutter can't be ordered — drop as noise.
     return labels.filter(l => l.cut);
+  }
+
+  // ── Azure nonfiction reconstruction ──────────────────────────────────────
+  // The nonfiction twin of reconstructFictionAzure, and it exists for the same
+  // reason: the SHARED reconstructNonfiction was tuned to ocr.space's output
+  // shape and silently drops labels Azure has already read. Measured on the
+  // cached responses, routing Azure through the shared reconstructor assembles
+  // ~56% of the labels; this one reaches ~97%.
+
+  // Merge the full-frame word set with the words read from native-resolution
+  // tiles. `s` scales tile coordinates (native) into the full frame's space.
+  // Tiles are additive only: a word the full frame already found is not
+  // duplicated, but one only the tiles saw is kept.
+  function mergeAzureWordSets(full, tiles, s) {
+    if (!tiles || !tiles.length) return full;
+    const out = full.slice();
+    const iou = (a, b) => {
+      const ix = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+      const iy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+      if (ix <= 0 || iy <= 0) return 0;
+      const inter = ix * iy;
+      return inter / (a.w * a.h + b.w * b.h - inter);
+    };
+    for (const w of tiles) {
+      const t = { ...w, x: w.x * s, y: w.y * s, w: w.w * s, h: w.h * s };
+      if (out.some(o => o.t === t.t && iou(o, t) >= 0.5)) continue;
+      out.push(t);
+    }
+    return out;
+  }
+
+  // One physical word can come back twice — once from the full frame and once
+  // from a tile, at slightly different boxes and sometimes different text
+  // ("635" and "635.048"). Both then compete in the pairing race below and the
+  // worse one can win a cutter that belonged to its neighbour. Collapse
+  // overlapping reads of the SAME KIND (number vs letters) first, preferring
+  // the longer read.
+  function dedupeWordReads(words) {
+    const kind = w => /^\d/.test(w.t) ? 'n' : /^[A-Za-z]+$/.test(w.t) ? 'a' : null;
+    const overlapMin = (a, b) => {
+      const ix = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+      const iy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+      if (ix <= 0 || iy <= 0) return 0;
+      return (ix * iy) / Math.max(1, Math.min(a.w * a.h, b.w * b.h));
+    };
+    const keep = [];
+    for (const w of words) {
+      const k = kind(w);
+      if (k === null) { keep.push(w); continue; }
+      const i = keep.findIndex(o => kind(o) === k && overlapMin(o, w) >= 0.55);
+      if (i < 0) { keep.push(w); continue; }
+      const dup = keep[i];
+      const better = w.t.length !== dup.t.length
+        ? w.t.length > dup.t.length
+        : (w.c ?? 0.9) > (dup.c ?? 0.9);
+      if (better) keep[i] = w;
+    }
+    return keep;
+  }
+
+  // Is there ink to the RIGHT of this number — digits that ran off the curve of
+  // the spine? Asking "is there any dark pixel at all" fired on the sticker's
+  // own printed border, so measure a column ink profile: stop at the first
+  // solid vertical wall (the border), and only count a peak before it.
+  function inkRightOfNumber(ctx, numBox) {
+    if (!numBox) return false;
+    const [x, y, w, h] = numBox;
+    const bx = Math.round(x + w), by = Math.round(y);
+    const bw = Math.round(h * 1.6), bh = Math.round(h);
+    if (bw < 2 || bh < 2) return false;
+    let band;
+    try { band = ctx.getImageData(bx, by, bw, bh).data; } catch { return false; }
+    const cut = 110;
+    const prof = [];
+    for (let cx = 0; cx < bw; cx++) {
+      let dark = 0;
+      for (let cy = 0; cy < bh; cy++) if (band[(cy * bw + cx) * 4] < cut) dark++;
+      prof.push(dark / bh);
+    }
+    let endAt = bw, run = 0;
+    for (let cx = 0; cx < bw; cx++) {
+      run = prof[cx] > AZ_INK_WALL ? run + 1 : 0;
+      if (run >= AZ_INK_WALL_RUN) { endAt = cx - run + 1; break; }
+    }
+    for (let cx = 0; cx < endAt; cx++) if (prof[cx] >= AZ_INK_MIN) return true;
+    return false;
+  }
+
+  // Consensus MARKING, never repair. Books shelved together share a class
+  // number and OCR truncates the decimal on some stickers, so a "635.04" among
+  // several full "635.0484" reads is very likely the same number with digits
+  // that ran off the spine. Marking says "do not judge this one"; rewriting
+  // would put digits on screen that are not in the photograph, and a volunteer
+  // acting on an invented digit is sent to the wrong book.
+  // `gate` is asked, per label, whether the pixels agree that something is cut
+  // off — a consensus alone is not evidence about THIS sticker.
+  function markTruncatedByConsensus(labels, gate) {
+    const counts = new Map();
+    for (const l of labels) counts.set(l.num, (counts.get(l.num) || 0) + 1);
+    for (const l of labels) {
+      const n = l.num;
+      for (const [y, c] of counts) {
+        if (y === n || !y.startsWith(n) || y.length <= n.length) continue;
+        if (c < 2 || c <= counts.get(n)) continue;
+        if (gate && !gate(l)) break;
+        l.truncated = true;
+        break;
+      }
+    }
+  }
+
+  // Two anchors can land on one physical sticker (a full "635.048" and a bare
+  // "635"), producing two labels for one book. Keep the richer read.
+  function dedupeStickerLabels(labels) {
+    const out = [];
+    const overlap = (a, b) => {
+      const ix = Math.min(a.bbox[0] + a.bbox[2], b.bbox[0] + b.bbox[2]) - Math.max(a.bbox[0], b.bbox[0]);
+      const iy = Math.min(a.bbox[1] + a.bbox[3], b.bbox[1] + b.bbox[3]) - Math.max(a.bbox[1], b.bbox[1]);
+      if (ix <= 0 || iy <= 0) return 0;
+      return (ix * iy) / Math.max(1, Math.min(a.bbox[2] * a.bbox[3], b.bbox[2] * b.bbox[3]));
+    };
+    for (const l of labels) {
+      const i = out.findIndex(o => overlap(o, l) >= 0.55 && o.cut === l.cut);
+      if (i < 0) { out.push(l); continue; }
+      const o = out[i];
+      const better = String(l.num).length !== String(o.num).length
+        ? String(l.num).length > String(o.num).length
+        : (l.score ?? 0) > (o.score ?? 0);
+      if (better) out[i] = l;
+    }
+    return out;
+  }
+
+  // keepUnpaired: return anchors that found no author tag as well. runOcr needs
+  // them because the closer-look pass is exactly what rescues them; it filters
+  // them out afterwards. Dropping them first made the second pass unable to see
+  // the very labels it exists to repair.
+  function reconstructNonfictionAzure(words, ctx, keepUnpaired) {
+    const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
+    const maxH = maxDim * 0.022;
+    const small = dedupeWordReads(words.filter(w => w.h <= maxH && w.w >= w.h * 0.5));
+
+    // Orphan decimal tails. Azure splits a call number across two words —
+    // "641." above "568" — and mergeAzureNumberFragments stitches them back
+    // together per response. The TILE pass then reads the same sticker again
+    // and contributes its own loose "568", which arrives after the stitching
+    // has already run. That orphan matches the bare-NNN anchor pattern, so it
+    // becomes a second label reading "568 ALL" beside the correct
+    // "641.568 ALL" — one book counted twice, and the wrong one often wins the
+    // author tag. Drop a number word that is the decimal tail of a full number
+    // sitting on the same sticker.
+    // Dotless split. mergeAzureNumberFragments stitches "641." above "568",
+    // but Azure sometimes drops the point entirely and returns "641" above
+    // "568" as two plain three-digit words. Both then match the bare-NNN anchor
+    // pattern and one sticker becomes two labels ("641 ALL" and "568 ALL"),
+    // which is most of what this photo was losing.
+    //
+    // Geometry alone is NOT enough — tried, and it cost recall by joining a
+    // number to its neighbour's. The join must also be CORROBORATED: the
+    // stitched result has to be a number the shelf has already produced in full
+    // somewhere else. Shelves are runs of near-identical call numbers, so a
+    // genuine split almost always has a fully-read twin nearby, and a wrong
+    // join almost never spells one.
+    const shelfNums = new Set(small.filter(w => RX_NUM_FULL.test(w.t)).map(w => w.t));
+    const stitched = new Set();
+    for (const a of small) {
+      if (stitched.has(a) || !RX_NUM3.test(a.t)) continue;
+      for (const b of small) {
+        if (b === a || stitched.has(b) || !RX_NUM3.test(b.t)) continue;
+        if (!shelfNums.has(a.t + '.' + b.t)) continue;
+        const dy = b.y - (a.y + a.h);
+        if (dy < -a.h * 0.6 || dy > a.h * 2.2) continue;
+        const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+        if (ox / Math.max(1, Math.min(a.w, b.w)) < 0.35) continue;
+        a.t = a.t + '.' + b.t;
+        a.w = Math.max(a.x + a.w, b.x + b.w) - Math.min(a.x, b.x);
+        a.h = Math.max(a.y + a.h, b.y + b.h) - Math.min(a.y, b.y);
+        a.x = Math.min(a.x, b.x); a.y = Math.min(a.y, b.y);
+        a.c = Math.min(a.c ?? 0.9, b.c ?? 0.9);
+        stitched.add(b);
+        break;
+      }
+    }
+    if (stitched.size) {
+      for (let i = small.length - 1; i >= 0; i--) if (stitched.has(small[i])) small.splice(i, 1);
+    }
+
+    const fulls = small.filter(w => RX_NUM_FULL.test(w.t));
+    const insideFull = (w) => fulls.some(f => {
+      if (f === w || f.t.split('.')[1] !== w.t) return false;
+      const ix = Math.min(f.x + f.w, w.x + w.w) - Math.max(f.x, w.x);
+      const iy = Math.min(f.y + f.h, w.y + w.h) - Math.max(f.y, w.y);
+      if (ix <= 0 || iy <= 0) return false;
+      return (ix * iy) / Math.max(1, w.w * w.h) >= 0.4;
+    });
+    const anchors = small.filter(w =>
+      RX_NUM_FULL.test(w.t) || (RX_NUM3.test(w.t) && !insideFull(w)));
+
+    const used = new Set();
+    const labels = [];
+    for (const a of anchors) {
+      if (used.has(a)) continue;
+      const axc = a.x + a.w / 2;
+      let num = a.t;
+      const parts = [a];
+      let curBottom = a.y + a.h;
+
+      // decimal continuation directly below a bare NNN anchor
+      if (RX_NUM3.test(a.t)) {
+        for (const w of small) {
+          if (used.has(w) || w === a) continue;
+          const m = RX_DEC.exec(w.t);
+          if (!m) continue;
+          const wxc = w.x + w.w / 2;
+          if (Math.abs(wxc - axc) <= a.w * 1.2 && w.y - curBottom >= -a.h * 0.3 && w.y - curBottom <= a.h * 2.5) {
+            num = a.t + '.' + m[1];
+            parts.push(w); used.add(w);
+            curBottom = w.y + w.h;
+            break;
+          }
+        }
+      }
+
+      // Nearest cutter below the number. Azure returns one wide token for a full
+      // number ("635.048" as ~82px) where ocr.space returns two narrow ones, so
+      // the sideways tolerance carries a text-HEIGHT term on top of the shared
+      // width term — otherwise a wide number reaches into the neighbouring spine
+      // and steals its tag.
+      //
+      // Scored, not first-match: a strict "lowest dy wins" picks a tag that is
+      // nearer vertically but clearly under the next spine along.
+      const cand = [];
+      for (const w of small) {
+        if (used.has(w) || w === a) continue;
+        const u = w.t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
+        if (!AZ_RX_CUTTER.test(u)) continue;
+        const wxc = w.x + w.w / 2;
+        const dy = w.y - curBottom;
+        const dx = Math.abs(wxc - axc);
+        if (dy < -a.h * 0.5 || dy > a.h * 3.0) continue;
+        if (dx > Math.max(a.w, w.w) * 1.2 + a.h * AZ_CUT_DX_H) continue;
+        // NOTE: a confidence term was added to this score and swept from 0 to 3;
+        // results were identical, and only an absurd weight (50) moved a single
+        // label. The misreads come back just as confident as the good reads, so
+        // confidence cannot separate them here. Reverted, recorded so it is not
+        // retried.
+        cand.push({ a, w, score: Math.abs(dy) / a.h + dx / Math.max(1, a.h) });
+      }
+      cand.sort((p, q) => p.score - q.score);
+      const best = cand[0] || null;
+      let cutter = null;
+      if (best) {
+        cutter = best.w.t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
+        parts.push(best.w); used.add(best.w);
+      }
+      used.add(a);
+
+      const ux = Math.min(...parts.map(p => p.x)),  uy = Math.min(...parts.map(p => p.y));
+      const ur = Math.max(...parts.map(p => p.x + p.w)), ub = Math.max(...parts.map(p => p.y + p.h));
+      if (lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8) < 0.30) continue;
+
+      const conf = Math.min(...parts.map(p => p.c ?? 0.9));
+      labels.push({
+        text: num + (cutter ? ' ' + cutter : ''), num, cut: cutter,
+        truncated: false,
+        unclear: conf < AZ_MIN_NUM_CONF,
+        numBox: [a.x, a.y, a.w, a.h],
+        bbox: [ux, uy, ur - ux, ub - uy],
+        score: conf,
+      });
+    }
+
+    markTruncatedByConsensus(labels, l => inkRightOfNumber(ctx, l.numBox));
+    return dedupeStickerLabels(keepUnpaired ? labels : labels.filter(l => l.cut));
+  }
+
+  // ── "Look closer" second pass ────────────────────────────────────────────
+  // Which stickers is this read shaky on? Those are the ones worth one extra
+  // Azure call, cropped out and read in isolation.
+  function zoomCandidates(labels) {
+    const out = [];
+    labels.forEach((l, i) => {
+      if ((l.score ?? 1) < AZ_MIN_NUM_CONF || !l.cut || l.truncated) out.push(i);
+    });
+    return out;
+  }
+
+  // Looser tag rule for an ISOLATED sticker: with only one label in the cell
+  // there is no neighbouring spine to steal from, so lowercase and
+  // letter-for-digit reads can be accepted where the in-sheet rule would not.
+  function zoomTag(t) {
+    if ((t.match(/[A-Za-z]/g) || []).length < 2) return null;
+    const u = t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
+    return AZ_RX_CUTTER.test(u) ? u : null;
+  }
+
+  // Read one composite sheet back into per-cell {num, cut, conf}.
+  function readZoomCells(words, rects) {
+    return rects.map(([rx, ry, rw, rh]) => {
+      const inCell = words.filter(w => {
+        const cx = w.x + w.w / 2, cy = w.y + w.h / 2;
+        return cx >= rx && cx <= rx + rw && cy >= ry && cy <= ry + rh;
+      });
+      const mid = rx + rw / 2;
+      const nums = inCell.filter(w => /^\d[\d.,]*$/.test(w.t))
+        .sort((a, b) => Math.abs(a.x + a.w / 2 - mid) - Math.abs(b.x + b.w / 2 - mid));
+      const a = nums[0];
+      if (!a) return null;
+      const axc = a.x + a.w / 2;
+      // The crop is centred on ONE sticker, so a number off to the side belongs
+      // to a neighbour that crept into the frame. Without this the pass rewrote
+      // a correct "635 COR" to "635 COU" by locking onto the sticker next door.
+      if (Math.abs(axc - mid) > rw * AZ_ZOOM_CENTRE) return null;
+
+      let num = a.t.replace(/,$/, '');
+      const parts = [a];
+      let bottom = a.y + a.h;
+      for (const w of inCell) {
+        if (w === a) continue;
+        const m = RX_DEC.exec(w.t);
+        if (!m) continue;
+        if (Math.abs(w.x + w.w / 2 - axc) <= a.w * 1.5 &&
+            w.y - bottom >= -a.h * 0.4 && w.y - bottom <= a.h * 2.0) {
+          num += '.' + m[1];
+          parts.push(w);
+          bottom = w.y + w.h;
+          break;
+        }
+      }
+      const cut = inCell.filter(w => zoomTag(w.t) &&
+          w.y - bottom >= -a.h * 0.8 && w.y - bottom <= a.h * 3 &&
+          Math.abs(w.x + w.w / 2 - axc) <= a.h * AZ_ZOOM_CUT_DX)
+        .sort((p, q) => p.y - q.y)[0];
+      const all = cut ? parts.concat([cut]) : parts;
+      return { num, cut: cut ? zoomTag(cut.t) : null,
+               conf: Math.min(...all.map(w => w.c ?? 0.9)) };
+    });
+  }
+
+  // Do two reads of the same sticker refer to the same number? Equal, one a
+  // prefix of the other (a longer read completing a truncation), or differing
+  // in exactly one digit (a single glyph confusion).
+  function numbersAgree(a, b) {
+    if (a === b || a.startsWith(b) || b.startsWith(a)) return true;
+    if (a.length !== b.length) return false;
+    let d = 0;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i] && ++d > 1) return false;
+    return d === 1;
+  }
+
+  // Fold the isolated re-reads back in — conservatively. The pass is allowed to
+  // sharpen a shaky read, never to invent a different book.
+  function mergeZoomReads(labels, idxs, reads) {
+    let fixed = 0;
+    idxs.forEach((li, ci) => {
+      const l = labels[li], r = reads[ci];
+      if (!l || !r || !r.num) return;
+      if ((r.conf ?? 0) < AZ_ZOOM_MIN_CONF) return;
+      // Without this the pass rewrote a correct "632 BEL" to "635.4 BEL" at 0.98
+      // because a same-tag neighbour corroborated it.
+      if (!numbersAgree(String(l.num), String(r.num))) return;
+      if (!r.cut && !l.cut) return;
+      // A closer look may LENGTHEN a tag but never shorten one: it shortened a
+      // correct "641.56 AMI" to "641.56 AM".
+      const cut = l.cut && r.cut && l.cut.startsWith(r.cut) ? l.cut : (r.cut || l.cut);
+      const num = r.num;
+      if (num === l.num && cut === l.cut) {
+        if ((r.conf ?? 0) > (l.score ?? 0)) { l.score = r.conf; l.unclear = false; fixed++; }
+        return;
+      }
+      l.num = num; l.cut = cut; l.text = num + ' ' + cut;
+      l.score = Math.max(l.score ?? 0, r.conf);
+      l.unclear = false;
+      fixed++;
+    });
+    return fixed;
   }
 
   // Fiction stickers are 2–3 stacked short lines: SURNAME / First (or VON /
