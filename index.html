@@ -2328,6 +2328,76 @@
     return labels.filter(l => l.cut);
   }
 
+  // Does this text have the SHAPE of a label this library issues?
+  //
+  // Measured over every label in the ground-truth key:
+  //   • 132 of 132 nonfiction cutters are exactly three letters. Not two, not
+  //     four — so "635 AK" (a B cropped off by the frame edge) and "635 ICON"
+  //     (a foreshortened "635 CON") are both structurally impossible.
+  //   • A fiction sticker is an ALL-CAPS surname over a mixed-case given name:
+  //     "WAGGONER / Tim". The case change is the reliable signal, NOT the comma
+  //     — the comma is on the sticker but the assembler joins the two lines with
+  //     a space, and Azure often reads it as a full stop anyway. Requiring one
+  //     demoted 90% of real fiction reads, including the genuinely misfiled
+  //     "WALLACE. David Foster" this app exists to catch.
+  //   • Real fiction surnames run 4 to 9 characters. An extra ALL-CAPS word, a
+  //     repeated token, or a surname outside 3..14 means two stickers welded
+  //     together ("WACCIONES WAGGONS", "WALBER Kate ALDE", "IPEINHOLNZIEGESAR")
+  //     or a fragment ("VED", "VON AI Elizabe").
+  //
+  // This is a local convention, not a universal one. Re-derive it before
+  // pointing the app at a library that files differently.
+  const PLAUSIBLE_NF = /^\s*\d{1,3}(?:\.\d+)?\s+[A-Za-z]{3}\s*$/;
+  const PLAUSIBLE_PREFIXES = new Set([
+    'de','del','dela','di','du','la','le','les','lo','mac','mc',
+    'o','van','von','st','san','santa','el','al','bin','ibn','da','das','dos',
+  ]);
+  function labelPlausible(text, section) {
+    const t = String(text || '').trim();
+    if (!t) return false;
+    if (section !== 'fiction') {
+      // Volume/year suffixes are part of the shelf's own vocabulary
+      // ("641.568 SOU 2019"), so strip a trailing number before testing.
+      return PLAUSIBLE_NF.test(t.replace(/\s+(?:v\.?\s*)?\d{1,4}\s*$/i, ''));
+    }
+    // Comma or full stop after the surname is optional — treat both as a plain
+    // separator and split on whitespace.
+    const toks = t.replace(/[,.]/g, ' ').split(/\s+/).filter(Boolean);
+    if (toks.length < 2) return false;              // "VED", "WAIDN": no given name
+    const isUpper = w => w === w.toUpperCase() && /[A-Z]/.test(w);
+
+    // A trailing single letter is a middle initial ("WAHLGREN, Anna E."), which
+    // would otherwise scan as ALL-CAPS and be mistaken for part of the surname.
+    // Only when something precedes the given name — on its own a lone initial
+    // is a half-read sticker ("WAGGONER T"), not a name.
+    if (toks.length > 2 && toks[toks.length - 1].length === 1) toks.pop();
+
+    // The given name is the trailing run of tokens that are not ALL-CAPS.
+    let i = toks.length;
+    while (i > 0 && !isUpper(toks[i - 1])) i--;
+    const given = toks.slice(i);
+    const sur = toks.slice(0, i);
+    if (!sur.length || !given.length || given.length > 2) return false;
+    if (given.some(g => g.length < 2 || !/^[A-Za-z][A-Za-z'’-]*$/.test(g))) return false;
+
+    // Every ALL-CAPS word before the surname must be a filing prefix. Anything
+    // else is a second sticker that got welded on.
+    if (sur.length > 3) return false;
+    for (let j = 0; j < sur.length - 1; j++) {
+      if (!PLAUSIBLE_PREFIXES.has(sur[j].toLowerCase().replace(/[^a-z]/g, ''))) return false;
+    }
+    const last = sur[sur.length - 1];
+    if (last.length < 3 || last.length > 14) return false;
+    // No token may repeat: "WAID WAID", "WAGA WAGAMES RichardRichard".
+    const seen = new Set();
+    for (const w of toks) {
+      const k = w.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+    }
+    return /^[A-Za-z][A-Za-z'’-]+$/.test(last);
+  }
+
   // ── Azure nonfiction reconstruction ──────────────────────────────────────
   // The nonfiction twin of reconstructFictionAzure, and it exists for the same
   // reason: the SHARED reconstructNonfiction was tuned to ocr.space's output
@@ -3834,7 +3904,37 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       title_conf:     l.title_conf     ?? null,
       title_verified: l.title_verified ?? false,
       src:            l.src            || 'ocr',
+      // This rebuild is a WHITELIST, and `truncated`/`unclear` were not on it —
+      // so the reconstructors' truncation marking never reached labelsToBooks,
+      // and every downstream rule that depends on it (the prefix tie in
+      // compareKeys, "a truncated read can never be red", the yellow "number
+      // cut off" verdict) was dead in the shipping build.
+      truncated:      !!l.truncated,
+      unclear:        !!l.unclear,
     }));
+
+    // Shape gate: a label that does not look like a label this library issues
+    // cannot be trusted enough to accuse anyone.
+    //
+    // Azure returns text runs, not labels, and the assembler occasionally welds
+    // two neighbouring stickers into one ("VON REINHOLD, Shola" next to
+    // "VON ZIEGESAR, Cecily" came back as "BOO WAL WALKER, Boo") or reads a
+    // foreshortened sticker so badly the result is structurally impossible
+    // ("635 ICON" for "635 CON"). Each arrives with Azure's full confidence, so
+    // nothing downstream would otherwise stop them.
+    //
+    // Demote rather than drop. Dropping would hide a book the volunteer can see
+    // on the shelf; demoting below the 0.65 flag bar keeps it visible and
+    // honestly marked unread, and — per the flag-safety invariant — makes it
+    // impossible for it to raise a red misshelving flag.
+    let demoted = 0;
+    for (const o of out) {
+      if (labelPlausible(o.text, tieSect)) continue;
+      o.score = Math.min(o.score, 0.6);
+      o.unclear = true;
+      demoted++;
+    }
+    if (demoted) console.log(`[perf] finishLabels: ${demoted} malformed label(s) demoted below the flag bar`);
 
     // Verify-before-accusing: a false misshelving flag is the worst mistake
     // this app can make, so every label a provisional order check would flag
