@@ -402,24 +402,8 @@
         <span>Debug Mode</span>
         <div class="settings-toggle" id="debugToggleSwitch"></div>
       </div>
-      <div class="settings-item" id="geminiToggle" role="menuitemcheckbox" aria-checked="true" tabindex="0">
-        <span>On-device AI OCR</span>
-        <div class="settings-toggle" id="geminiToggleSwitch"></div>
-      </div>
-      <div class="settings-item" id="titleToggle" role="menuitemcheckbox" aria-checked="true" tabindex="0">
-        <span>Read titles online (faster)</span>
-        <div class="settings-toggle" id="titleToggleSwitch"></div>
-      </div>
-      <div class="settings-item" id="cloudToggle" role="menuitemcheckbox" aria-checked="true" tabindex="0" style="display:none">
-        <span>Cloud OCR (GPU, fast)</span>
-        <div class="settings-toggle" id="cloudToggleSwitch"></div>
-      </div>
-      <div class="settings-item" id="liveArEntry" role="menuitem" tabindex="0" style="display:none">
-        <span>Live scan (experimental)</span>
-        <span aria-hidden="true" style="color:#777">&rsaquo;</span>
-      </div>
       <div style="padding:10px 16px;border-top:1px solid #2c2c2c">
-        <div style="font-size:11px;color:#555;line-height:1.5">On-device AI OCR (PP-OCR)<br>+ ocr.space via Cloudflare proxy</div>
+        <div style="font-size:11px;color:#555;line-height:1.5">Azure AI Vision<br>via Cloudflare proxy</div>
       </div>
     </div>
   </div>
@@ -518,17 +502,6 @@
   const GEMINI_READ_QUALITY   = 0.85;
   const GEMINI_READ_TIMEOUT_MS = 15000;
 
-  // Local OCR (ocr_local.js): PP-OCRv6 det+rec running in the browser via
-  // onnxruntime-web (WebGPU with WASM fallback). Fully free, no quota, no
-  // network after the one-time ~31MB model download (Cache API). Validated at
-  // 96% recall on the 10-image ground truth (test_items/bench_js_port.py).
-  // It races ocr.space on every scan: first success renders, the other fuses
-  // in as a background refine, and a scan only fails when BOTH are down.
-  // ?nolocal=1 disables the on-device engine — benchmarking the remote-only
-  // path (how fast and how accurate the scan is with no local inference).
-  let localOcrEnabled = new URLSearchParams(location.search).get('nolocal') === '1'
-    ? false : (localStorage.getItem('shelfcheck.localocr') ?? '1') === '1';
-
   // ── State ────────────────────────────────────────────────────────────────
   const MAX_CANVAS_DIM = 4096;   // keep native resolution — nonfiction tiles need it
   let pendingEncode    = null;   // Promise<{blob, sentW, sentH}> — pre-encodes while user reads photo
@@ -559,13 +532,6 @@
   // `modal deploy` prints, WITHOUT a trailing /ocr — e.g.
   // 'https://yourname--shelfcheck-ocr-ocr-web.modal.run'). That turns cloud OCR
   // on for every volunteer. Leave empty to stay on-device only.
-  const CLOUD_OCR_URL_DEFAULT = '';
-  const _cloudQS = new URLSearchParams(location.search).get('cloud');
-  if (_cloudQS != null) localStorage.setItem('shelfcheck.cloudurl', _cloudQS);
-  const CLOUD_OCR_URL = ((localStorage.getItem('shelfcheck.cloudurl') || CLOUD_OCR_URL_DEFAULT) ?? '').trim();
-  const CLOUD_OCR_TIMEOUT_MS = 30000;   // cold start can be slow; fall back past this
-  let cloudOcrEnabled = !!CLOUD_OCR_URL &&
-    (localStorage.getItem('shelfcheck.cloud') ?? '1') === '1';
   let _flaggedRowMap   = new Map();  // book object → flagged-list DOM row
   let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
   let analysisCancelled = false;
@@ -623,19 +589,6 @@
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
       pendingEncode = encodeForOCR();
       pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
-      // Speculatively run the device engine (cloud GPU or on-device) while the
-      // user reviews the photo — the read hides behind the review pause, so
-      // Analyze usually has results waiting in memory.
-      if ((cloudOcrEnabled && CLOUD_OCR_URL) ||
-          (localOcrEnabled && window.LocalOCR && LocalOCR.available())) {
-        pendingLocal = deviceOcr(snapshot, null);
-      }
-      // NOTE: warming the on-device engine here (LocalOCR.preload) was tried to
-      // hide the ~3.2s cold start that finishLabels' recheck pays. It made no
-      // measurable difference — median 4.5s -> 4.8s, worst 6.2s -> 6.3s, both
-      // inside the run-to-run noise (two identical-config runs differed by
-      // 0.4s/0.9s). Scan latency here is dominated by variance on the two
-      // remote calls, not by engine startup, so the preload was reverted.
       // Take-photo → results with no extra tap (native camera only). Retake
       // stays available for a redo; analyzeShelf flips Analyze to "Reading…".
       if (autoAnalyze) analyzeShelf();
@@ -682,830 +635,8 @@
   // <input capture="environment">). It returns a full-resolution still — better
   // for tiny sticker OCR than the live preview — and gives the user its own
   // shutter/confirm step. The in-app live-AR camera is now an experimental
-  // extra reachable only from the settings menu (see the AR debug entry below).
-  // Tapping Take Photo opens the native camera; the volunteer then spends a few
-  // seconds framing. Warm the GPU container now so it's hot by the time the
-  // photo comes back.
-  takePicBtn.addEventListener('click', () => { warmCloud(); photoInput.click(); });
+  takePicBtn.addEventListener('click', () => photoInput.click());
 
-  // ── Live in-app camera ────────────────────────────────────────────────────
-  const cameraLive   = document.getElementById('cameraLive');
-  const cameraVideo  = document.getElementById('cameraVideo');
-  const camClose     = document.getElementById('camClose');
-  const arLiveOverlay = document.getElementById('arLiveOverlay');
-  const arSheet      = document.getElementById('arSheet');
-  const camMessage   = document.getElementById('camMessage');
-  let cameraStream  = null;
-  let camZoom       = 1;
-
-  function setZoom(z) {
-    camZoom = Math.min(4, Math.max(1, z));
-    cameraVideo.style.transform = `scale(${camZoom})`;
-  }
-
-  // Sticker text is tiny relative to the whole frame, and a browser is free
-  // to silently negotiate a getUserMedia video stream down to something like
-  // 640x480 under a bare "ideal" hint even on hardware that supports far
-  // more — there's no floor unless one is asked for. Try progressively
-  // lower resolution floors (not just "ideal") until one is accepted, and
-  // ask for a modest frame rate throughout: the live loop only needs the
-  // video smooth enough for cheap motion tracking (see arTrackTick), not a
-  // full 30fps, and relaxing frame rate lets some phones unlock a higher
-  // resolution mode on the same camera.
-  const AR_RES_STAGES = [
-    { width: { min: 3840 }, height: { min: 2160 } },
-    { width: { min: 2560 }, height: { min: 1440 } },
-    { width: { min: 1920 }, height: { min: 1080 } },
-    { width: { min: 1280 }, height: { min: 720 } },
-    {},   // last resort: whatever the device/browser defaults to
-  ];
-
-  async function openLiveCamera() {
-    if (!navigator.mediaDevices?.getUserMedia) { photoInput.click(); return; }
-    let stream = null;
-    for (const res of AR_RES_STAGES) {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' }, frameRate: { ideal: 15, max: 24 }, ...res },
-          audio: false,
-        });
-        break;
-      } catch { /* try the next, lower-floor stage */ }
-    }
-    if (!stream) { photoInput.click(); return; }
-    cameraStream = stream;
-    cameraVideo.srcObject = stream;
-    setZoom(1);
-    cameraLive.classList.add('show');
-    try { await cameraVideo.play(); } catch {}
-    const settings = stream.getVideoTracks()[0]?.getSettings?.() || {};
-    console.log(`[perf] openLiveCamera: negotiated ${settings.width}x${settings.height} @ ${settings.frameRate || '?'}fps ` +
-                `(video element reports ${cameraVideo.videoWidth}x${cameraVideo.videoHeight})`);
-    arSetupImageCapture(stream);
-    arPreloadWithProgress();
-    startArLoop();
-  }
-
-  // Kick off (don't await) the on-device reader warm-up the moment the camera
-  // opens, surfacing the one-time ~31MB model download as a visible progress
-  // line so a cold first-run doesn't look frozen. Idempotent/memoized in
-  // ocr_local.js, so a warm profile resolves instantly with no progress calls
-  // (cachedFetch only reports progress on a real network fetch). Guarded on
-  // arActive so a mid-download camera close can't resurrect stale messages.
-  function arPreloadWithProgress() {
-    if (!(localOcrEnabled && window.LocalOCR && LocalOCR.available())) return;
-    const prog = {};
-    LocalOCR.preload((url, got, total) => {
-      prog[url] = { got, total };
-      let g = 0, t = 0;
-      for (const k in prog) { g += prog[k].got; t += prog[k].total; }
-      if (t && arActive && cameraLive.classList.contains('show') && !arLastBoxes.length) {
-        camMessage.textContent = `Preparing reader… ${Math.min(99, Math.round(g / t * 100))}%`;
-      }
-    }).then(
-      () => { if (arActive && !arLastBoxes.length) camMessage.textContent = 'Point at a shelf row — scanning automatically'; },
-      () => { if (arActive) camMessage.textContent = 'Reader unavailable — using online service'; }
-    );
-  }
-
-  // Progressive enhancement: ImageCapture.takePhoto() pulls a genuine
-  // photographic still from the camera hardware — meaningfully higher
-  // resolution than the live preview stream on devices that support it
-  // (Chrome/Android). Safari on iOS doesn't implement ImageCapture at all,
-  // so this silently stays null there and arScanCycle keeps using the video-
-  // frame grab it already had, same as before — never worse, sometimes
-  // considerably better.
-  let arImageCapture = null;
-  function arSetupImageCapture(stream) {
-    arImageCapture = null;
-    if (typeof ImageCapture === 'undefined') return;
-    try { arImageCapture = new ImageCapture(stream.getVideoTracks()[0]); } catch { arImageCapture = null; }
-  }
-
-  // Grab the frame to analyze this cycle: a real high-res still via
-  // ImageCapture where available, otherwise the current live video frame.
-  // Returns null on total failure (caller falls back to the video frame).
-  async function arGrabStillPhoto() {
-    if (!arImageCapture) return null;
-    try {
-      const blob = await arImageCapture.takePhoto();
-      const bmp = await createImageBitmap(blob);
-      return bmp;
-    } catch { return null; }
-  }
-
-  function closeLiveCamera() {
-    const hadResults = arActive && lastRawBooks && lastRawBooks.length;
-    stopArLoop();
-    cameraLive.classList.remove('show');
-    if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; }
-    cameraVideo.srcObject = null;
-    // Clear any lingering AR-context error banner so it can't resurface as a
-    // stale child the next time cameraLive is reopened.
-    if (cameraLive.contains(document.getElementById('errorBanner'))) {
-      document.getElementById('errorBanner')?.remove();
-    }
-
-    if (hadResults) {
-      // Hand off to the classic still-photo view — snapshot already holds
-      // the last frame the live loop analyzed (and its results).
-      photoPlaceholder.style.display = 'none';
-      snapshot.style.display = 'block';
-      showResults(lastRawBooks, getSection());
-    } else {
-      actionBar.classList.add('show');
-      analyzeBtn.disabled = false;
-    }
-  }
-
-  // Pure math: what region of the video frame is currently on screen, in
-  // video-pixel space, accounting for the cover-fit + pinch zoom. Returns
-  // null if the camera isn't ready yet. Shared by the live AR loop below.
-  function computeCaptureRect() {
-    const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
-    const dispW = cameraLive.clientWidth, dispH = cameraLive.clientHeight;
-    if (!vw || !vh) return null;
-    const cover = Math.max(dispW / vw, dispH / vh);
-    const eff   = cover * camZoom;
-    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-    const toVX  = px => vw / 2 + (px - dispW / 2) / eff;
-    const toVY  = py => vh / 2 + (py - dispH / 2) / eff;
-    const sx  = clamp(toVX(0),     0, vw), sx2 = clamp(toVX(dispW), 0, vw);
-    const sy  = clamp(toVY(0),     0, vh), sy2 = clamp(toVY(dispH), 0, vh);
-    return { sx, sy, sw: Math.max(1, sx2 - sx), sh: Math.max(1, sy2 - sy) };
-  }
-
-  // ── Live AR: continuous scanning, no shutter ─────────────────────────────
-  // Google Lens/Word Lens play the same trick: a slow, accurate recognition
-  // pass runs asynchronously in the background (can take multiple seconds),
-  // while a cheap per-frame visual tracker drags the LAST pass's boxes along
-  // with the camera in between, so the overlay never looks frozen even
-  // though the actual text reading isn't running anywhere near 60fps.
-  // (Google's own patent for this: US20140112527A1.) The full det+rec
-  // pipeline and every flag-safety rule are reused completely unchanged —
-  // only the on-screen box POSITION between analyses is ever approximated.
-  let arLoopToken   = 0;     // bumped on stop/restart so a stale cycle can't apply results after the fact
-  let arLastBoxes   = [];    // [{bbox:[vx,vy,vw,vh] in video-pixel space, book, color, dashed, index, _overlayRect}]
-  let arKeyLuma     = null;  // Uint8ClampedArray — downsampled grayscale of the frame the last analysis used
-  let arMotion      = { dx: 0, dy: 0 };  // accumulated video-px drift since arKeyLuma was captured
-  let arRefGen      = 0;     // bumped whenever arKeyLuma/arMotion are reset to a new reference frame, so an
-                              // in-flight det() pass anchored to the OLD reference (captured its mdx/mdy before
-                              // the reset) can detect the mismatch and discard its result instead of drawing
-                              // boxes at the wrong position (the reset zeroes arMotion, so re-adding a stale
-                              // mdx at render time would offset the box by however far the camera moved between
-                              // the two reference frames — this is what caused det boxes to appear on blank
-                              // shelf gaps during a fast pan).
-  let arTrackHandle = null;
-  let arLumaScratch = null;
-
-  // Det-only fast path: grey "seen, still reading" boxes that appear near-
-  // instantly (one cheap detection pass) long before the full det+rec+fusion
-  // read result lands. They live in the SAME video-pixel reference frame as
-  // the read boxes (arLastBoxes) — anchored to arKeyLuma, dragged by arMotion —
-  // so the single motion tracker moves both. When a read result overlaps a
-  // det box, the read box wins and the det box is suppressed at render time,
-  // giving an in-place grey→green/red/yellow transition with no flicker.
-  let arDetBoxes    = [];    // [{bbox:[vx,vy,vw,vh] in the arKeyLuma reference frame}]
-  let arDetBusy     = false; // a det pass is in flight
-  let arScanBusy    = false; // a full read cycle is using the ORT session (det must wait its turn)
-  let arDetHandle   = null;  // setTimeout handle for the det sub-loop
-  let arDetScratch  = null;
-  let arRemoteDown  = false; // last attempted remote OCR call failed → flags paused
-  let arLastRemoteAt = 0;    // perf-clock time of the last remote OCR attempt (throttle)
-
-  // ── Multi-frame vote / track store ───────────────────────────────────────
-  // Persistent per-spine tracks living in the CURRENT reference frame's
-  // video-pixel coordinates (same space as arLastBoxes/arDetBoxes). Each read
-  // cycle and each det pass matches its boxes to these tracks; a track that
-  // keeps being seen accumulates a read-history and votes on its displayed
-  // label, so the overlay stops rebuilding from scratch every cycle (which is
-  // what made text flicker and grey orphan boxes float everywhere). On every
-  // reference-frame reset the whole store is shifted by the same _preDx/_preDy
-  // drift that re-anchors arDetBoxes — so votes always compare boxes in one
-  // coordinate frame.
-  // Track shape: { id, bbox:[vx,vy,vw,vh], history:[{text}], voteText:{key,count,text},
-  //   lastSeenCycle, lastSeenDetTick, displayBook, displayColor, dashed, flagged, index }
-  let arTracks     = [];
-  let arCycleSeq   = 0;      // read-cycle counter (++ once per landed arApplyResults)
-  let arDetSeq     = 0;      // det-pass counter (++ once per landed det tick)
-  let arTrackId    = 0;      // monotonic track id
-  const AR_VOTE_CAP        = 6;  // read-history length cap per track
-  const AR_TRACK_CYCLE_TTL = 2;  // a track may go unread this many cycles if det still sees it
-  const AR_TRACK_DET_TTL   = 4;  // a track may go det-unseen this many ticks if a read is recent
-
-  const AR_TRACK_W = 96, AR_TRACK_H = 72, AR_SEARCH = 14;
-  const AR_DET_INTERVAL_MS = 400;      // cadence of the det-only sub-loop
-  const AR_DET_MAX_SIDE = 1600;        // scratch canvas size for the det pass
-  const AR_REMOTE_MIN_INTERVAL_MS = 20000;  // at most one ocr.space call per 20s during continuous AR
-
-  // Downsampled grayscale of the currently-visible capture region — cheap
-  // enough to recompute every frame (a few thousand pixels).
-  function arGrabLuma(rect) {
-    const c = arLumaScratch || (arLumaScratch = document.createElement('canvas'));
-    c.width = AR_TRACK_W; c.height = AR_TRACK_H;
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(cameraVideo, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, AR_TRACK_W, AR_TRACK_H);
-    const px = ctx.getImageData(0, 0, AR_TRACK_W, AR_TRACK_H).data;
-    const n = AR_TRACK_W * AR_TRACK_H;
-    const luma = new Uint8ClampedArray(n);
-    for (let i = 0; i < n; i++) {
-      const o = i * 4;
-      luma[i] = (px[o] * 0.299 + px[o + 1] * 0.587 + px[o + 2] * 0.114) | 0;
-    }
-    return luma;
-  }
-
-  // Coarse global motion estimate between two downsampled grayscale frames:
-  // sum-of-absolute-differences block match over a small search window, on a
-  // strided pixel sample. Deliberately a single rigid (dx,dy) for the whole
-  // frame rather than per-feature optical flow — good enough for panning
-  // across a shelf, and far simpler (and less failure-prone) to get right
-  // than a full tracker.
-  function arEstimateMotion(prevLuma, curLuma) {
-    let bestDx = 0, bestDy = 0, bestScore = Infinity;
-    const W = AR_TRACK_W, H = AR_TRACK_H, R = AR_SEARCH;
-    for (let dy = -R; dy <= R; dy += 2) {
-      for (let dx = -R; dx <= R; dx += 2) {
-        let sad = 0, cnt = 0;
-        for (let y = R; y < H - R; y += 3) {
-          const rowPrev = y * W, rowCur = (y + dy) * W;
-          for (let x = R; x < W - R; x += 3) {
-            sad += Math.abs(prevLuma[rowPrev + x] - curLuma[rowCur + x + dx]);
-            cnt++;
-          }
-        }
-        const score = sad / cnt;
-        if (score < bestScore) { bestScore = score; bestDx = dx; bestDy = dy; }
-      }
-    }
-    return { dx: bestDx, dy: bestDy };
-  }
-
-  // Map a point in full video-frame pixel space to the overlay canvas's own
-  // pixel space, given the current cover-fit + pinch zoom (the inverse of
-  // computeCaptureRect's toVX/toVY math).
-  function arVideoToOverlay(vx, vy) {
-    const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
-    const dispW = cameraLive.clientWidth, dispH = cameraLive.clientHeight;
-    const dpr = window.devicePixelRatio || 1;
-    const cover = Math.max(dispW / vw, dispH / vh);
-    const eff = cover * camZoom;
-    return [
-      (dispW / 2 + (vx - vw / 2) * eff) * dpr,
-      (dispH / 2 + (vy - vh / 2) * eff) * dpr,
-    ];
-  }
-
-  function arRenderOverlay() {
-    const dpr = window.devicePixelRatio || 1;
-    const cw = Math.max(1, Math.round(cameraLive.clientWidth  * dpr));
-    const ch = Math.max(1, Math.round(cameraLive.clientHeight * dpr));
-    if (arLiveOverlay.width !== cw || arLiveOverlay.height !== ch) {
-      arLiveOverlay.width = cw; arLiveOverlay.height = ch;
-    }
-    const ctx = arLiveOverlay.getContext('2d');
-    ctx.clearRect(0, 0, cw, ch);
-    if (!arLastBoxes.length && !arDetBoxes.length) return;
-    const lw = Math.max(2, Math.round(cw / 260));
-    const fs = Math.max(11, Math.round(cw / 40));
-    ctx.font = `bold ${fs}px sans-serif`;
-    ctx.textBaseline = 'bottom';
-    for (const entry of arLastBoxes) {
-      const [vx, vy, vw2, vh2] = entry.bbox;
-      const [x0, y0] = arVideoToOverlay(vx + arMotion.dx, vy + arMotion.dy);
-      const [x1, y1] = arVideoToOverlay(vx + vw2 + arMotion.dx, vy + vh2 + arMotion.dy);
-      const bx = Math.min(x0, x1), by = Math.min(y0, y1);
-      const bw = Math.abs(x1 - x0), bh = Math.abs(y1 - y0);
-      entry._overlayRect = [bx, by, bw, bh];
-      // Every book gets a thin outline (never filled) so the spine stays
-      // readable underneath — red misshelved, grey unconfirmed, green
-      // confidently correct. Only flagged boxes get a number badge, matching
-      // the "box N" the flagged-list rows show — a solid green wall of
-      // badges on a 40-book shelf would be pure clutter for boxes that don't
-      // have a corresponding list row to point at anyway.
-      ctx.strokeStyle = entry.color; ctx.lineWidth = lw;
-      if (entry.dashed) ctx.setLineDash([6, 4]);
-      ctx.strokeRect(bx, by, bw, bh);
-      ctx.setLineDash([]);
-      if (entry.index != null) {
-        const num = String(entry.index);
-        const tw = ctx.measureText(num).width;
-        ctx.fillStyle = entry.color; ctx.globalAlpha = 0.85;
-        ctx.fillRect(bx, by - fs - 3, tw + 6, fs + 3);
-        ctx.globalAlpha = 1; ctx.fillStyle = '#000';
-        ctx.fillText(num, bx + 3, by - 2);
-      }
-    }
-
-    // Det-only "seen, still reading" boxes: thin grey dashed outlines, no
-    // badge. Drawn AFTER (under, visually) the read boxes and only where they
-    // don't overlap one — an overlapping read box means that sticker has now
-    // been read, so its coloured box supersedes the grey placeholder in place.
-    let detSuppressed = 0;
-    if (arDetBoxes.length) {
-      const overlapsRead = (d) => {
-        const [vx, vy, vw2, vh2] = d.bbox;
-        const cx = vx + vw2 / 2, cy = vy + vh2 / 2;
-        return arLastBoxes.some(en => {
-          const [ex, ey, ew, eh] = en.bbox;
-          if (cx >= ex && cx <= ex + ew && cy >= ey && cy <= ey + eh) return true;
-          const ix = Math.max(0, Math.min(vx + vw2, ex + ew) - Math.max(vx, ex));
-          const iy = Math.max(0, Math.min(vy + vh2, ey + eh) - Math.max(vy, ey));
-          const inter = ix * iy, uni = vw2 * vh2 + ew * eh - inter;
-          return uni > 0 && inter / uni > 0.3;
-        });
-      };
-      const dlw = Math.max(1, Math.round(lw * 0.6));
-      ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = dlw; ctx.setLineDash([6, 4]);
-      for (const d of arDetBoxes) {
-        if (overlapsRead(d)) { detSuppressed++; continue; }
-        const [vx, vy, vw2, vh2] = d.bbox;
-        const [x0, y0] = arVideoToOverlay(vx + arMotion.dx, vy + arMotion.dy);
-        const [x1, y1] = arVideoToOverlay(vx + vw2 + arMotion.dx, vy + vh2 + arMotion.dy);
-        ctx.strokeRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
-      }
-      ctx.setLineDash([]);
-    }
-    // Test/telemetry hook: last overlay composition. orphanDetBoxes = grey det
-    // boxes NOT superseded by a read-bearing track (the "floating boxes" the
-    // tracking is meant to drive down); tracks/tracksWithReads expose the store.
-    window.__arOverlayStats = {
-      readBoxes: arLastBoxes.length, detBoxes: arDetBoxes.length, detSuppressed,
-      orphanDetBoxes: arDetBoxes.length - detSuppressed,
-      tracks: arTracks.length,
-      tracksWithReads: arTracks.filter(t => t.history && t.history.length).length,
-    };
-  }
-
-  // Draw the currently-visible capture region into a scratch canvas for the
-  // det-only pass. Higher-res than the tiny motion-tracking luma grab (sticker
-  // text needs the detail) but capped so a single det pass stays cheap.
-  function arGrabDetFrame(rect) {
-    const sc = Math.min(1, AR_DET_MAX_SIDE / Math.max(rect.sw, rect.sh));
-    const w = Math.max(32, Math.round(rect.sw * sc));
-    const h = Math.max(32, Math.round(rect.sh * sc));
-    const c = arDetScratch || (arDetScratch = document.createElement('canvas'));
-    c.width = w; c.height = h;
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(cameraVideo, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, w, h);
-    return c;
-  }
-
-  // The det-only sub-loop: every ~400ms, when the ORT session isn't busy with a
-  // full read cycle, run a single detection pass and refresh the grey boxes.
-  // Anchored into the arKeyLuma reference frame (subtract the current motion
-  // drift) so the tracker drags them exactly like the read boxes.
-  async function arDetTick() {
-    if (!arActive) return;
-    if (!arDetBusy && !arScanBusy && cameraVideo.videoWidth &&
-        localOcrEnabled && window.LocalOCR && LocalOCR.available()) {
-      arDetBusy = true;
-      try {
-        const rect = computeCaptureRect();
-        if (rect) {
-          const mdx = arMotion.dx, mdy = arMotion.dy, refGenAtStart = arRefGen;
-          const boxes = await LocalOCR.detect(arGrabDetFrame(rect));
-          // A full read cycle can land (and reset arKeyLuma/arMotion to a new
-          // reference frame) while this det pass was in flight. mdx/mdy were
-          // captured against the OLD reference, so anchoring into the new one
-          // with them would misplace every box by however far the camera moved
-          // in between — discard rather than draw boxes in the wrong spot.
-          if (arActive && boxes.length && refGenAtStart === arRefGen) {
-            arDetBoxes = boxes.map(o => {
-              const [fx, fy, fw, fh] = o.bboxFrac;
-              return { bbox: [
-                rect.sx + fx * rect.sw - mdx, rect.sy + fy * rect.sh - mdy,
-                fw * rect.sw, fh * rect.sh,
-              ] };
-            });
-            // Refresh the liveness of any track a det box still covers. This is
-            // what lets a read-bearing track survive read cycles that don't re-
-            // read it (anti-flicker) yet expire promptly once it pans off-frame.
-            // The refGen guard above means arDetBoxes and arTracks are in the
-            // same reference frame right now, so overlap matching is valid.
-            arDetSeq++;
-            for (const d of arDetBoxes) {
-              for (const tk of arTracks) {
-                if (arMatchScore(d.bbox, tk.bbox) > 0) tk.lastSeenDetTick = arDetSeq;
-              }
-            }
-            arPruneTracks();
-            arBoxesFromTracks();   // drop any track that just expired from the overlay
-            window.__arDetRenders = (window.__arDetRenders || 0) + 1;
-            arRenderOverlay();
-          }
-        }
-      } catch { /* det is best-effort; a failed pass just skips this tick */ }
-      arDetBusy = false;
-    }
-    if (arActive) arDetHandle = setTimeout(arDetTick, AR_DET_INTERVAL_MS);
-  }
-
-  function arTrackTick() {
-    arTrackHandle = requestAnimationFrame(arTrackTick);
-    if (!arActive || !cameraVideo.videoWidth) return;
-    const rect = computeCaptureRect();
-    if (!rect || !arKeyLuma) { arRenderOverlay(); return; }
-    const curLuma = arGrabLuma(rect);
-    const m = arEstimateMotion(arKeyLuma, curLuma);
-    // Scale from downsampled tracking space back to video-pixel space.
-    arMotion = { dx: m.dx * (rect.sw / AR_TRACK_W), dy: m.dy * (rect.sh / AR_TRACK_H) };
-    arRenderOverlay();
-  }
-
-  // Turn a fresh analysis result into tracker state: run the SAME checkOrder
-  // flag logic as ever, remap EVERY book's bbox (not just flagged ones) from
-  // image-pixel space back into full video-frame pixel space using the
-  // capture rect this cycle used, reset the tracker's reference frame + zero
-  // the accumulated motion, and refresh the flagged-books sheet. Every
-  // detected book gets a box now — red for misshelved, grey for "couldn't
-  // confirm", green for confidently correct — so the overlay reads like a
-  // live labeling pass over the whole shelf rather than only surfacing
-  // problems. Numbering (for the tap-to-list correlation) stays reserved for
-  // flagged books, same as the sheet below, so a dense shelf of green boxes
-  // doesn't turn into a wall of badges.
-  // Normalize a spine label to a vote key: case- and punctuation-insensitive so
-  // "635.04 HEM" and "635.04  hem" fold together but "635.04" vs "635.048" don't.
-  function arNormText(t) { return String(t || '').toUpperCase().replace(/[^A-Z0-9]+/g, ''); }
-
-  // How well two video-px boxes correspond to the SAME physical spine. Strong
-  // IoU (>0.3) ranks above a mere center-in-box hit so a read box prefers the
-  // track it genuinely overlaps. Returns 0 for no correspondence.
-  function arMatchScore(a, b) {
-    const [ax, ay, aw, ah] = a, [bx, by, bw, bh] = b;
-    const ix = Math.max(0, Math.min(ax + aw, bx + bw) - Math.max(ax, bx));
-    const iy = Math.max(0, Math.min(ay + ah, by + bh) - Math.max(ay, by));
-    const inter = ix * iy, uni = aw * ah + bw * bh - inter;
-    const iou = uni > 0 ? inter / uni : 0;
-    if (iou > 0.3) return 1 + iou;                       // strong match
-    const acx = ax + aw / 2, acy = ay + ah / 2, bcx = bx + bw / 2, bcy = by + bh / 2;
-    if (acx >= bx && acx <= bx + bw && acy >= by && acy <= by + bh) return 0.5;
-    if (bcx >= ax && bcx <= ax + aw && bcy >= ay && bcy <= ay + ah) return 0.5;
-    return 0;
-  }
-
-  // Majority vote over a track's read history (chronological). Ties break to the
-  // most recently read label. Returns the winning normalized key, its count
-  // (= voteCount), and a raw representative text to actually display (the most
-  // recent raw label in the winning class, so formatting isn't lost to norm()).
-  function arMajority(history) {
-    const counts = new Map(), latest = new Map();
-    for (const h of history) {
-      const k = arNormText(h.text);
-      counts.set(k, (counts.get(k) || 0) + 1);
-      latest.set(k, h.text);                    // later entries overwrite → most recent raw
-    }
-    let bestK = null, bestC = 0;
-    for (const [k, c] of counts) if (c > bestC) { bestC = c; bestK = k; }
-    const tied = [...counts.entries()].filter(([, c]) => c === bestC).map(([k]) => k);
-    if (tied.length > 1) {
-      for (let i = history.length - 1; i >= 0; i--) {
-        const k = arNormText(history[i].text);
-        if (tied.includes(k)) { bestK = k; break; }
-      }
-    }
-    return { key: bestK, count: bestC, text: latest.get(bestK) };
-  }
-
-  // Drop tracks unseen by BOTH the read cycles (>TTL cycles) AND the det
-  // sub-loop (>TTL ticks). Keeping a track alive on EITHER signal is the whole
-  // anti-flicker win: a spine read once stays boxed while det keeps seeing it,
-  // even across read cycles that never re-read it; once it leaves frame both
-  // signals go stale and it expires, killing the floating-orphan problem.
-  function arPruneTracks() {
-    arTracks = arTracks.filter(tk =>
-      (arCycleSeq - tk.lastSeenCycle) <= AR_TRACK_CYCLE_TTL ||
-      (arDetSeq   - tk.lastSeenDetTick) <= AR_TRACK_DET_TTL);
-  }
-
-  // Rebuild arLastBoxes (the render source) from every live read-bearing track.
-  function arBoxesFromTracks() {
-    arLastBoxes = arTracks
-      .filter(tk => tk.history.length && tk.displayBook)
-      .map(tk => ({
-        trackId: tk.id,
-        bbox: tk.bbox.slice(),
-        book: tk.displayBook,
-        color: tk.displayColor,
-        dashed: tk.dashed,
-        flagged: tk.flagged,
-        index: tk.index,
-        voteCount: tk.voteText ? tk.voteText.count : 1,
-        _overlayRect: null,
-      }));
-  }
-
-  function arApplyResults(books, section, rect) {
-    const sentW = lastApiDims.sentW, sentH = lastApiDims.sentH;
-    const toVideoX = sc => rect.sx + sc * (rect.sw / sentW);
-    const toVideoY = sc => rect.sy + sc * (rect.sh / sentH);
-
-    // ── 1. Re-anchor ALL persistent state into the new reference frame ──────
-    // A read cycle makes the current frame the new reference: grab its luma,
-    // zero the drift, bump arRefGen. Everything that was anchored to the OLD
-    // reference (tracks AND det boxes) must be shifted by exactly the drift
-    // (_preDx/_preDy) accumulated since that frame, or it would jump. This is
-    // the identical transform arDetBoxes has always used — tracks piggyback on
-    // it so incoming read boxes (already in the new frame) and existing tracks
-    // are compared in ONE coordinate space.
-    const _preDx = arMotion.dx, _preDy = arMotion.dy;
-    arKeyLuma = arGrabLuma(rect);
-    arMotion  = { dx: 0, dy: 0 };
-    arRefGen++;
-    for (const tk of arTracks) { tk.bbox[0] += _preDx; tk.bbox[1] += _preDy; }
-    if (arDetBoxes.length) arDetBoxes = arDetBoxes.map(d =>
-      ({ bbox: [d.bbox[0] + _preDx, d.bbox[1] + _preDy, d.bbox[2], d.bbox[3]] }));
-
-    arCycleSeq++;
-
-    // ── 2. Match incoming reads to tracks; append votes; create new tracks ──
-    const incoming = books.filter(b => b._bbox).map(b => {
-      const [bx, by, bw, bh] = b._bbox;
-      return { book: b, vbox: [toVideoX(bx), toVideoY(by),
-                               bw * (rect.sw / sentW), bh * (rect.sh / sentH)] };
-    });
-    const trackOfBook = new Map();
-    const usedTracks = new Set();
-    for (const inc of incoming) {
-      let best = null, bestScore = 0;
-      for (const tk of arTracks) {
-        if (usedTracks.has(tk)) continue;
-        const s = arMatchScore(inc.vbox, tk.bbox);
-        if (s > bestScore) { bestScore = s; best = tk; }
-      }
-      if (!best) {
-        best = { id: ++arTrackId, bbox: inc.vbox.slice(), history: [], voteText: null,
-                 lastSeenCycle: arCycleSeq, lastSeenDetTick: arDetSeq,
-                 displayBook: null, displayColor: null, dashed: false, flagged: false, index: null };
-        arTracks.push(best);
-      }
-      usedTracks.add(best);
-      trackOfBook.set(inc.book, best);
-      best.bbox = inc.vbox.slice();          // update position to the latest read
-      best.lastSeenCycle = arCycleSeq;
-      best.lastSeenDetTick = arDetSeq;        // a read implies the spine is present now
-      best.history.push({ text: inc.book.spine_label || '' });
-      if (best.history.length > AR_VOTE_CAP) best.history.shift();
-      best.voteText = arMajority(best.history);
-    }
-
-    // ── 3. Consensus labels → checkOrder → colours ─────────────────────────
-    // Substitute each matched track's MAJORITY text for its raw read before the
-    // flag logic runs, so the displayed label (and its colour) is the multi-
-    // frame consensus, not one noisy frame.
-    // SACRED INVARIANT: this rewrites only spine_label TEXT — never a score.
-    // checkOrder still gates every red outOfOrder flag on the fused >=0.65 bar,
-    // so on a local-only (skipRemote) cycle no book can reach that bar and vote
-    // agreement can NEVER manufacture a red flag. Consensus stabilises text and
-    // box colour/persistence only; red flags stay exclusive to the fused path.
-    // checkOrder spreads each book into a fresh object ({...b, shelfIndex}),
-    // so track association must ride ON the book as a copied property
-    // (_arTrackId), not in an object-identity map — identity dies in the spread.
-    const consensusBooks = books.map(b => {
-      const tk = trackOfBook.get(b);
-      if (!tk) return b;
-      if (tk.voteText && tk.voteText.text != null && tk.voteText.text !== b.spine_label) {
-        return { ...b, spine_label: tk.voteText.text, _arTrackId: tk.id };
-      }
-      return { ...b, _arTrackId: tk.id };
-    });
-    const checked = checkOrder(consensusBooks, section);
-    lastCheckedBooks = checked;
-
-    // ── 4. Fold this cycle's flag/colour result back onto matched tracks ────
-    // Only tracks matched THIS cycle refresh their colour/flag/book; tracks not
-    // re-read this cycle keep the colour from the LATEST cycle they appeared in
-    // (that colour-stability is the anti-flicker win). "box N" badges stay the
-    // 1-based whole-shelf position, matching the flagged-list rows.
-    const trackById = new Map(arTracks.map(tk => [tk.id, tk]));
-    for (const b of checked) {
-      const tk = b._arTrackId != null ? trackById.get(b._arTrackId) : null;
-      if (!tk) continue;
-      const flagged = b.outOfOrder || b.unverifiable || b.possiblyOutOfOrder;
-      tk.displayBook  = b;
-      tk.displayColor = b.outOfOrder ? '#ef4444' : (b.unverifiable || b.possiblyOutOfOrder) ? '#eab308' : '#22c55e';
-      tk.dashed  = b._src === 'gemini-synth';
-      tk.flagged = flagged;
-      tk.index   = flagged ? checked.indexOf(b) + 1 : null;
-    }
-
-    // ── 5. Expire stale tracks, then rebuild the render source from tracks ──
-    arPruneTracks();
-    arBoxesFromTracks();
-    arRenderOverlay();
-
-    const total = checked.length;
-    (window.__shelfcheckRenders = window.__shelfcheckRenders || []).push({
-      t: performance.now(), section, total,
-      outCount: checked.filter(b => b.outOfOrder).length,
-      unvCount: checked.filter(b => b.unverifiable).length,
-      possiblyCount: checked.filter(b => b.possiblyOutOfOrder).length, ar: true,
-      books: checked.map(b => ({
-        spine_label: b.spine_label, title: b.title || null, title_verified: !!b.title_verified,
-        outOfOrder: !!b.outOfOrder, unverifiable: !!b.unverifiable,
-        possiblyOutOfOrder: !!b.possiblyOutOfOrder, shelfRow: b.shelfRow ?? null,
-        // video-px bbox (additive telemetry) so a harness can match the same
-        // physical book across consecutive cycles by overlap for churn stats.
-        bbox: b._bbox ? [toVideoX(b._bbox[0]), toVideoY(b._bbox[1]),
-                         b._bbox[2] * (rect.sw / sentW), b._bbox[3] * (rect.sh / sentH)] : null,
-      })),
-      // The boxes actually drawn this cycle (video-px, current reference frame),
-      // with their displayed label — lets a harness measure label-text churn on
-      // the SAME physical spine across cycles by overlap.
-      renderBoxes: arLastBoxes.map(e => ({
-        trackId: e.trackId ?? null,
-        text: e.book ? e.book.spine_label : null, bbox: e.bbox,
-        color: e.color, voteCount: e.voteCount || 1,
-      })),
-    });
-
-    showFlaggedList(checked, arSheet);
-  }
-
-  // One full analysis cycle: grab the current framing, run the existing
-  // encode/OCR/finishLabels/checkOrder pipeline completely unchanged, apply
-  // the fresh boxes, then immediately schedule the next cycle. No fixed
-  // timer — cadence is exactly however long the device's pipeline takes,
-  // never overlapping, never queuing up stale work.
-  async function arScanCycle() {
-    const myToken = arLoopToken;
-    if (!arActive) return;
-    // rect stays in VIDEO-pixel space throughout — it's what arApplyResults
-    // uses afterward to map analysis results back onto the live overlay, and
-    // that mapping is resolution-agnostic (a ratio), so it's unaffected by
-    // which source image (video frame vs a higher-res still) actually gets
-    // analyzed below.
-    const rect = computeCaptureRect();
-    if (!rect) { setTimeout(() => { if (arLoopToken === myToken) arScanCycle(); }, 400); return; }
-
-    // Prefer a real photographic still (ImageCapture) when available — much
-    // higher resolution than the live preview stream, which matters because
-    // the sticker text this app reads is tiny relative to the whole frame.
-    // Rescale the video-space crop rect into the still's own pixel space
-    // (same physical framing, just a different resolution) before cropping.
-    const stillPhoto = await arGrabStillPhoto();
-    if (arLoopToken !== myToken) return;   // camera closed mid-capture
-    const source = stillPhoto || cameraVideo;
-    const srcW = stillPhoto ? stillPhoto.width  : cameraVideo.videoWidth;
-    const srcH = stillPhoto ? stillPhoto.height : cameraVideo.videoHeight;
-    // The ImageCapture still is frequently a DIFFERENT aspect ratio than the
-    // live video track (a 4:3 sensor photo vs a 16:9 preview stream): the
-    // browser derives the on-screen preview as a CENTERED crop of the sensor.
-    // Mapping the video-space crop rect into the still with independent x/y
-    // scales (srcW/vw, srcH/vh) therefore misplaced it — the still carries
-    // extra field of view (top & bottom for a 4:3 still under a 16:9 preview)
-    // that the preview never showed — which drew every AR box consistently
-    // BELOW its sticker on real phones. Map through the SHARED field of view
-    // instead: one uniform scale (the smaller axis is the shared-FOV axis) plus
-    // a centering offset on the axis the still over-covers. For the video-frame
-    // fallback (no still, e.g. the headless test harness) this reduces to
-    // scale 1 / offset 0 — byte-identical to the old behaviour.
-    const s    = stillPhoto ? Math.min(srcW / cameraVideo.videoWidth, srcH / cameraVideo.videoHeight) : 1;
-    const offX = (srcW - cameraVideo.videoWidth  * s) / 2;
-    const offY = (srcH - cameraVideo.videoHeight * s) / 2;
-    const cropX = offX + rect.sx * s, cropY = offY + rect.sy * s;
-    const cropW = rect.sw * s, cropH = rect.sh * s;
-
-    const sc = Math.min(1, MAX_CANVAS_DIM / Math.max(cropW, cropH));
-    snapshot.width  = Math.round(cropW * sc);
-    snapshot.height = Math.round(cropH * sc);
-    snapshot.getContext('2d').drawImage(source, cropX, cropY, cropW, cropH, 0, 0, snapshot.width, snapshot.height);
-    stillPhoto?.close?.();
-    saveCleanPhoto();
-
-    // Throttle the remote (ocr.space) engine during continuous AR so the free
-    // tier's ~10-scans/day quota isn't burned in seconds: fire it at most once
-    // per AR_REMOTE_MIN_INTERVAL_MS; every cycle in between reads on-device
-    // only. Red misshelving flags still need fused confidence, so they refresh
-    // roughly every 20s; grey/green/yellow reads keep updating every cycle.
-    const allowRemote = (performance.now() - arLastRemoteAt) >= AR_REMOTE_MIN_INTERVAL_MS;
-    if (allowRemote) { arLastRemoteAt = performance.now(); console.log('[ar] remote OCR attempt (throttle window open)'); }
-
-    arScanBusy = true;   // the ORT session is now in use by this read cycle — det-only pauses
-    // Keep the "online check unavailable" state visible even mid-scan so the
-    // persistent status isn't clobbered by a bare "Scanning…" every cycle.
-    camMessage.textContent = arRemoteDown
-      ? 'Scanning… · online check unavailable — local reads only'
-      : 'Scanning…';
-    analysisCancelled = false;
-    analysisAbort = new AbortController();
-
-    // When the online service is unreachable, keep saying so (persistent status)
-    // rather than reverting to the neutral "scanning" line and looking silent.
-    const idleMsg = () => arRemoteDown
-      ? 'Online check unavailable — local reads only'
-      : 'Point at a shelf row — scanning automatically';
-    const finishCycle = (delay, msg) => {
-      analysisAbort = null;
-      arScanBusy = false;
-      if (arActive) camMessage.textContent = msg || idleMsg();
-      if (arLoopToken === myToken && arActive) {
-        if (delay) setTimeout(() => { if (arLoopToken === myToken) arScanCycle(); }, delay);
-        else arScanCycle();
-      }
-    };
-
-    // Only pay the remote-encode cost on cycles that are actually allowed to
-    // call the remote engine; throttled cycles read on-device from `snapshot`.
-    let encoded = null;
-    if (allowRemote) {
-      try { encoded = await encodeForOCR(); }
-      catch { finishCycle(800, 'Reconnecting…'); return; }
-      if (arLoopToken !== myToken) return;   // camera closed / loop restarted mid-cycle
-    }
-
-    let ocrData;
-    try {
-      ocrData = await runOcr(encoded, analysisAbort.signal, () => {}, { arMode: true, skipRemote: !allowRemote });
-    } catch { finishCycle(800, 'Reconnecting…'); return; }
-    if (arLoopToken !== myToken) return;
-
-    lastRawBooks = labelsToBooks(ocrData.labels);
-    lastApiDims  = { sentW: ocrData.imageSize[0], sentH: ocrData.imageSize[1] };
-    const detected = autoDetectSection(lastRawBooks);
-    if (detected) setActiveTab(detected);
-
-    arApplyResults(lastRawBooks, getSection(), rect);
-
-    if (ocrData.refine) {
-      ocrData.refine.then(refined => {
-        if (arLoopToken !== myToken || !refined) return;
-        lastRawBooks = labelsToBooks(refined.labels);
-        lastApiDims  = { sentW: refined.imageSize[0], sentH: refined.imageSize[1] };
-        arApplyResults(lastRawBooks, getSection(), rect);
-      });
-    }
-
-    finishCycle(0);
-  }
-
-  function startArLoop() {
-    arActive = true;
-    arLoopToken++;
-    arLastBoxes = []; arKeyLuma = null; arMotion = { dx: 0, dy: 0 }; arRefGen++;
-    arDetBoxes = []; arDetBusy = false; arScanBusy = false;
-    arTracks = []; arCycleSeq = 0; arDetSeq = 0;
-    // Seed one full interval in the past (performance.now() is ms-since-load,
-    // so a literal 0 would wrongly gate the remote engine off for the first
-    // 20s of the page's life) → the very first cycle is allowed to fuse.
-    arRemoteDown = false; arLastRemoteAt = -AR_REMOTE_MIN_INTERVAL_MS;
-    if (!arTrackHandle) arTrackHandle = requestAnimationFrame(arTrackTick);
-    if (!arDetHandle) arDetHandle = setTimeout(arDetTick, 0);  // grey boxes ASAP, before the first full cycle
-    arScanCycle();
-  }
-
-  function stopArLoop() {
-    arActive = false;
-    arLoopToken++;   // in-flight cycle's checks will now fail, so it stops rescheduling itself
-    if (analysisAbort) { analysisCancelled = true; analysisAbort.abort(); analysisAbort = null; }
-    if (arTrackHandle) { cancelAnimationFrame(arTrackHandle); arTrackHandle = null; }
-    if (arDetHandle) { clearTimeout(arDetHandle); arDetHandle = null; }
-    arLastBoxes = []; arKeyLuma = null; arImageCapture = null;
-    arDetBoxes = []; arDetBusy = false; arScanBusy = false;
-    arTracks = []; arCycleSeq = 0; arDetSeq = 0;
-    const ctx = arLiveOverlay.getContext('2d');
-    if (arLiveOverlay.width) ctx.clearRect(0, 0, arLiveOverlay.width, arLiveOverlay.height);
-    arBoxPulse.classList.remove('show');
-    arSheet.classList.remove('show'); arSheet.innerHTML = '';
-    arCaptionEl?.classList.remove('show');
-  }
-
-  // Tap-to-highlight on the live overlay: hit-test against each box's last
-  // rendered on-screen rect (arRenderOverlay keeps these current every frame)
-  // rather than the classic canvas/sentW-sentH math, since the AR overlay's
-  // mapping changes continuously with camera pan/zoom. Every box is tappable
-  // now, not just flagged ones — flagged boxes open their flagged-list row
-  // as before; green/grey boxes (no list row to open) pop a small caption
-  // with what was read instead.
-  arLiveOverlay.addEventListener('click', e => {
-    if (!arActive) return;
-    const rect = arLiveOverlay.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const tapX = (e.clientX - rect.left) * dpr;
-    const tapY = (e.clientY - rect.top)  * dpr;
-    const hit = arLastBoxes.find(en => en._overlayRect &&
-      tapX >= en._overlayRect[0] && tapX <= en._overlayRect[0] + en._overlayRect[2] &&
-      tapY >= en._overlayRect[1] && tapY <= en._overlayRect[1] + en._overlayRect[3]);
-    if (hit && hit.flagged) {
-      arHideCaption();
-      highlightArrow(hit.book);
-      openBookDetail(hit.book, arSheet);
-    } else if (hit) {
-      popBoxPulse(hit.book);
-      arShowCaption(hit);
-    } else {
-      arBoxPulse.classList.remove('show');
-      arHideCaption();
-    }
-  });
-
-  // Pinch-to-zoom
-  let pinchDist = 0, pinchZoom = 1;
-  const touchDist = t => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
-  cameraLive.addEventListener('touchstart', e => { if (e.touches.length === 2) { pinchDist = touchDist(e.touches); pinchZoom = camZoom; } }, { passive: false });
-  cameraLive.addEventListener('touchmove',  e => { if (e.touches.length === 2 && pinchDist) { e.preventDefault(); setZoom(pinchZoom * touchDist(e.touches) / pinchDist); } }, { passive: false });
-
-  camClose.addEventListener('click', closeLiveCamera);
   uploadPicBtn.addEventListener('click', () => uploadInput.click());
   retakeBtn.addEventListener('click', retake);
   photoInput.addEventListener('change',  () => { if (photoInput.files[0])  loadPhoto(photoInput.files[0], true); });
@@ -1554,177 +685,6 @@
     });
   }
 
-  // ── OCR pipeline (ocr.space via Cloudflare Worker) ───────────────────────
-
-  // Low-level proxy call: POST raw JPEG blob, returns ocr.space JSON.
-  async function callOcrProxy(blob, externalSignal) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), OCR_TIMEOUT_MS);
-    const onAbort = () => ctrl.abort();
-    if (externalSignal) {
-      if (externalSignal.aborted) { ctrl.abort(); }
-      else externalSignal.addEventListener('abort', onAbort, { once: true });
-    }
-    let res;
-    try {
-      res = await fetch(WORKER_URL, {
-        method: 'POST', body: blob,
-        headers: { 'Content-Type': 'image/jpeg' },
-        signal: ctrl.signal,
-      });
-    } finally {
-      clearTimeout(timer);
-      if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
-    }
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      const err = new Error(`Worker ${res.status}: ${t.slice(0, 200)}`);
-      err.status = res.status;
-      throw err;
-    }
-    const data = await res.json();
-    if (data.IsErroredOnProcessing) throw new Error(`ocr.space: ${data.ErrorMessage}`);
-    return data;
-  }
-
-  // ── Local OCR wrapper ────────────────────────────────────────────────────
-  // Runs the in-browser engine (ocr_local.js) on the full-res snapshot and
-  // adapts its output to the boxed-book shape the fusion pipeline expects
-  // (the same shape the old Gemini tile path produced): spine_label +
-  // bboxFrac fractions of the source canvas, projected into whatever pixel
-  // space the render target uses by mapGemToPixels.
-  // Keep only labels that look like call-number stickers — the same rule the
-  // OCR reconstruction applies (nonfiction needs a Dewey number; fiction needs
-  // an uppercase surname-ish first token). White book spines otherwise leak
-  // publisher/title text into the results and poison the ordering check.
-  function localLabelPlausible(text, section) {
-    if (section === 'nonfiction') return /\d{3}/.test(text);
-    const t0 = String(text).trim().split(/\s+/)[0] || '';
-    const letters = t0.replace(/[^A-Za-z]/g, '');
-    if (letters.length < 3) return false;
-    return letters.replace(/[^A-Z]/g, '').length / letters.length >= 0.6;
-  }
-
-  // ── Lexicon-aware post-correction (Fix 3) ─────────────────────────────────
-  // Sticker text follows rigid patterns: a call-number zone (mostly digits,
-  // at most one decimal point) and a cutter/surname zone (mostly letters).
-  // The rec model's most common confusions are visually-similar glyph pairs
-  // (O/0, I/l/1, S/5, B/8). This is a conservative fix-up pass over already-
-  // RECOGNIZED text, applied upstream of parseDewey/parseSurnameAndFirst
-  // (neither of which is modified) — a substitution is kept only when it
-  // turns the WHOLE token into something that cleanly matches its zone's
-  // shape; tokens that already cleanly match a zone are left untouched.
-  const LEX_DIGIT_MAP  = { O: '0', o: '0', I: '1', l: '1', S: '5', B: '8' };
-  const LEX_LETTER_MAP = { '0': 'O', '1': 'I', '5': 'S', '8': 'B' };
-  const LEX_DIGIT_RE  = /^\d{1,3}(\.\d+)?$/;
-  const LEX_LETTER_RE = /^[A-Za-z]+$/;
-
-  function lexiconCorrectToken(tok) {
-    if (!tok || LEX_DIGIT_RE.test(tok) || LEX_LETTER_RE.test(tok)) return tok;  // already clean
-    let digits = 0, letters = 0;
-    for (const ch of tok) {
-      if (ch >= '0' && ch <= '9') digits++;
-      else if (/[A-Za-z]/.test(ch)) letters++;
-    }
-    if (digits > letters) {
-      // call-number zone: O/o/I/l/S/B -> digit, only kept if the WHOLE token
-      // then matches a Dewey-shaped number.
-      let cand = '';
-      for (const ch of tok) cand += (ch in LEX_DIGIT_MAP ? LEX_DIGIT_MAP[ch] : ch);
-      if (LEX_DIGIT_RE.test(cand)) return cand;
-    } else if (letters > digits && tok.length >= 2 && tok.length <= 6) {
-      // cutter/surname zone: 0/1/5/8 -> letter, only kept if the WHOLE token
-      // then becomes all-letters.
-      let cand = '';
-      for (const ch of tok) cand += (ch in LEX_LETTER_MAP ? LEX_LETTER_MAP[ch] : ch);
-      if (LEX_LETTER_RE.test(cand)) return cand;
-    }
-    return tok;
-  }
-
-  function lexiconCorrectText(text) {
-    const s = String(text || '');
-    if (!s) return s;
-    return s.split(/(\s+)/).map(part => {
-      if (part === '' || /^\s+$/.test(part)) return part;
-      const fixed = lexiconCorrectToken(part);
-      if (fixed !== part) console.debug(`[dbglex] ${part} -> ${fixed}`);
-      return fixed;
-    }).join('');
-  }
-
-  // Clean up raw rec text: OCR confuses commas/spaced dots inside Dewey
-  // numbers, and a malformed number both mis-sorts and blocks cross-engine
-  // confirmation.
-  function normalizeLocalText(t, section) {
-    let s = String(t).replace(/\s+/g, ' ').trim();
-    if (section === 'nonfiction') {
-      s = s.replace(/(\d)\s*,\s*(\d)/g, '$1.$2');   // 635,048  -> 635.048
-      s = s.replace(/(\d)\.\s+(\d)/g, '$1.$2');      // 635. 048 -> 635.048
-      s = s.replace(/^(\d+)\.(?!\d)/, '$1');         // 635. XYZ -> 635 XYZ
-    }
-    return s;
-  }
-
-  // Shared raw-labels -> books mapping. Both the on-device engine and the
-  // Modal cloud engine emit the SAME raw shape ({text, conf, bboxFrac} plus
-  // .unread), so both run through this one function — the plausibility filter,
-  // the strict 0.97 'high' gate, the truncated-number demotion, and the
-  // normalization are byte-identical whichever engine produced the reads. That
-  // is what lets the GPU server be a true drop-in: nothing downstream can tell
-  // the difference, so the measured accuracy and the zero-false-positive rule
-  // carry over unchanged.
-  function rawLabelsToBooks(rawLabels, section) {
-    const unread = [...(rawLabels.unread || [])];
-    const labels = rawLabels.filter(l => {
-      if (localLabelPlausible(l.text, section)) return true;
-      if (l.bboxFrac) unread.push({ bboxFrac: l.bboxFrac });
-      return false;
-    });
-    // 'high' is deliberately strict (0.97): raw OCR misreads ("NALKER" for
-    // WALKER) usually dip below it, and only high-confidence books are ever
-    // eligible for misshelving flags — a wrong flag is worse than a grey
-    // "unverifiable" entry. A Dewey number ending in a bare separator
-    // ("635." / "635,0") is a truncated read — same demotion.
-    const truncatedNum = t => section === 'nonfiction' &&
-      (/^\s*\d{1,3}[.,](?!\d)/.test(t) || /^\s*\d{1,3}\.\d*0(?=\s|$)/.test(t));
-    const books = labels.map(l => ({
-      spine_label: lexiconCorrectText(normalizeLocalText(l.text, section)),
-      title: null,
-      confidence: (l.conf >= 0.97 && !truncatedNum(l.text)) ? 'high' : 'low',
-      shelfRow: 0,
-      bboxFrac: l.bboxFrac,
-    }));
-    books.unread = unread;
-    return books;
-  }
-
-  async function callLocalOcr(src, signal) {
-    const t0 = performance.now();
-    const section = getSection();
-    // note: plausibility runs on the RAW text; normalization happens in
-    // rawLabelsToBooks so truncation evidence (trailing "635.") survives
-    // until the confidence decision.
-    const rawLabels = await LocalOCR.run(src, { signal });
-    const books = rawLabelsToBooks(rawLabels, section);
-    console.log(`[perf] callLocalOcr: ${books.length} book(s), ${books.unread.length} unread at ${Math.round(performance.now() - t0)}ms`);
-    return books;
-  }
-
-  // Cloud OCR: the same PP-OCR det+rec models, run natively (onnxruntime on a
-  // plain CPU) instead of under WASM on the phone. Sends the snapshot as a JPEG
-  // and gets back the identical raw shape LocalOCR.run produces, so it slots
-  // into rawLabelsToBooks and the fusion exactly like the on-device engine —
-  // ~2.2s server-side versus ~6-7s on a phone.
-  // Throws on any failure so the caller can fall back to the on-device engine.
-  //
-  // Once inference moves off the phone, UPLOAD becomes the latency budget, so
-  // the snapshot is downscaled before sending. Measured on the 10-image set
-  // (server-side raw label recall / upload size for a 12MP photo):
-  //   full res  92.0%  2.6MB      3072px  92.4%  1.05MB      2048px  90.4%  0.56MB
-  // 3072 is free — recognition crops still have the pixels they need — while
-  // 2048 starts costing real reads. Detection already runs at 2048 server-side;
-  // it's RECOGNITION that needs the resolution, which is why this can't go lower.
   const CLOUD_UPLOAD_MAX_DIM = 3072;
   const CLOUD_UPLOAD_QUALITY = 0.85;
 
@@ -1763,138 +723,23 @@
   // hence the double parse. Base64 costs ~33% on the wire (1.05MB -> 1.35MB
   // measured) — accepted to keep the contract a plain string in / string out
   // instead of depending on how Gradio serialises file uploads.
-  async function callCloudOcr(src, signal) {
-    const t0 = performance.now();
-    const section = getSection();
-    const blob = await encodeForCloud(src);
-    const b64  = await blobToBase64(blob);
-    const base = CLOUD_OCR_URL.replace(/\/$/, '') + '/gradio_api/call/ocr';
-
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), CLOUD_OCR_TIMEOUT_MS);
-    const onAbort = () => ctrl.abort();
-    if (signal) {
-      if (signal.aborted) ctrl.abort();
-      else signal.addEventListener('abort', onAbort, { once: true });
-    }
-    try {
-      const submit = await fetch(base, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: [b64] }),
-        signal: ctrl.signal,
-      });
-      if (!submit.ok) throw new Error('cloud OCR submit ' + submit.status);
-      const { event_id: eid } = await submit.json();
-      if (!eid) throw new Error('cloud OCR: no event id');
-
-      const stream = await fetch(`${base}/${eid}`, { signal: ctrl.signal });
-      if (!stream.ok) throw new Error('cloud OCR stream ' + stream.status);
-      const text = await stream.text();
-      if (/^event:\s*error/m.test(text)) throw new Error('cloud OCR job error');
-
-      const lines = text.split('\n').filter(l => l.startsWith('data: '));
-      if (!lines.length) throw new Error('cloud OCR: empty stream');
-      const payload = JSON.parse(lines[lines.length - 1].slice(6));
-      const data = JSON.parse(Array.isArray(payload) ? payload[0] : payload);
-      if (data.error) throw new Error('cloud OCR: ' + data.error);
-
-      const raw = data.labels || [];
-      raw.unread = data.unread || [];
-      const books = rawLabelsToBooks(raw, section);
-      console.log(`[perf] callCloudOcr: ${books.length} book(s), ${books.unread.length} unread, ` +
-                  `sent ${(blob.size / 1e6).toFixed(2)}MB (${(b64.length / 1e6).toFixed(2)}MB b64), ` +
-                  `server ${data.ms}ms (${data.provider}) at ${Math.round(performance.now() - t0)}ms`);
-      return books;
-    } finally {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onAbort);
-    }
-  }
-
-  // Warm the container the instant the app is usable, so a sleeping free-tier
-  // Space wakes during the seconds the volunteer spends walking to the shelf and
-  // framing — by the time the photo lands it's hot. Fire-and-forget; failure is
-  // harmless (deviceOcr falls back to the on-device engine).
-  let _cloudWarmedAt = 0;
-  function warmCloud() {
-    if (!cloudOcrEnabled || !CLOUD_OCR_URL) return;
-    if (Date.now() - _cloudWarmedAt < 30000) return;   // don't spam
-    _cloudWarmedAt = Date.now();
-    // A Gradio Space has no /warm route; fetching the app root is what wakes a
-    // sleeping Space and gets the container running.
-    fetch(CLOUD_OCR_URL.replace(/\/$/, '') + '/', { method: 'GET', mode: 'no-cors' }).catch(() => {});
-  }
-
-  // Resolve with the first promise to produce a NON-EMPTY result; if none does,
-  // resolve with whatever non-null result arrived (else null). Rejections are
-  // absorbed — a racing engine that dies just stops being a candidate.
-  function firstSuccessful(promises) {
-    return new Promise(resolve => {
-      let outstanding = promises.length, settled = false, fallback = null;
-      const done = v => { if (!settled) { settled = true; resolve(v); } };
-      for (const p of promises) {
-        p.then(v => {
-          if (v && v.length) return done(v);
-          if (v && !fallback) fallback = v;
-        }, () => {}).then(() => { if (--outstanding === 0) done(fallback); });
-      }
-      if (!promises.length) done(null);
-    });
-  }
-
-  // The engine that fills the "device" slot in the fusion: cloud when enabled
-  // and configured, else the on-device engine. One place decides, so runOcr and
-  // the speculative pre-encode path stay in sync.
+  // The STANDBY reader. Azure fills the label, geometry and title slots on its
+  // own (see the AZURE_URL branch in runOcr), so while Azure is answering this
+  // stands down and resolves null — running both would double the cost and the
+  // latency for a second opinion the design does not use.
   //
-  // Cloud and on-device RACE rather than the cloud being awaited with a fallback
-  // only on error. A free-tier host that is merely SLOW (not broken) would
-  // otherwise make every scan worse than doing nothing — the app would sit on
-  // the network for up to CLOUD_OCR_TIMEOUT_MS while the phone, which can answer
-  // in ~6-7s, sat idle. This project has already been burned by exactly that:
-  // the earlier Hugging Face Space (see shelfcheck-ocr-archive) ran past a 45s
-  // client timeout on the same hardware class this desktop reads in ~2s.
-  // Racing makes the cloud pure upside: it wins when it's fast, and costs
-  // nothing but some phone CPU when it isn't.
+  // It reads only when Azure cannot be reached at all: the Worker is down, or
+  // the 5,000-reads/month free allowance is spent. Gemini fills unreadable
+  // digits in by inference where Azure reports only what the camera captured,
+  // so it is strictly a better-than-nothing path and never the default.
   function deviceOcr(src, signal) {
-    const localAvailable = localOcrEnabled && window.LocalOCR && LocalOCR.available();
-
-    // Engines other than Gemini, in preference order. Used as the fallback when
-    // Gemini is disabled, errors, or returns nothing.
-    const fallback = () => {
-      if (cloudOcrEnabled && CLOUD_OCR_URL) {
-        const cloudP = callCloudOcr(src, signal).catch(err => {
-          console.log('[perf] cloud OCR failed:', err.message);
-          return null;
-        });
-        if (!localAvailable) return cloudP;
-        return firstSuccessful([cloudP, callLocalOcr(src, signal).catch(() => null)]);
-      }
-      return localAvailable ? callLocalOcr(src, signal).catch(() => null)
-                            : Promise.resolve(null);
-    };
-
-    // Azure-only mode: Azure fills the label/geometry/title slot on its own (see
-    // the AZURE_URL branch in runOcr), so Gemini must NOT also run — it would
-    // double the cost and latency for a second opinion the design no longer
-    // uses. Gemini stays wired as the BACKUP: runOcr falls back to it when the
-    // Azure call fails or its monthly free allowance runs out.
-    if (AZURE_URL && AZURE_ONLY && !azureDown) return Promise.resolve(null);
-
-    // Gemini is the primary reader: ~3.5s and 89.6% recall against ~6-7s for the
-    // on-device pass, and it returns titles in the same call. Deliberately NOT
-    // raced against the on-device engine — Gemini wins that race every time, so
-    // racing would only burn phone battery to reach the same answer. A failure
-    // falls back instead, which costs latency exactly when it's already broken.
-    if (geminiReadEnabled && GEMINI_URL) {
-      return callGeminiReadMerged(src, getSection(), signal)
-        .then(books => (books && books.length) ? books : fallback())
-        .catch(err => {
-          console.log('[perf] gemini read failed, falling back:', err.message);
-          return fallback();
-        });
-    }
-    return fallback();
+    if (AZURE_URL && !azureDown) return Promise.resolve(null);
+    if (!GEMINI_URL) return Promise.resolve(null);
+    return callGeminiReadMerged(src, getSection(), signal)
+      .catch(err => {
+        console.log('[perf] gemini fallback read failed:', err.message);
+        return null;
+      });
   }
 
   // The Gemini reader returns no geometry (asking for per-book boxes measured
@@ -1941,26 +786,6 @@
   }
 
   // Extract text lines with bboxes from ocr.space TextOverlay.
-  function parseOcrOverlay(data) {
-    const lines = [];
-    for (const parsed of (data.ParsedResults || [])) {
-      for (const line of (parsed.TextOverlay?.Lines || [])) {
-        const words = line.Words || [];
-        if (!words.length) continue;
-        const text = words.map(w => w.WordText || '').join(' ').trim();
-        if (!text) continue;
-        const lefts   = words.map(w => w.Left);
-        const tops    = words.map(w => w.Top);
-        const rights  = words.map(w => w.Left + w.Width);
-        const bottoms = words.map(w => w.Top + w.Height);
-        const x = Math.min(...lefts), y = Math.min(...tops);
-        const w = Math.max(...rights) - x, h = Math.max(...bottoms) - y;
-        lines.push({ text, bbox: [x, y, w, h], score: 0.9 });
-      }
-    }
-    return lines;
-  }
-
   // Fraction of pixels in a region whose luminance is >= thresh (0..1).
   function lightRatio(ctx, x, y, w, h, thresh = 150) {
     const cw = ctx.canvas.width, ch = ctx.canvas.height;
@@ -2167,19 +992,6 @@
     return data;
   }
 
-  function parseOcrWords(data) {
-    const words = [];
-    for (const parsed of (data.ParsedResults || [])) {
-      for (const line of (parsed.TextOverlay?.Lines || [])) {
-        for (const w of (line.Words || [])) {
-          const t = (w.WordText || '').trim();
-          if (t) words.push({ t, x: w.Left, y: w.Top, w: w.Width, h: w.Height });
-        }
-      }
-    }
-    return words;
-  }
-
   // ── Label reconstruction ──────────────────────────────────────────────────
   // Nonfiction spine stickers are vertical stacks of tiny horizontal words:
   //   635 / .04 / CAR  (number anchor, optional decimal, cutter).
@@ -2241,92 +1053,6 @@
   // Symptom to chase next: cutters pair correctly, NUMBERS come out truncated
   // ("635 SIM" for a "635.048 SIM" sticker), so the decimal fragments are being
   // lost or mis-claimed somewhere upstream of pairing.
-
-  function reconstructNonfiction(words, ctx) {
-    const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
-    const maxH = maxDim * 0.022;                       // sticker text is tiny
-    const small = words.filter(w => w.h <= maxH && w.w >= w.h * 0.6);
-    const anchors = small.filter(w => RX_NUM_FULL.test(w.t) || RX_NUM3.test(w.t));
-
-    const used = new Set();
-    const labels = [];
-    for (const a of anchors) {
-      const axc = a.x + a.w / 2;
-      let num = a.t;
-      const parts = [a];
-      let curBottom = a.y + a.h;
-
-      // decimal continuation directly below a bare NNN anchor
-      if (RX_NUM3.test(a.t)) {
-        for (const w of small) {
-          if (used.has(w) || w === a) continue;
-          const m = RX_DEC.exec(w.t);
-          if (!m) continue;
-          const wxc = w.x + w.w / 2;
-          if (Math.abs(wxc - axc) <= a.w * 1.2 && w.y - curBottom >= 0 && w.y - curBottom <= a.h * 2.5) {
-            num = a.t + '.' + m[1];
-            parts.push(w); used.add(w);
-            curBottom = w.y + w.h;
-            break;
-          }
-        }
-      }
-
-      // nearest cutter below the number
-      let best = null;
-      for (const w of small) {
-        if (used.has(w) || w === a) continue;
-        if (!RX_CUTTER.test(w.t)) continue;
-        const wxc = w.x + w.w / 2;
-        const dy = w.y - curBottom;
-        // NOTE: swapping this centre-distance test for a scale-invariant x-overlap
-        // test was tried, to stop Azure's wide full-number words ("635.048" as one
-        // 82px token vs ocr.space's "635"+".048" at ~40px each) reaching into the
-        // neighbouring spine and stealing its cutter. It gained Azure only
-        // 53.2% -> 55.5% and BROKE ocr.space parity (2 of 8 images changed), so it
-        // was reverted. Azure needs its own reconstructor, not a retuned shared one.
-        if (Math.abs(wxc - axc) <= Math.max(a.w, w.w) * 1.2 && dy >= -a.h * 0.5 && dy <= a.h * 3.0) {
-          if (!best || dy < best.dy) best = { dy, w };
-        }
-      }
-      let cutter = null;
-      if (best) { cutter = best.w.t.toUpperCase(); parts.push(best.w); used.add(best.w); }
-
-      // sticker union box must sit on a light background
-      const ux = Math.min(...parts.map(p => p.x)),  uy = Math.min(...parts.map(p => p.y));
-      const ur = Math.max(...parts.map(p => p.x + p.w)), ub = Math.max(...parts.map(p => p.y + p.h));
-      if (lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8) < 0.30) continue;
-
-      labels.push({ text: num + (cutter ? ' ' + cutter : ''), num, cut: cutter,
-                    truncated: !!a.truncated,
-                    bbox: [ux, uy, ur - ux, ub - uy], score: 0.9 });
-    }
-
-    // Consensus MARKING (was consensus repair). Books shelved together share a
-    // class number and OCR truncates the decimal on some stickers, so when this
-    // shelf read "635.0484" in full several times, a neighbouring "635.04" is
-    // very likely the same number with unreadable trailing digits.
-    //
-    // This used to REWRITE 635.04 into 635.0484. That put digits on the screen
-    // that are not in the photograph, and when the guess was wrong it sent a
-    // volunteer to the wrong book. A likely inference is not a reading. Mark the
-    // uncertainty instead and let the comparator decline to judge; the number
-    // shown to the volunteer stays exactly what the camera captured.
-    const counts = new Map();
-    for (const l of labels) counts.set(l.num, (counts.get(l.num) || 0) + 1);
-    for (const l of labels) {
-      const n = l.num;
-      for (const [y, c] of counts) {
-        if (y === n || !y.startsWith(n) || y.length <= n.length) continue;
-        if (c < 2 || c <= counts.get(n)) continue;
-        l.truncated = true;
-        break;
-      }
-    }
-
-    // Bare numbers without a cutter can't be ordered — drop as noise.
-    return labels.filter(l => l.cut);
-  }
 
   // Does this text have the SHAPE of a label this library issues?
   //
@@ -2780,91 +1506,6 @@
     });
     return fixed;
   }
-
-  // Fiction stickers are 2–3 stacked short lines: SURNAME / First (or VON /
-  // SURNAME / First).  Cluster sticker-like lines by x-overlap + vertical
-  // adjacency, join top-to-bottom.
-  function reconstructFiction(lines, ctx) {
-    const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
-    const maxH = maxDim * 0.025;
-    const cand = lines.filter(ln => {
-      const [x, y, w, h] = ln.bbox;
-      if (h > maxH || w < h * 0.75) return false;
-      return lightRatio(ctx, x - 4, y - 4, w + 8, h + 8) >= 0.35;
-    });
-
-    const n = cand.length;
-    const parent = Array.from({ length: n }, (_, i) => i);
-    const find = i => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
-    const union = (i, j) => { const ri = find(i), rj = find(j); if (ri !== rj) parent[rj] = ri; };
-
-    const xOverlap = (a, b) => {
-      const [ax,, aw] = a.bbox, [bx,, bw] = b.bbox;
-      const ov = Math.min(ax + aw, bx + bw) - Math.max(ax, bx);
-      return ov / Math.max(1, Math.min(aw, bw));
-    };
-    for (let i = 0; i < n; i++) {
-      for (let j = i + 1; j < n; j++) {
-        if (xOverlap(cand[i], cand[j]) < 0.4) continue;
-        const [, ay,, ah] = cand[i].bbox, [, by,, bh] = cand[j].bbox;
-        const gap = Math.max(ay, by) - Math.min(ay + ah, by + bh);
-        if (gap <= Math.max(ah, bh) * 1.2) union(i, j);
-      }
-    }
-
-    const groups = new Map();
-    for (let i = 0; i < n; i++) {
-      const r = find(i);
-      if (!groups.has(r)) groups.set(r, []);
-      groups.get(r).push(cand[i]);
-    }
-
-    const out = [];
-    for (const g of groups.values()) {
-      g.sort((a, b) => a.bbox[1] - b.bbox[1]);
-      const text = g.map(l => l.text).join(' ');
-      const first = (text.trim().split(/[\s,.]+/)[0] || '');
-      const alpha = first.replace(/[^A-Za-z]/g, '');
-      if (alpha.length < 3) continue;
-      let upp = 0;
-      for (const c of alpha) if (c >= 'A' && c <= 'Z') upp++;
-      if (upp / alpha.length < 0.6) continue;
-      const ux = Math.min(...g.map(l => l.bbox[0]));
-      const uy = Math.min(...g.map(l => l.bbox[1]));
-      const ur = Math.max(...g.map(l => l.bbox[0] + l.bbox[2]));
-      const ub = Math.max(...g.map(l => l.bbox[1] + l.bbox[3]));
-      out.push({ text, bbox: [ux, uy, ur - ux, ub - uy], score: 0.9 });
-    }
-    return out;
-  }
-
-  // retained: parity-test extraction anchor (also no longer called directly —
-  // titles now come from Gemini — but the comment below is parity_check.mjs's
-  // end-of-slice marker, so both stay byte-identical).
-  // Map a bbox from the 90°-CW rotated image back to original image coordinates.
-  function mapBackRotated(rx, ry, rw, rh, origH) {
-    return [ry, Math.max(0, origH - rx - rw), rh, rw];
-  }
-
-  // Fiction reconstruction for Azure, from WORDS rather than lines.
-  //
-  // reconstructFiction() above clusters Azure's LINES, and Azure groups
-  // horizontally-adjacent text across NEIGHBOURING SPINES into a single line —
-  // a dense fiction shelf yields lines like
-  //   "WALK WALKER WALKER, WALKER, Boo WALK Ann Marie Ann Marie Alice"
-  // which is five different books in one box. Clustering those by x-overlap
-  // then glues whole runs of the shelf together: measured 31 books found where
-  // 63 exist, and a genuinely misshelved WALLACE went unflagged because every
-  // neighbour it would be compared against was a three-surname blob.
-  //
-  // Word boxes belong to a single spine, so the same union-find that failed on
-  // lines works correctly on words. This is the fiction twin of the fix
-  // reconstructNonfiction already relies on.
-  const FICTION_STOPWORDS = new Set([
-    'THE', 'AND', 'FOR', 'NOT', 'BUT', 'HER', 'HIS', 'OUR', 'ALL', 'ONE', 'TWO',
-    'NEW', 'HOW', 'WHY', 'WHO', 'WHAT', 'WHEN', 'FROM', 'WITH', 'THAT', 'THIS',
-    'INTO', 'OVER', 'BOOK', 'NOVEL', 'STORIES',
-  ]);
 
   function reconstructFictionAzure(words, ctx) {
     const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
@@ -3820,54 +2461,6 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     }
   }
 
-  async function readTiedTitles(labels, imgW, imgH, tieSect, signal) {
-    if (!(localOcrEnabled && window.LocalOCR && LocalOCR.available() && snapshot.width)) return;
-    const groups = new Map();
-    labels.forEach((l, i) => {
-      let k;
-      if (tieSect === 'fiction') {
-        const p = parseSurnameAndFirst(l.text); if (!p) return;
-        k = p.surname + '\x00' + (p.first || '');
-      } else {
-        const d = parseDewey(l.text); if (!d) return;
-        k = String(d.num ?? '') + '\x00' + (d.cut || '');
-      }
-      if (!groups.has(k)) groups.set(k, []);
-      groups.get(k).push(i);
-    });
-    const tied = [];
-    for (const idxs of groups.values()) if (idxs.length >= 2) tied.push(...idxs);
-    if (!tied.length) return;
-    const fx = snapshot.width / imgW, fy = snapshot.height / imgH;
-    const t0 = performance.now();
-    let got = 0, read = 0;
-    // Hard time budget: reading titles is ~0.4-0.8s each, and a shelf can carry
-    // dozens of tied books. Still-photo mode now renders once, when everything
-    // is done, so this sits ON the blocking path and was measured as the single
-    // biggest remaining cost (5.4s of a 14.6s scan). Keep it tight: tie groups
-    // not reached in time simply stay tie-safe (any order within a tie is
-    // accepted, so an unread title can only ever cost a detection, never cause
-    // a false accusation).
-    const TITLE_BUDGET_MS = 2000;
-    for (const i of tied) {
-      if (signal?.aborted || performance.now() - t0 > TITLE_BUDGET_MS) break;
-      const b = labels[i].bbox;
-      if (!b || labels[i].title) continue;
-      read++;
-      const tt = await LocalOCR.readTitle(snapshot, [b[0] * fx, b[1] * fy, b[2] * fx, b[3] * fy])
-        .catch(() => null);
-      if (tt && tt.title) {
-        const cleaned = cleanSpineTitle(tt.title, labels[i].text);
-        // Keep the read confidence alongside the title so the unverified
-        // title-order pass (checkOrderOneShelf) can apply a quality bar — a
-        // low-confidence spine read must not be able to raise "possibly out
-        // of order". Currently the conf was dropped here.
-        if (cleaned.length >= 3) { labels[i].title = cleaned; labels[i].title_conf = tt.conf; got++; }
-      }
-    }
-    console.log(`[perf] finishLabels: read ${got}/${read} spine title(s) (${tied.length} tied) in ${Math.round(performance.now() - t0)}ms`);
-  }
-
   // Fuse (if gem is provided), tie-check, verify tied titles against Open
   // Library, and assign shelfRow — the tail of the pipeline shared by both
   // the immediate (OCR-only or Gemini-on-time) render and the later refine
@@ -3910,12 +2503,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // order within a tie. So OL caught nothing, while adding a third-party
     // network dependency, latency, and a title-based false-flag vector. With no
     // title feeding ordering, tie groups simply accept any internal order.
-    // Because titles no longer affect flags, we only read on-device titles when
-    // the online (Gemini) reader is OFF; otherwise the parallel Gemini titles
-    // are all we need for display and nothing blocks on title reading.
-    if (!geminiTitlesEnabled && needsTitles && opts.readTitles && labels.some(l => !l.title)) {
-      await readTiedTitles(labels, imgW, imgH, tieSect, signal);
-    }
+    // Azure returns the spine titles in the same response as the labels (see
+    // azureTitlesFor), so no separate title read is needed at all.
 
     // Assign shelfRow via gap-based clustering (see clusterRowIndex) instead
     // of fixed-height banding, so a shelf's stickers stay one row even when
@@ -4076,38 +2665,17 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   // that resolves to an improved {labels, imageSize, n} once local OCR lands,
   // or null if it ultimately failed/added nothing.
   // Calls onCall1Done() between the two proxy calls so the UI can advance stages.
-  // ocr.space free tier throws transient 502s under back-to-back load; one
-  // delayed retry recovers most of them. 4xx (bad request, file too large)
-  // won't be fixed by retrying — rethrow those immediately.
-  async function callOcrProxyWithRetry(blob, signal) {
-    try { return await callOcrProxy(blob, signal); }
-    catch (e) {
-      if (signal?.aborted || (e.status && e.status < 500)) throw e;
-      await new Promise(r => setTimeout(r, 1200));
-      return callOcrProxy(blob, signal);
-    }
-  }
 
-  async function runOcr(encoded, signal, onCall1Done, arOpts, onFirstReads) {
+  async function runOcr(encoded, signal, onCall1Done, _unused, onFirstReads) {
     const t0 = performance.now();
     const section = getSection();
-    // AR mode throttles the remote engine to protect the free-tier quota. When
-    // `skipRemote` is set this cycle reads on-device only (no ocr.space call at
-    // all); the local engine alone drives the render, so — by the sacred flag-
-    // safety invariant — no red misshelving flag can be produced (single-engine
-    // reads score below the 0.65 fuse bar).
-    const arMode = !!(arOpts && arOpts.arMode);
-    const skipRemote = !!(arOpts && arOpts.skipRemote);
 
-    // The local engine fires immediately, in parallel with ocr.space, from
-    // the full-res snapshot canvas (both the upload and AR paths draw into
-    // it). They fail independently (device too old / models still downloading
-    // vs 502 rate limits), so racing both means a scan only dies when BOTH
-    // fail — and first render comes from whichever answers first.
+    // The standby reader. It resolves null while Azure is healthy and only
+    // actually reads when Azure cannot be reached at all — see deviceOcr.
     const localP = pendingLocal ?? deviceOcr(snapshot, signal);
     pendingLocal = null;
 
-    const ocrP = skipRemote ? Promise.reject(new Error('remote skipped (AR throttle)')) : (async () => {
+    const ocrP = (async () => {
       let labels, imgW, imgH;
       // Azure path. The luminance context is the very canvas that was uploaded,
       // so the light-background sticker gate lines up with the coordinates.
@@ -4207,34 +2775,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         return { labels, imgW, imgH };
         }
       }
-      if (section === 'fiction') {
-        // Fiction stickers are large; one downscaled frame reads them fine.
-        const data1 = await callOcrProxyWithRetry(encoded.blob, signal);
-        labels = reconstructFiction(parseOcrOverlay(data1), encoded.canvas.getContext('2d'));
-        imgW = encoded.sentW; imgH = encoded.sentH;
-      } else {
-        // Nonfiction stickers are tiny; OCR native-resolution L/R tiles.
-        // Reuse the speculative pre-encode started at capture time if present —
-        // same idea as pendingEncode, hides this cost behind photo-review time.
-        const { tiles, canvas: fullCanvas } = await (pendingTiles ?? encodeTilesForOCR());
-        pendingTiles = null;
-        const datas = await Promise.all(tiles.map(t => callOcrProxyWithRetry(t.blob, signal)));
-        const words = [];
-        datas.forEach((d, i) => {
-          for (const w of parseOcrWords(d)) { w.x += tiles[i].xoff; words.push(w); }
-        });
-        // Drop duplicate reads from the tile overlap zone.
-        const dedup = [];
-        for (const w of words) {
-          if (!dedup.some(s => s.t === w.t && Math.abs(s.x - w.x) < 12 && Math.abs(s.y - w.y) < 12)) {
-            dedup.push(w);
-          }
-        }
-        labels = reconstructNonfiction(dedup, fullCanvas.getContext('2d'));
-        imgW = fullCanvas.width; imgH = fullCanvas.height;
-      }
-      console.log(`[perf] runOcr: OCR call(s) done at ${Math.round(performance.now() - t0)}ms`);
-      return { labels, imgW, imgH };
+      // Azure could not be reached, or returned nothing usable. There is no
+      // second reader on this path — the caller falls back to Gemini (deviceOcr).
+      return null;
     })();
 
     // Progressive PROGRESS (not a progressive answer): hand the caller the
@@ -4242,7 +2785,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // volunteer that reading worked while fusion/ordering finish. Fires at most
     // once, never in AR mode (which has its own render loop), and carries no
     // verdict — see drawProgressBoxes.
-    if (!arMode && onFirstReads) {
+    if (onFirstReads) {
       let fired = false;
       const fire = (boxes) => {
         if (fired || !boxes || !boxes.length) return;
@@ -4250,10 +2793,10 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         console.log(`[perf] runOcr: first reads (${boxes.length} boxes) at ${Math.round(performance.now() - t0)}ms`);
         try { onFirstReads(boxes); } catch {}
       };
-      // The device/cloud engine emits fraction-space boxes directly.
+      // The standby reader emits fraction-space boxes directly.
       localP.then(books => fire((books || []).filter(b => b.bboxFrac).map(b => b.bboxFrac)),
                   () => {});
-      // ocr.space returns pixel boxes in its own sent-image space; normalise.
+      // Azure returns pixel boxes in its own sent-image space; normalise.
       ocrP.then(r => fire((r?.labels || [])
                   .filter(l => l.bbox && r.imgW && r.imgH)
                   .map(l => [l.bbox[0] / r.imgW, l.bbox[1] / r.imgH,
@@ -4261,24 +2804,13 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
                 () => {});
     }
 
-    // Track remote health so the AR loop can surface a persistent "online check
-    // unavailable — local reads only" status (and keep serving on-device reads)
-    // instead of going silent. Only meaningful when a remote call was actually
-    // attempted; a throttled (skipRemote) cycle leaves the last verdict intact.
-    if (arMode && !skipRemote) {
-      ocrP.then(() => { arRemoteDown = false; }, () => { arRemoteDown = true; });
-    }
-
-    // ── Still-photo mode: ONE result, once everything is in ──────────────────
-    // The old progressive path rendered the fast engine immediately and then
+    // ── ONE result, once everything is in ────────────────────────────────────
+    // An earlier progressive path rendered the fast engine immediately and then
     // re-rendered when the slower one landed. That produced two answers for one
-    // photo — a small one, then a noticeably bigger one — which reads as the
-    // app changing its mind rather than making progress. For a single still
-    // photo there's nothing to track and no reason to publish a provisional
-    // answer, so both engines are awaited, fused, title-checked, and rendered
-    // exactly once. (The live AR loop below keeps the progressive path: there,
-    // showing something immediately genuinely matters.)
-    if (!arMode) {
+    // photo — a small one, then a noticeably bigger one — which reads as the app
+    // changing its mind rather than making progress. For a single still photo
+    // there is nothing to track and no reason to publish a provisional answer.
+    {
       // Titles are read by Gemini CONCURRENTLY with the on-device pass. The
       // two take about the same wall time (~6s vs ~7s), so titles arrive for
       // free instead of costing a serial title-reading step after the labels
@@ -4406,7 +2938,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // 4.3s deadline from the start of runOcr, floored at 250ms.
     const graceMs = Math.max(250, Math.min(LOCAL_GRACE_MS, 4300 - (performance.now() - t0)));
     const graceP = new Promise(r => { graceTimer = setTimeout(() => r(GRACE_TIMEOUT), graceMs); });
-    const raced = localOcrEnabled ? await Promise.race([localP, graceP]) : null;
+    const raced = await Promise.race([localP, graceP]);
     clearTimeout(graceTimer);
     const gemOnTime = raced === GRACE_TIMEOUT || !raced ? null : mapGemToPixels(raced, imgW, imgH);
     console.log(`[perf] runOcr: local race resolved at ${Math.round(performance.now() - t0)}ms (${raced === GRACE_TIMEOUT ? 'grace won — rendering remote-only, local will refine' : raced ? 'local won — fused into first render' : 'local unavailable — remote-only'})`);
@@ -5929,8 +4461,6 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     debugSwitch.classList.toggle('on', debugMode);
     debugToggle.setAttribute('aria-checked', String(debugMode));
     settingsBtn.classList.toggle('debug-active', debugMode);
-    // The live-AR scan is experimental — only surface its entry in debug mode.
-    liveArEntry.style.display = debugMode ? '' : 'none';
     document.getElementById('debugBadge')?.remove();
     if (debugMode) {
       const badge = document.createElement('div');
@@ -5940,76 +4470,6 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     settingsMenu.classList.remove('show');
     settingsBtn.setAttribute('aria-expanded', 'false');
   });
-
-  const liveArEntry = document.getElementById('liveArEntry');
-  liveArEntry.addEventListener('click', () => {
-    settingsMenu.classList.remove('show');
-    settingsBtn.setAttribute('aria-expanded', 'false');
-    openLiveCamera();
-  });
-
-  const geminiToggle = document.getElementById('geminiToggle');
-  const geminiSwitch  = document.getElementById('geminiToggleSwitch');
-  geminiSwitch.classList.toggle('on', localOcrEnabled);
-  geminiToggle.setAttribute('aria-checked', String(localOcrEnabled));
-  geminiToggle.addEventListener('click', () => {
-    localOcrEnabled = !localOcrEnabled;
-    localStorage.setItem('shelfcheck.localocr', localOcrEnabled ? '1' : '0');
-    geminiSwitch.classList.toggle('on', localOcrEnabled);
-    geminiToggle.setAttribute('aria-checked', String(localOcrEnabled));
-    settingsMenu.classList.remove('show');
-    settingsBtn.setAttribute('aria-expanded', 'false');
-    if (localOcrEnabled && window.LocalOCR && LocalOCR.available()) {
-      LocalOCR.preload().catch(() => {});
-    }
-  });
-
-  const titleToggle = document.getElementById('titleToggle');
-  const titleSwitch = document.getElementById('titleToggleSwitch');
-  titleSwitch.classList.toggle('on', geminiTitlesEnabled);
-  titleToggle.setAttribute('aria-checked', String(geminiTitlesEnabled));
-  titleToggle.addEventListener('click', () => {
-    geminiTitlesEnabled = !geminiTitlesEnabled;
-    localStorage.setItem('shelfcheck.gemtitles', geminiTitlesEnabled ? '1' : '0');
-    titleSwitch.classList.toggle('on', geminiTitlesEnabled);
-    titleToggle.setAttribute('aria-checked', String(geminiTitlesEnabled));
-    settingsMenu.classList.remove('show');
-    settingsBtn.setAttribute('aria-expanded', 'false');
-  });
-
-  // The Cloud OCR toggle only appears once a Modal endpoint URL is configured
-  // (constant, ?cloud=, or localStorage). Off falls back to the on-device
-  // engine, so a volunteer can always run without the server.
-  const cloudToggle = document.getElementById('cloudToggle');
-  const cloudSwitch = document.getElementById('cloudToggleSwitch');
-  if (CLOUD_OCR_URL) {
-    cloudToggle.style.display = '';
-    cloudSwitch.classList.toggle('on', cloudOcrEnabled);
-    cloudToggle.setAttribute('aria-checked', String(cloudOcrEnabled));
-    cloudToggle.addEventListener('click', () => {
-      cloudOcrEnabled = !cloudOcrEnabled;
-      localStorage.setItem('shelfcheck.cloud', cloudOcrEnabled ? '1' : '0');
-      cloudSwitch.classList.toggle('on', cloudOcrEnabled);
-      cloudToggle.setAttribute('aria-checked', String(cloudOcrEnabled));
-      settingsMenu.classList.remove('show');
-      settingsBtn.setAttribute('aria-expanded', 'false');
-      if (cloudOcrEnabled) warmCloud();
-    });
-  }
-
-  // Warm the engine as soon as the page is idle. For the on-device engine that
-  // means the one-time model download + compile; for the cloud engine it means
-  // spinning the GPU container up early. Both happen while the user lines up
-  // the shot instead of inside the first scan.
-  if (cloudOcrEnabled) warmCloud();
-  if (localOcrEnabled) {
-    const warm = () => {
-      if (window.LocalOCR && LocalOCR.available()) LocalOCR.preload().catch(() => {});
-    };
-    if ('requestIdleCallback' in window) requestIdleCallback(warm, { timeout: 4000 });
-    else setTimeout(warm, 1500);
-  }
-
 
   function showTimingBadge(prepMs, apiMs, ocrMs) {
     document.getElementById('timingBadge')?.remove();
