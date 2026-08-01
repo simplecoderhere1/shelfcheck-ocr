@@ -1608,13 +1608,22 @@
       if (upp / first.length < 0.6) continue;      // surname line is CAPITALISED
       const ux = Math.min(...g.map(w => w.x)), uy = Math.min(...g.map(w => w.y));
       const ur = Math.max(...g.map(w => w.x + w.w)), ub = Math.max(...g.map(w => w.y + w.h));
-      // Azure's real confidence, MINIMUM across the words making up the label —
-      // the same statistic the nonfiction reconstructor uses. This was a flat
-      // 0.9, which meant the misshelving confidence bar could not discriminate
-      // between fiction labels AT ALL: a cleanly-read "VUONG, Ocean" and a
-      // half-read "WALKER Karen Thomp" arrived with identical scores, so either
-      // both were eligible to be flagged or neither was.
-      const conf = Math.min(...g.map(w => w.c ?? 0.9));
+      // Azure's real confidence, taken over the SURNAME LINE only.
+      //
+      // This was a flat 0.9, which meant the misshelving bar could not tell a
+      // clean "VUONG, Ocean" from a half-read "WALKER Karen Thomp" and three
+      // correctly-shelved books got accused. Replacing it with the minimum
+      // across ALL the label's words fixed those, and immediately cost a true
+      // detection: "WALLACE. David Foster" — the one genuinely misfiled book on
+      // that shelf — dropped to 0.504 and fell under the bar, because the given
+      // name read poorly even though the surname did not.
+      //
+      // The surname is what decides where a book files; the given name only
+      // breaks ties between books by the same author. Judging the label by a
+      // word that cannot change its shelf position is measuring the wrong thing.
+      const lineH = Math.min(...g.map(w => w.h));
+      const surnameLine = g.filter(w => Math.abs(w.y - g[0].y) <= lineH * 0.6);
+      const conf = Math.min(...surnameLine.map(w => w.c ?? 0.9));
       out.push({ text, bbox: [ux, uy, ur - ux, ub - uy], score: conf,
                  unclear: conf < AZ_MIN_NUM_CONF });
     }
