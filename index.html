@@ -1542,6 +1542,64 @@
     return fixed;
   }
 
+  // ── Closer look, fiction ─────────────────────────────────────────────────
+  // Same reason the nonfiction pass exists, and the same one extra call: on a
+  // packed shelf Azure sometimes does not read a sticker at all. For the two
+  // VON ARNIM books it returned "DNING", "ION" and "AI" and never produced
+  // "ARNIM" anywhere in its output. No assembler can recover a word that was
+  // never read — the sticker has to be cropped out and re-read on its own,
+  // which is what isolation buys. A fiction sticker is SURNAME over given name
+  // rather than number over cutter, so it needs its own reader and merge rule.
+  function zoomCandidatesFiction(labels) {
+    const out = [];
+    labels.forEach((l, i) => {
+      if ((l.score ?? 1) < AZ_MIN_NUM_CONF || !labelPlausible(l.text, 'fiction')) out.push(i);
+    });
+    return out;
+  }
+
+  function readZoomCellsFiction(words, rects) {
+    return rects.map(([rx, ry, rw, rh]) => {
+      const inCell = words.filter(w => {
+        const cx = w.x + w.w / 2, cy = w.y + w.h / 2;
+        return cx >= rx && cx <= rx + rw && cy >= ry && cy <= ry + rh;
+      });
+      if (!inCell.length) return null;
+      // Top-to-bottom, then left-to-right within a line, matching the order
+      // reconstructFictionAzure joins words in so parseSurnameAndFirst agrees.
+      inCell.sort((a, b) => (Math.abs(a.y - b.y) > Math.min(a.h, b.h) * 0.6)
+        ? a.y - b.y : a.x - b.x);
+      const lineH = Math.min(...inCell.map(w => w.h));
+      const surnameLine = inCell.filter(w => Math.abs(w.y - inCell[0].y) <= lineH * 0.6);
+      return {
+        text: inCell.map(w => w.t).join(' ').replace(/\s+/g, ' ').trim(),
+        conf: Math.min(...surnameLine.map(w => w.c ?? 0.9)),
+      };
+    });
+  }
+
+  function mergeZoomReadsFiction(labels, idxs, reads) {
+    let fixed = 0;
+    idxs.forEach((li, ci) => {
+      const l = labels[li], r = reads[ci];
+      if (!l || !r || !r.text) return;
+      if ((r.conf ?? 0) < AZ_ZOOM_MIN_CONF) return;
+      // A crop still contains slivers of the spines either side, so an
+      // unconstrained re-read can be worse than what it replaces. Only a
+      // well-formed SURNAME/given-name label is allowed to overwrite anything.
+      if (!labelPlausible(r.text, 'fiction')) return;
+      // The surname decides where a book files, so a re-read that disagrees
+      // with an already confident, already well-formed label is far more likely
+      // to have caught the neighbouring sticker than to be a correction.
+      if (labelPlausible(l.text, 'fiction') && (l.score ?? 0) >= AZ_ZOOM_MIN_CONF) return;
+      l.text  = r.text;
+      l.score = Math.max(l.score ?? 0, r.conf);
+      l.unclear = false;
+      fixed++;
+    });
+    return fixed;
+  }
+
   // Words that are never a surname. Without this an English word printed on the
   // spine gets clustered as a fiction label and files itself in the middle of
   // the run, producing false flags on the books either side of it.
@@ -2837,6 +2895,21 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // Anchors that still have no author tag cannot be sorted, so they stop
           // here rather than reaching the volunteer as half a label.
           labels = labels.filter(l => l.cut);
+        } else {
+          try {
+            const zt0 = performance.now();
+            const idxs = zoomCandidatesFiction(labels).slice(0, AZ_ZOOM_MAX);
+            if (idxs.length) {
+              const sheet = await encodeZoomSheet(labels, idxs, enc.sentW);
+              if (sheet) {
+                const zd = await callAzureOcr(sheet.blob, signal);
+                const n = mergeZoomReadsFiction(labels, sheet.idxs,
+                            readZoomCellsFiction(parseAzureWords(zd), sheet.rects));
+                console.log(`[perf] closer look (fiction): ${n} of ${sheet.idxs.length}` +
+                  ` sharpened — total ${(performance.now() - zt0) | 0}ms`);
+              }
+            }
+          } catch (e) { console.log('[perf] closer look skipped:', e.message); }
         }
         // Marks these as the trusted sole engine (see the oOnly branch in
         // fuseLabels) and attaches the spine titles Azure returned in the same
