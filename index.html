@@ -1507,6 +1507,15 @@
     return fixed;
   }
 
+  // Words that are never a surname. Without this an English word printed on the
+  // spine gets clustered as a fiction label and files itself in the middle of
+  // the run, producing false flags on the books either side of it.
+  const FICTION_STOPWORDS = new Set([
+    'THE', 'AND', 'FOR', 'NOT', 'BUT', 'HER', 'HIS', 'OUR', 'ALL', 'ONE', 'TWO',
+    'NEW', 'HOW', 'WHY', 'WHO', 'WHAT', 'WHEN', 'FROM', 'WITH', 'THAT', 'THIS',
+    'INTO', 'OVER', 'BOOK', 'NOVEL', 'STORIES',
+  ]);
+
   function reconstructFictionAzure(words, ctx) {
     const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
     const maxH = maxDim * 0.025;
