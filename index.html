@@ -1329,14 +1329,18 @@
 
     const used = new Set();
     const labels = [];
+
+    // ── Pass 1: resolve each anchor's NUMBER ────────────────────────────────
+    // Decimal continuations are unambiguous (directly below, x-aligned, and the
+    // fragment shape "[.,]digits" belongs to nothing else), so they can still be
+    // claimed anchor by anchor.
+    const stubs = [];
     for (const a of anchors) {
       if (used.has(a)) continue;
       const axc = a.x + a.w / 2;
       let num = a.t;
       const parts = [a];
       let curBottom = a.y + a.h;
-
-      // decimal continuation directly below a bare NNN anchor
       if (RX_NUM3.test(a.t)) {
         for (const w of small) {
           if (used.has(w) || w === a) continue;
@@ -1351,44 +1355,78 @@
           }
         }
       }
+      used.add(a);
+      stubs.push({ a, num, parts, curBottom, axc, cutter: null });
+    }
 
-      // Nearest cutter below the number. Azure returns one wide token for a full
-      // number ("635.048" as ~82px) where ocr.space returns two narrow ones, so
-      // the sideways tolerance carries a text-HEIGHT term on top of the shared
-      // width term — otherwise a wide number reaches into the neighbouring spine
-      // and steals its tag.
-      //
-      // Scored, not first-match: a strict "lowest dy wins" picks a tag that is
-      // nearer vertically but clearly under the next spine along.
-      const cand = [];
+    // ── Pass 2: assign author tags GLOBALLY, best pair first ────────────────
+    // This used to run inside the loop above: each anchor took its own best
+    // candidate in array order, so an anchor that merely happened to come first
+    // could claim a tag that sat closer to a later one, and that later anchor
+    // then found nothing and was dropped for having no tag. Measured over the
+    // cached responses, 28 of 40 missed labels had their tag PRESENT in Azure's
+    // words and unassembled — this was the biggest single cause.
+    //
+    // Collecting every admissible (anchor, tag) pair and assigning the closest
+    // ones first makes the outcome independent of array order: a tag goes to the
+    // anchor it actually sits under, not to whoever asked first.
+    //
+    // Azure returns one wide token for a full number ("635.048" as ~82px) where
+    // ocr.space returns two narrow ones, so the sideways tolerance carries a
+    // text-HEIGHT term on top of the shared width term — otherwise a wide number
+    // reaches into the neighbouring spine and steals its tag.
+    const pairs = [];
+    for (const s of stubs) {
       for (const w of small) {
-        if (used.has(w) || w === a) continue;
+        if (used.has(w)) continue;
         const u = w.t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
         if (!AZ_RX_CUTTER.test(u)) continue;
-        const wxc = w.x + w.w / 2;
-        const dy = w.y - curBottom;
-        const dx = Math.abs(wxc - axc);
-        if (dy < -a.h * 0.5 || dy > a.h * 3.0) continue;
-        if (dx > Math.max(a.w, w.w) * 1.2 + a.h * AZ_CUT_DX_H) continue;
+        const dy = w.y - s.curBottom;
+        const dx = Math.abs((w.x + w.w / 2) - s.axc);
+        if (dy < -s.a.h * 0.5 || dy > s.a.h * 3.0) continue;
+        if (dx > Math.max(s.a.w, w.w) * 1.2 + s.a.h * AZ_CUT_DX_H) continue;
         // NOTE: a confidence term was added to this score and swept from 0 to 3;
         // results were identical, and only an absurd weight (50) moved a single
         // label. The misreads come back just as confident as the good reads, so
         // confidence cannot separate them here. Reverted, recorded so it is not
         // retried.
-        cand.push({ a, w, score: Math.abs(dy) / a.h + dx / Math.max(1, a.h) });
+        pairs.push({ s, w, score: Math.abs(dy) / s.a.h + dx / Math.max(1, s.a.h) });
       }
-      cand.sort((p, q) => p.score - q.score);
-      const best = cand[0] || null;
-      let cutter = null;
-      if (best) {
-        cutter = best.w.t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
-        parts.push(best.w); used.add(best.w);
-      }
-      used.add(a);
+    }
+    pairs.sort((p, q) => p.score - q.score);
+    for (const p of pairs) {
+      if (p.s.cutter || used.has(p.w)) continue;
+      p.s.cutter = p.w.t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
+      p.s.parts.push(p.w);
+      used.add(p.w);
+    }
 
+    // ── Pass 3: build the labels ────────────────────────────────────────────
+    for (const { a, num, parts, cutter } of stubs) {
       const ux = Math.min(...parts.map(p => p.x)),  uy = Math.min(...parts.map(p => p.y));
       const ur = Math.max(...parts.map(p => p.x + p.w)), ub = Math.max(...parts.map(p => p.y + p.h));
-      if (lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8) < 0.30) continue;
+      // Light-background gate: a call-number sticker is printed on white, so a
+      // union box that is mostly dark is publisher text or cover art, not a
+      // label.
+      //
+      // The threshold was 0.30, inherited from the ocr.space reconstructor whose
+      // word boxes were tighter. Azure returns one wide token for a full number,
+      // so its union boxes reach further into the dark spine either side and the
+      // same threshold rejects real stickers: pair_probe.mjs measured this gate
+      // discarding 17 labels on 195849222 alone — more than the pairing logic
+      // loses. Swept over the cached responses (`--lit=`):
+      //
+      //     0.30  recall 84.7%  precision 76.3%
+      //     0.20  recall 86.9%  precision 76.5%
+      //     0.15  recall 87.3%  precision 76.0%
+      //     0.10  recall 88.6%  precision 75.7%
+      //     0.05  recall 89.4%  precision 75.6%
+      //
+      // Recall climbs steadily while precision barely moves, so the gate was
+      // costing real books and buying almost nothing. 0.10 takes most of the
+      // gain; what it lets through is malformed, and the shape gate in
+      // finishLabels is a better filter for that than a pixel threshold.
+      if (lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8) < 0.10) continue;
 
       const conf = Math.min(...parts.map(p => p.c ?? 0.9));
       labels.push({
