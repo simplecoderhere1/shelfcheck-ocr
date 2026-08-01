@@ -1565,13 +1565,41 @@
     const find = i => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
     const union = (i, j) => { const ri = find(i), rj = find(j); if (ri !== rj) parent[rj] = ri; };
 
+    // Normalised by the WIDER word, not the narrower one. Dividing by the
+    // narrower word meant any short fragment lying inside a wide word's x-span
+    // scored a perfect 1.0 — so a two-letter scrap off the NEXT book's spine
+    // was maximally "overlapping" and always got absorbed. That is how
+    // "VREELAND"/"Susan" (both read cleanly, 0.65 and 0.99) became
+    // "VREELAND Susan NE" at score 0.25 and got flagged as unreadable: the
+    // stray "NE" came from the neighbouring sticker and poisoned the surname
+    // line the score is taken over.
     const xOv = (a, b) => {
       const ov = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
-      return ov / Math.max(1, Math.min(a.w, b.w));
+      return ov / Math.max(1, Math.max(a.w, b.w));
     };
+    const letters  = w => w.t.replace(/[^A-Za-z]/g, '');
+    const isCaps   = w => letters(w).length > 0 && letters(w) === letters(w).toUpperCase();
+    const sameLine = (a, b) => Math.abs(a.y - b.y) <= Math.min(a.h, b.h) * 0.6;
+
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
         const a = cand[i], b = cand[j];
+        // Two CAPITALISED words sharing a line are two different stickers, not
+        // one surname — on a packed shelf the next label begins a few pixels
+        // away, and fusing them both garbles the text and deletes a book
+        // ("WADE WADE Becky", "WACHTEL WACHTEL, ShirleyShirley RuSaak"). The
+        // only genuine multi-word surnames here are prefixed ("VON ARNIM"), so
+        // allow the pair only when the left word is a known prefix. Given-name
+        // words are mixed case and are untouched by this.
+        if (isCaps(a) && isCaps(b) && sameLine(a, b)) {
+          const [l, r] = a.x <= b.x ? [a, b] : [b, a];
+          if (!PLAUSIBLE_PREFIXES.has(letters(l).toLowerCase())) continue;
+          // A prefix sits BESIDE its surname ("VON ARNIM"), so the two share no
+          // vertical overlap for xOv to measure — join them on adjacency, or
+          // the prefix is orphaned and the surname loses its first word.
+          if (r.x - (l.x + l.w) <= Math.max(a.h, b.h) * 1.5) union(i, j);
+          continue;
+        }
         if (xOv(a, b) < 0.4) continue;
         const gap = Math.max(a.y, b.y) - Math.min(a.y + a.h, b.y + b.h);
         if (gap <= Math.max(a.h, b.h) * 1.2) union(i, j);
