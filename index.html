@@ -1017,6 +1017,13 @@
   // was, so they are derived from the call-number words in the photo instead.
   const AZ_TEXT_H_K   = 4.2;   // largest label word, as a multiple of the median
   const AZ_CAL_MIN_N  = 6;     // below this many numbers, don't trust the median
+  // Tiles per photo, laid out as a grid shaped by the image's aspect ratio.
+  // 6 sits at the knee of the measured curve (see encodeTilesForOCR): it buys
+  // 91% -> 97% of labels becoming buildable, where going on to 9 tiles adds
+  // only 1.5pt for three more calls.
+  const TILE_TARGET  = 6;
+  const TILE_OVERLAP = 0.06;   // share of each axis, so a sticker on a seam
+                               // survives whole in at least one tile
   // Below this Azure word confidence a call number is more likely wrong than
   // right, so the label is marked unclear rather than trusted.
   const AZ_MIN_NUM_CONF = 0.70;
@@ -2281,17 +2288,45 @@
   async function encodeTilesForOCR() {
     const t0 = performance.now();
     const W = snapshot.width, H = snapshot.height;
-    const ov = Math.round(W * 0.05);
-    // Tile count is tunable (?tiles=N) for benchmarking: each tile is JPEG'd
-    // down to fit ocr.space's size limit, so more tiles means less compression
-    // per tile and potentially better reads, at the cost of more API calls.
-    const nTiles = Math.max(2, Math.min(6, Number(new URLSearchParams(location.search).get('tiles')) || 2));
+    // A GRID, not vertical strips.
+    //
+    // Azure omits text it can plainly see once a frame is crowded — on a row of
+    // 30 books all marked "641.568" it returns that token about 15 times, and
+    // the missing half simply cannot be assembled. Cutting the photo up is the
+    // known remedy, and counting tokens WITH MULTIPLICITY (supply_probe.py)
+    // shows how much each cut is worth, over the four worst shelves:
+    //
+    //     full frame only        58.2% of labels buildable    1 call
+    //     + 2 vertical strips    91.0%                        3
+    //     + 2x2 grid             94.0%                        5
+    //     + 3x2 grid             97.0%                        7
+    //     + 3x3 grid             98.5%                       10
+    //
+    // The old ceiling metric that chose 2 strips asked only whether a label's
+    // parts appeared ANYWHERE, so one clear "641.568" made all thirty books
+    // look recoverable and the extra tiles looked worthless. They are not.
+    //
+    // The grid is derived from the image's own aspect ratio so cells come out
+    // roughly square. Strips were always cut along x whatever the shape of the
+    // photo, which on a PORTRAIT phone photo gives two very tall, very narrow
+    // slices — the opposite of the isolation that makes tiling work, and the two
+    // portrait photos in the corpus are the two worst shelves for recall.
+    const qs = new URLSearchParams(location.search);
+    const want = Math.max(1, Math.min(12, Number(qs.get('tiles')) || TILE_TARGET));
+    const nx = Math.max(1, Math.min(want, Math.round(Math.sqrt(want * W / H))));
+    const ny = Math.max(1, Math.ceil(want / nx));
+    const ovx = Math.round(W * TILE_OVERLAP), ovy = Math.round(H * TILE_OVERLAP);
     const cuts = [];
-    for (let i = 0; i < nTiles; i++) {
-      const x0 = Math.floor(W * i / nTiles), x1 = Math.floor(W * (i + 1) / nTiles);
-      const lo = Math.max(0, x0 - (i ? ov : 0));
-      const hi = Math.min(W, x1 + (i < nTiles - 1 ? ov : 0));
-      cuts.push({ x: lo, w: hi - lo });
+    for (let iy = 0; iy < ny; iy++) {
+      for (let ix = 0; ix < nx; ix++) {
+        const x0 = Math.floor(W * ix / nx), x1 = Math.floor(W * (ix + 1) / nx);
+        const y0 = Math.floor(H * iy / ny), y1 = Math.floor(H * (iy + 1) / ny);
+        const lo = Math.max(0, x0 - (ix ? ovx : 0));
+        const hi = Math.min(W, x1 + (ix < nx - 1 ? ovx : 0));
+        const to = Math.max(0, y0 - (iy ? ovy : 0));
+        const bo = Math.min(H, y1 + (iy < ny - 1 ? ovy : 0));
+        cuts.push({ x: lo, w: hi - lo, y: to, h: bo - to });
+      }
     }
     // Crop straight from the snapshot and apply the contrast/saturate
     // enhancement per tile, instead of first filtering a whole extra
@@ -2307,10 +2342,10 @@
     const tiles = await Promise.all(cuts.map(async c => {
       const tTile0 = performance.now();
       const t = document.createElement('canvas');
-      t.width = c.w; t.height = H;
+      t.width = c.w; t.height = c.h;
       const tctx = t.getContext('2d');
       tctx.filter = 'contrast(1.08) saturate(1.05)';
-      tctx.drawImage(snapshot, c.x, 0, c.w, H, 0, 0, c.w, H);
+      tctx.drawImage(snapshot, c.x, c.y, c.w, c.h, 0, 0, c.w, c.h);
       // At most 2 encode attempts: try a good-quality first pass, and if it
       // overshoots the 1MB cap, jump straight to a quality estimated from
       // the overshoot ratio instead of stepping down 0.05 at a time (was up
@@ -2322,8 +2357,8 @@
         blob = await new Promise(r => t.toBlob(r, 'image/jpeg', q2));
         attempts = 2;
       }
-      console.log(`[perf] encodeTilesForOCR tile xoff=${c.x}: ${Math.round(performance.now() - tTile0)}ms, ${attempts} attempt(s), ${blob ? (blob.size/1024).toFixed(0)+'KB' : 'failed'}`);
-      return { blob, xoff: c.x };
+      console.log(`[perf] encodeTilesForOCR tile ${c.x},${c.y}: ${Math.round(performance.now() - tTile0)}ms, ${attempts} attempt(s), ${blob ? (blob.size/1024).toFixed(0)+'KB' : 'failed'}`);
+      return { blob, xoff: c.x, yoff: c.y };
     }));
     console.log(`[perf] encodeTilesForOCR total: ${Math.round(performance.now() - t0)}ms`);
     return { tiles, canvas: snapshot };
@@ -2904,7 +2939,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
                 const out = [];
                 ds.forEach((d, i) => {
                   if (!d) return;
-                  for (const w of parseAzureWords(d)) { w.x += tiles[i].xoff; out.push(w); }
+                  for (const w of parseAzureWords(d)) {
+                    w.x += tiles[i].xoff; w.y += tiles[i].yoff; out.push(w);
+                  }
                 });
                 return out;
               }).catch(() => null)
