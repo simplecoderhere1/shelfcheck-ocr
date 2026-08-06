@@ -1017,6 +1017,7 @@
   // was, so they are derived from the call-number words in the photo instead.
   const AZ_TEXT_H_K   = 4.2;   // largest label word, as a multiple of the median
   const AZ_CAL_MIN_N  = 6;     // below this many numbers, don't trust the median
+  const AZ_TEXT_H_K_FIC = 3.2; // the same, for fiction, measured off sticker words
   // Tiles per photo, laid out as a grid shaped by the image's aspect ratio.
   // 6 sits at the knee of the measured curve (see encodeTilesForOCR): it buys
   // 91% -> 97% of labels becoming buildable, where going on to 9 tiles adds
@@ -1676,12 +1677,36 @@
 
   function reconstructFictionAzure(words, ctx) {
     const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
-    const maxH = maxDim * 0.025;
-    const cand = words.filter(w => {
-      if (!w.t || w.h > maxH || w.w < w.h * 0.5) return false;
+    // Same fix as the nonfiction reader, by a different route. "A label word is
+    // at most 2.5% of the long edge" encodes how far away the camera was, not
+    // anything about fiction labels, and past a point it discards every one of
+    // them at once.
+    //
+    // Fiction has no call numbers to calibrate from, so the signal is the
+    // STICKER: this filter already asks of every word whether it sits on a pale
+    // label, and the answer is free. Words that do have a median height of
+    // 19-20px on both fiction shelves against the old fixed 60px ceiling, a
+    // ratio of 3.0-3.2 — close enough to the nonfiction figure to be the same
+    // fact about the printing. The median resists the large title text that
+    // also sits on pale covers (p90 is 95-106px on these shelves).
+    //
+    // A note on what NOT to measure here: matching ground-truth surnames
+    // against word text does NOT identify sticker words, because the author's
+    // name is also printed large on the spine. That measurement says the label
+    // text is 77-85px and would set the threshold far too high.
+    const preMax = maxDim * 0.15;    // cost bound on the light test only — set
+                                     // far above any plausible label so it can
+                                     // never become a threshold in disguise
+    const onSticker = words.filter(w => {
+      if (!w.t || w.h > preMax || w.w < w.h * 0.5) return false;
       if (!/[A-Za-z]/.test(w.t)) return false;
       return lightRatio(ctx, w.x - 4, w.y - 4, w.w + 8, w.h + 8) >= 0.35;
     });
+    const stickerHs = onSticker.map(w => w.h).sort((a, b) => a - b);
+    const maxH = stickerHs.length >= AZ_CAL_MIN_N
+      ? stickerHs[stickerHs.length >> 1] * AZ_TEXT_H_K_FIC
+      : maxDim * 0.025;
+    const cand = onSticker.filter(w => w.h <= maxH);
 
     const n = cand.length;
     const parent = Array.from({ length: n }, (_, i) => i);
