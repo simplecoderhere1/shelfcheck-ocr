@@ -1012,6 +1012,11 @@
   // How far sideways a cutter may sit from its number, in units of text height,
   // ON TOP of the shared width term.
   const AZ_CUT_DX_H = 3.0;
+  // Self-calibration of the label-text scale. See reconstructNonfictionAzure:
+  // thresholds phrased as a share of the frame encode how far away the camera
+  // was, so they are derived from the call-number words in the photo instead.
+  const AZ_TEXT_H_K   = 4.2;   // largest label word, as a multiple of the median
+  const AZ_CAL_MIN_N  = 6;     // below this many numbers, don't trust the median
   // Below this Azure word confidence a call number is more likely wrong than
   // right, so the label is marked unclear rather than trusted.
   const AZ_MIN_NUM_CONF = 0.70;
@@ -1028,12 +1033,40 @@
   const AZ_ZOOM_CENTRE   = 0.22;   // re-read number must be near the cell centre
   const AZ_ZOOM_CUT_DX   = 1.5;    // tag must sit this close under its number
 
+  // TRIED AND REVERTED (2026-08-06) — recovering "anchorless" tags, i.e. books
+  // whose author tag Azure read but whose call number it never emitted, so no
+  // anchor existed to build a label around. That is the largest single miss
+  // cause (28 of 36 nonfiction misses), and the fix looked obvious: collect the
+  // unconsumed 3-letter tags sitting on white stickers and crop each one onto a
+  // sheet for an isolated re-read, exactly as the closer-look pass does.
+  //
+  // Two measured results killed it, both worth keeping:
+  //   1. Sharing the closer-look sheet is actively HARMFUL. Crops roughly
+  //      doubled (17->27, 8->22, 12->24), the sheet passed encodeZoomSheet's
+  //      4000px cap, its 2x zoom fell to 1x, and every REAL candidate was then
+  //      re-read at half magnification: repairs 12->7, 10->7, 8->6, live recall
+  //      88.1% -> 86.9%. The sheet is a shared, size-limited resource.
+  //   2. On its OWN sheet (one extra call, existing pass bit-identical) the
+  //      idea simply does not pay: 4 of 69 crops resolved across 8 shelves,
+  //      recall 88.1% -> 88.7%, FP 1 -> 2, worst render 3.9s -> 9.3s.
+  //
+  // The lesson generalises: isolation recovers text Azure PARTIALLY read — that
+  // is why the closer look works — but it does not conjure text the detector
+  // never found at all. Do not retry without a different way to locate the
+  // sticker, e.g. spine segmentation rather than a guessed offset above the tag.
+
   // Truncation test: is there ink to the RIGHT of the number, i.e. digits that
   // ran off the curve of the spine? A first-hit scan fired on the sticker's own
   // border, so this measures a column ink PROFILE and stops at a solid wall.
   const AZ_INK_MIN      = 0.65;
   const AZ_INK_WALL     = 0.85;
-  const AZ_INK_WALL_RUN = 4;
+  // A spine seam has to be this many columns wide to count as a wall. Expressed
+  // as a fraction of the NUMBER'S OWN HEIGHT rather than in raw pixels: "4
+  // pixels" means one thing on a 2400px whole-bay photo and something quite
+  // different on a close-up of a single row, where 4px is a fraction of a
+  // stroke and every character edge reads as a wall. Floored at 2 so the run
+  // test stays a run.
+  const AZ_INK_WALL_RUN_H = 0.28;
 
   // AZURE RECONSTRUCTION — unfinished, see memory. Azure's raw text is good
   // (16 of 17 label parts present on the shelf that fails worst, deep decimals
@@ -1205,10 +1238,11 @@
       for (let cy = 0; cy < bh; cy++) if (band[(cy * bw + cx) * 4] < cut) dark++;
       prof.push(dark / bh);
     }
+    const wallRun = Math.max(2, Math.round(h * AZ_INK_WALL_RUN_H));
     let endAt = bw, run = 0;
     for (let cx = 0; cx < bw; cx++) {
       run = prof[cx] > AZ_INK_WALL ? run + 1 : 0;
-      if (run >= AZ_INK_WALL_RUN) { endAt = cx - run + 1; break; }
+      if (run >= wallRun) { endAt = cx - run + 1; break; }
     }
     for (let cx = 0; cx < endAt; cx++) if (prof[cx] >= AZ_INK_MIN) return true;
     return false;
@@ -1265,7 +1299,31 @@
   // the very labels it exists to repair.
   function reconstructNonfictionAzure(words, ctx, keepUnpaired) {
     const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
-    const maxH = maxDim * 0.022;
+    // How big is label text in THIS photo? The filter below drops words too
+    // large to be a call number (spine titles, cover art). It used to ask that
+    // as `maxDim * 0.022` — a fixed share of the frame — which silently assumes
+    // the camera was the same distance away as it was for the ten test photos.
+    // It is not a property of libraries: photograph one shelf ROW instead of a
+    // whole bay and every word crosses the threshold at once and the read
+    // returns nothing. That is a cliff, not a graceful degradation, and a
+    // volunteer stepping closer is the most natural thing in the world.
+    //
+    // Call numbers name themselves — they are the words matching the Dewey
+    // pattern — so the photo can be asked directly how tall its label text is.
+    // The median is used rather than the mean because a shelf-end sign or a
+    // misread title can be arbitrarily large. Measured over the corpus, number
+    // words run 13.0-17.6px against the old fixed 52.8px ceiling, i.e. the
+    // ratio the old constant really encoded was 3.0-4.1x; AZ_TEXT_H_K sits just
+    // above that so this corpus behaves identically while the scale assumption
+    // disappears.
+    const numHs = words.filter(w => RX_NUM3.test(w.t) || RX_NUM_FULL.test(w.t))
+                       .map(w => w.h).sort((a, b) => a - b);
+    // Too few numbers to calibrate from (a fiction shelf misrouted here, or a
+    // read that failed) — fall back to the old fixed share rather than trust a
+    // median of two words.
+    const maxH = numHs.length >= AZ_CAL_MIN_N
+      ? numHs[numHs.length >> 1] * AZ_TEXT_H_K
+      : maxDim * 0.022;
     const small = dedupeWordReads(words.filter(w => w.h <= maxH && w.w >= w.h * 0.5));
 
     // Orphan decimal tails. Azure splits a call number across two words —
