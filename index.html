@@ -1779,6 +1779,13 @@
     // No dedupeWordReads here, deliberately: the fiction path reads only the
     // full frame, so one sticker yields one set of words. It becomes necessary
     // the moment fiction is tiled — see the revert note in runOcr.
+    //
+    // Adding it anyway was tried, on the theory that repeated near-identical
+    // labels ("WAITES, Martyn" twice, "WALKER Megan" twice) were one sticker
+    // read twice. Printing the label boxes disproved it: those pairs sit 65-110
+    // px apart on the shelf, one book-spine's width, and are genuinely two books
+    // by the same author standing side by side. Deduping them would delete real
+    // books. The repetition is a fact about libraries, not about Azure.
     const cand = onSticker.filter(w => w.h <= maxH);
 
     const n = cand.length;
@@ -4022,6 +4029,49 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     return a.length - b.length;
   }
 
+  // Are these two names the same name, one of them misread?
+  //
+  // Nonfiction protects itself from this already: a Dewey number Azure reports
+  // as cut off is tied against a longer sibling rather than compared, because
+  // digits that are not in the photograph cannot decide shelf position. Fiction
+  // had no equivalent and it is where every remaining false accusation comes
+  // from — not from bad ordering logic, but from the last letter of a surname.
+  //
+  // Libraries shelve an author's books together, so neighbours routinely share
+  // a surname, and then the ONLY thing separating them is the part of the read
+  // that is least reliable: WALKER/WALKET/WALKEN/WALKED off four adjacent
+  // spines, or WAITES "Maryn" against WAITES "Martyn". One substituted letter
+  // reverses the order and the shelf looks wrong when it is perfectly right.
+  //
+  // So: treat a difference that a single OCR slip explains as no evidence at
+  // all. Two forms count as the same name when the shorter is a prefix of the
+  // longer (the read stopped early) or one single-character edit turns one into
+  // the other — a letter read wrong, dropped, or invented ("Maryn"/"Martyn" is
+  // a dropped t, not a swapped one, and a substitution-only test misses it).
+  // Minimum lengths keep short scraps like "WAL" from swallowing every surname.
+  //
+  // This loses detections — WALKER really shelved among WALTER now passes — and
+  // that is the intended direction. A missed misfiling leaves a volunteer where
+  // they were; a false one sends them to the wrong book.
+  const NAME_PREFIX_MIN = 4;   // shorter than this, a prefix proves nothing
+  const NAME_EDIT_MIN   = 5;   // shorter than this, one letter is most of the word
+  function nameSlip(a, b) {
+    const norm = s => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+    const x = norm(a), y = norm(b);
+    if (!x || !y || x === y) return false;        // equal names compare normally
+    const [s, l] = x.length <= y.length ? [x, y] : [y, x];
+    if (l.startsWith(s)) return s.length >= NAME_PREFIX_MIN;
+    if (s.length < NAME_EDIT_MIN || l.length - s.length > 1) return false;
+    // One edit, checked by walking both together and allowing a single skip.
+    let i = 0, j = 0, edits = 0;
+    while (i < s.length && j < l.length) {
+      if (s[i] === l[j]) { i++; j++; continue; }
+      if (++edits > 1) return false;
+      if (s.length === l.length) { i++; j++; } else { j++; }   // substitute / drop
+    }
+    return edits + (l.length - j) + (s.length - i) === 1;
+  }
+
   // Dewey number compare: integer part numerically, then decimal digits
   // positionally, shorter decimal first — standard shelf filing order
   // (635 < 635.01 < 635.04 < 635.0483 < 635.1).
@@ -4132,8 +4182,29 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         const words = raw.split(/\s+/).filter(w => /[A-Za-z]/.test(w));
         if (words.length > 1) {
           const norm = t => t.toLowerCase().replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
-          const lead = norm(words.slice(0, -1).join(' '));
-          if (lead) { surname = lead; first = norm(words[words.length - 1]); }
+          // "All but the last word" is only right for a two-word label. On a
+          // three-word one it puts a given name into the surname: "WALKER Karen
+          // Thomp" filed under "walker karen", which sits nowhere near the
+          // WALKER run it belongs to and made the book look misshelved.
+          //
+          // The sticker itself says where the split is, in the same convention
+          // labelPlausible already relies on: the surname line is CAPITALISED
+          // and the given name is not. Take the leading run of capitalised words
+          // as the surname. When that run is the whole label there is no given
+          // name visible to separate, so fall back to the old rule rather than
+          // leaving the given name empty.
+          const isCaps = w => /[A-Za-z]/.test(w) && w === w.toUpperCase();
+          let k = 0;
+          while (k < words.length && isCaps(words[k])) k++;
+          if (k === 0 || k === words.length) k = words.length - 1;
+          const lead = norm(words.slice(0, k).join(' '));
+          // The given name is joined WITHOUT a space, because that is what the
+          // comma path produces ("shirleyrussak"). Keeping the space made the
+          // same name in two spellings compare unequal — compareFiling sorts a
+          // space before any letter — so "WACHTEL, Shirley Russak" and "WACHTEL
+          // Shirley Russak", one book each, accused each other. The surname does
+          // keep its spaces: the comma path spaces those too ("von kreisler").
+          if (lead) { surname = lead; first = norm(words.slice(k).join('')); }
         }
       }
       return { kind: 'str', val: surname, first, vol, title };
@@ -4149,6 +4220,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     if (a.kind !== b.kind) return a.kind === 'dewey' ? -1 : 1;
     let cmp;
     if (a.kind === 'str') {
+      // Undecidable rather than out of order — see nameSlip().
+      if (nameSlip(a.val, b.val)) return 0;
       cmp = compareFiling(a.val, b.val);
     } else {
       if (a.val.numStr === null || b.val.numStr === null) {
@@ -4183,6 +4256,10 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     }
     if (cmp !== 0) return cmp;
     if (a.kind === 'str') {
+      // The surnames matched exactly, so these are two books by one author and
+      // the given name decides. It is read from the same sticker and slips the
+      // same way ("Maryn" for "Martyn"), so it gets the same protection.
+      if (nameSlip(a.first || '', b.first || '')) return 0;
       cmp = compareFiling(a.first || '', b.first || '');
       if (cmp !== 0) return cmp;
     }
