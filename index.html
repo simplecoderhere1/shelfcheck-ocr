@@ -1424,6 +1424,20 @@
       if (ix <= 0 || iy <= 0) return false;
       return (ix * iy) / Math.max(1, w.w * w.h) >= 0.4;
     });
+    // TRIED AND REVERTED: splitting a welded number+cutter token. Azure
+    // sometimes returns a whole sticker as one token with the space missing,
+    // "641.5686COM", which matches neither the number nor the cutter pattern,
+    // so that book has no anchor. Recovering it looks free — both halves came
+    // out of one box, so no digit is invented — and it was corroborated against
+    // shelfNums to reject "2nd" and "04ULA".
+    //
+    // It manufactures WRONG labels. Ground truth for that sticker is
+    // "641.568 COM"; the weld had taken the number off the NEIGHBOURING sticker
+    // (641.5686 belongs to LAI and STI beside it) and joined it to COM. One
+    // token from Azure is not evidence that its characters came from one
+    // sticker. Measured: recall unchanged at 209/236, precision 76.3 -> 75.5.
+    // Only 8 such tokens exist in the whole corpus and most are junk ("2nd",
+    // "3OH"), so there is no volume here to be worth a subtler rule.
     const anchors = small.filter(w =>
       RX_NUM_FULL.test(w.t) || (RX_NUM3.test(w.t) && !insideFull(w)));
 
