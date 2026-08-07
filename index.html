@@ -1114,18 +1114,55 @@
   // No Dewey class starts with a zero, so a leading 0 means the "number" is a
   // decimal TAIL that broke loose from its class — Azure splits "641.568" into
   // two words and an orphaned "048" then looks exactly like a call number.
-  const PLAUSIBLE_NF = /^\s*[1-9]\d{0,2}(?:\.\d+)?\s+[A-Za-z]{3}\s*$/;
+  // The cutter length is a property of the LIBRARY, so it is learned from the
+  // shelf rather than written in. Every one of the 132 nonfiction cutters here
+  // is exactly three letters, and that fact does real work — it is what rejects
+  // "635 ICON" and "604 FOTO". But other libraries file with one letter, four,
+  // or a Cutter-Sanborn code like "635 S528", and a hardcoded 3 would demote
+  // EVERY label there. Reading would carry on looking fine while misshelving
+  // detection quietly stopped working and said nothing, which is the worst way
+  // for this to fail.
+  //
+  // A library is internally consistent, so the shelf in front of the camera can
+  // be asked. dominantCutLen() takes the mode of the cutter lengths actually
+  // read, and only trusts it with enough labels behind it and a clear majority;
+  // otherwise it returns null and the 3-letter default stands.
+  const PLAUSIBLE_CUT_MIN_N   = 8;    // fewer labels than this: don't infer
+  const PLAUSIBLE_CUT_MAJORITY = 0.6; // the mode must be this share of them
+  const plausibleNf = (len = 3) =>
+    new RegExp(`^\\s*[1-9]\\d{0,2}(?:\\.\\d+)?\\s+[A-Za-z]{${len}}\\s*$`);
+  const PLAUSIBLE_NF = plausibleNf(3);
+  function dominantCutLen(labels) {
+    const hist = new Map();
+    let n = 0;
+    for (const l of labels || []) {
+      const m = /^\s*[1-9]\d{0,2}(?:\.\d+)?\s+([A-Za-z]{1,6})\s*$/.exec(
+        String(l && l.text || l || '').replace(/\s+(?:v\.?\s*)?\d{1,4}\s*$/i, ''));
+      if (!m) continue;
+      const k = m[1].length;
+      hist.set(k, (hist.get(k) || 0) + 1);
+      n++;
+    }
+    if (n < PLAUSIBLE_CUT_MIN_N) return null;
+    let best = 0, bestN = 0;
+    for (const [k, v] of hist) if (v > bestN) { best = k; bestN = v; }
+    return bestN / n >= PLAUSIBLE_CUT_MAJORITY ? best : null;
+  }
   const PLAUSIBLE_PREFIXES = new Set([
     'de','del','dela','di','du','la','le','les','lo','mac','mc',
     'o','van','von','st','san','santa','el','al','bin','ibn','da','das','dos',
   ]);
-  function labelPlausible(text, section) {
+  // cutLen: the cutter length observed on THIS shelf, from dominantCutLen().
+  // Omitted (every existing caller and both test harnesses) means the 3-letter
+  // default, so behaviour here is unchanged.
+  function labelPlausible(text, section, cutLen) {
     const t = String(text || '').trim();
     if (!t) return false;
     if (section !== 'fiction') {
       // Volume/year suffixes are part of the shelf's own vocabulary
       // ("641.568 SOU 2019"), so strip a trailing number before testing.
-      return PLAUSIBLE_NF.test(t.replace(/\s+(?:v\.?\s*)?\d{1,4}\s*$/i, ''));
+      const rx = cutLen ? plausibleNf(cutLen) : PLAUSIBLE_NF;
+      return rx.test(t.replace(/\s+(?:v\.?\s*)?\d{1,4}\s*$/i, ''));
     }
     // Comma or full stop after the surname is optional — treat both as a plain
     // separator and split on whitespace.
@@ -1675,6 +1712,39 @@
     'INTO', 'OVER', 'BOOK', 'NOVEL', 'STORIES',
   ]);
 
+  // One sticker read twice lands in the same group and both texts are kept, so
+  // the label comes out saying the surname two or three times: "WALLACE.
+  // WALLACE, David Foster", "WALK WALKER WALKER, Ann Marie", "WALKER Karen
+  // Thomps® Thompse". Azure returns overlapping reads of the same word on its
+  // own, and any tiling multiplies them, so the grouper cannot avoid it — the
+  // two boxes sit on top of each other, which is exactly what the union test
+  // looks for.
+  //
+  // The damage is not cosmetic. A doubled surname drags the label's confidence
+  // down (WALLACE fell 0.959 -> 0.664) and mis-sorts it, which is how a
+  // genuinely misfiled book stops being reported.
+  //
+  // Collapse only ADJACENT tokens where one is a prefix of the other, ignoring
+  // case and punctuation, keeping the longer. Adjacency matters: "BOO WAL
+  // WALKER, Boo" has a stray "BOO" off the neighbouring spine that must NOT
+  // merge with the real given name at the end. No real name repeats a word, so
+  // this cannot damage a correct label.
+  function collapseRepeats(toks) {
+    const norm = s => String(s).toLowerCase().replace(/[^a-z]/g, '');
+    const out = [];
+    for (const t of toks) {
+      const a = norm(t);
+      if (!a) { out.push(t); continue; }
+      const prev = out.length ? norm(out[out.length - 1]) : '';
+      if (prev && (a.startsWith(prev) || prev.startsWith(a))) {
+        if (a.length > prev.length) out[out.length - 1] = t;   // keep the fuller read
+        continue;
+      }
+      out.push(t);
+    }
+    return out;
+  }
+
   function reconstructFictionAzure(words, ctx) {
     const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
     // Same fix as the nonfiction reader, by a different route. "A label word is
@@ -1770,7 +1840,7 @@
       // Foster" must join in that order for parseSurnameAndFirst to read it.
       g.sort((a, b) => (Math.abs(a.y - b.y) > Math.min(a.h, b.h) * 0.6)
         ? a.y - b.y : a.x - b.x);
-      const text = g.map(w => w.t).join(' ').replace(/\s+/g, ' ').trim();
+      const text = collapseRepeats(g.map(w => w.t)).join(' ').replace(/\s+/g, ' ').trim();
       const first = (text.split(/[\s,.]+/)[0] || '').replace(/[^A-Za-z]/g, '');
       if (first.length < 3) continue;
       // Spine TITLES are set in caps too, so an all-caps leading word is not by
@@ -2843,8 +2913,11 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // honestly marked unread, and — per the flag-safety invariant — makes it
     // impossible for it to raise a red misshelving flag.
     let demoted = 0;
+    // Learn this shelf's cutter length before judging any label by it.
+    const cutLen = tieSect === 'fiction' ? null : dominantCutLen(out);
+    if (cutLen && cutLen !== 3) console.log(`[shape] cutter length on this shelf: ${cutLen}`);
     for (const o of out) {
-      if (labelPlausible(o.text, tieSect)) continue;
+      if (labelPlausible(o.text, tieSect, cutLen)) continue;
       // A FLAG, not a score penalty. This used to write score = 0.6, chosen to
       // sit under a 0.65 confidence bar — so the moment that bar moved to 0.55
       // every malformed label sailed through it and the gate silently stopped
