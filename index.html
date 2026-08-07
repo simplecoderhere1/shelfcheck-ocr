@@ -1706,6 +1706,9 @@
     const maxH = stickerHs.length >= AZ_CAL_MIN_N
       ? stickerHs[stickerHs.length >> 1] * AZ_TEXT_H_K_FIC
       : maxDim * 0.025;
+    // No dedupeWordReads here, deliberately: the fiction path reads only the
+    // full frame, so one sticker yields one set of words. It becomes necessary
+    // the moment fiction is tiled — see the revert note in runOcr.
     const cand = onSticker.filter(w => w.h <= maxH);
 
     const n = cand.length;
@@ -2956,6 +2959,30 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // Resolution is NOT the lever — re-reading the originals at full
           // 4080px changed nothing. It is how much of the FRAME the text
           // occupies, which is why tiling works and upscaling does not.
+          // TRIED AND REVERTED (2026-08-06) — tiling FICTION as well.
+          //
+          // The reasoning was sound and the reading result confirmed it: a
+          // fiction shelf is the most crowded thing the app sees (54 books in
+          // one frame against 20-odd on a gardening shelf), seven of the thirty
+          // remaining misses were one unbroken run of spines on a single
+          // fiction shelf, and tiling lifted that shelf from 91% to 96% read.
+          // It also needed dedupeWordReads on the fiction candidates, which the
+          // nonfiction path has always had and fiction never needed without
+          // tiles — otherwise the duplicate copies of one sticker weld together
+          // in the union-find grouper.
+          //
+          // It was reverted because DETECTION got worse, which is the point of
+          // the app: on that same shelf, misshelved books found fell 3 -> 1,
+          // losing "WALLACE, David Foster" and "WALKER, Boo". Reading five
+          // points more of the shelf changed which books are neighbours, and
+          // the ordering pass stopped calling two real misshelvings. Overall
+          // TP 4 -> 2 for recall 90.2% -> 91.1%. A worse trade than it looks:
+          // a label the volunteer never sees costs less than a misplaced book
+          // the app stops reporting.
+          //
+          // Worth revisiting ONLY with the ordering side understood first —
+          // why better neighbours made checkOrder decline. Do not just switch
+          // tiling back on.
           const tilesP = section !== 'fiction'
             ? (pendingTiles ?? encodeTilesForOCR()).then(async ({ tiles }) => {
                 pendingTiles = null;
