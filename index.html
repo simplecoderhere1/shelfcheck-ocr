@@ -1025,6 +1025,36 @@
   const TILE_TARGET  = 6;
   const TILE_OVERLAP = 0.06;   // share of each axis, so a sticker on a seam
                                // survives whole in at least one tile
+  // Label bands: crop to the strip the stickers live in, instead of a blind
+  // grid. Every sticker on one shelf sits in a thin horizontal band — measured
+  // at 7.2% of frame height — while a grid tile is ~50% of it, so a tile is
+  // mostly spine artwork and titles.
+  //
+  // The number that matters: a call number is ~25px tall in a 4080px photo.
+  // Azure documents its floor as "12 pixels for a 1024x768 image", which is a
+  // PROPORTION (~1.5% of frame height), not a pixel count. In a full-height
+  // tile our text is 0.6% of the frame — under the floor. In a band crop it is
+  // 3-8% — over it. That one fact also explains why re-reading the originals
+  // at native 4080px changed nothing: more pixels do not move a proportion.
+  //
+  // Measured on the 8 nonfiction shelves (band_bench.mjs), no closer-look pass:
+  //   full only          48.7% recall  55.0% precision   1 call
+  //   full + 6 tiles     82.2%         70.3%             7 calls
+  //   full + bands       83.9%         71.0%           ~5.5 calls
+  //   full + both        85.6%         72.9%          ~11.5 calls
+  // Bands win on recall, precision AND call count, and did it handicapped —
+  // the tiles got the contrast boost below and the bands got none.
+  //
+  // BAND_SEGS is 3 and must not be 1. The band sent as one ~3072x780 ribbon
+  // scored 72.5%, TEN POINTS WORSE than the grid: Azure penalises an extreme
+  // letterbox. Nor should it be larger — 5 segments plus the contrast boost
+  // scored 83.5%, no better than 3 plain ones. The gain comes from cropping to
+  // the band and saturates immediately, so there is nothing here to tune.
+  const BAND_PAD   = 3;   // multiple of the measured band height to keep, so a
+                          // sticker set higher on its spine than its neighbours
+                          // — a plausible reason it was missed — is still inside
+  const BAND_SEGS  = 3;   // pieces per band; see above, do not change to 1
+  const BAND_MIN_N = 3;   // labels needed before a row's band is trusted
   // Below this Azure word confidence a call number is more likely wrong than
   // right, so the label is marked unclear rather than trusted.
   const AZ_MIN_NUM_CONF = 0.70;
@@ -2483,6 +2513,82 @@
     return { tiles, canvas: snapshot };
   }
 
+  // Where are the label bands? Derived from the labels the FULL-FRAME read
+  // already produced, which is the only thing the app has when it must decide
+  // where to crop. Coordinates are in the sent frame, like every label bbox.
+  //
+  // Rows are found by walking labels down the frame and starting a new row
+  // wherever the vertical step exceeds a few label heights. That is a property
+  // of shelves — books stand in runs with a gap to the shelf above — not of
+  // these photos, so it does not need a tuned constant per library.
+  function planLabelBands(labels, sentH) {
+    const pts = labels
+      .filter(l => l.bbox)
+      .map(l => ({ y: l.bbox[1] + l.bbox[3] / 2, h: l.bbox[3] }))
+      .sort((a, b) => a.y - b.y);
+    const rows = [];
+    for (const q of pts) {
+      const r = rows[rows.length - 1];
+      if (r && q.y - r.last <= Math.max(30, q.h * 4)) {
+        r.ys.push(q.y); r.hs.push(q.h); r.last = q.y;
+      } else rows.push({ ys: [q.y], hs: [q.h], last: q.y });
+    }
+    const out = [];
+    for (const r of rows) {
+      if (r.ys.length < BAND_MIN_N) continue;   // too few to place a band from
+      const h = Math.max(...r.hs);
+      const lo = Math.min(...r.ys) - h / 2, hi = Math.max(...r.ys) + h / 2;
+      const c = (lo + hi) / 2, half = ((hi - lo) * BAND_PAD) / 2;
+      out.push({ y0: Math.max(0, c - half), y1: Math.min(sentH, c + half) });
+    }
+    // Two shelves close together can pad into each other. Overlapping bands
+    // would spend a call re-reading pixels we already sent, so they merge.
+    out.sort((a, b) => a.y0 - b.y0);
+    const merged = [];
+    for (const b of out) {
+      const p = merged[merged.length - 1];
+      if (p && b.y0 <= p.y1) p.y1 = Math.max(p.y1, b.y1);
+      else merged.push({ ...b });
+    }
+    return merged;
+  }
+
+  // Cut each band out of the NATIVE snapshot — the whole point is to spend
+  // resolution we already have on a smaller area — and split it into segments,
+  // because a whole band is an extreme letterbox that Azure reads WORSE than
+  // the grid tile it replaces (72.5% vs 82.2%; see BAND_SEGS).
+  //
+  // No contrast/saturate filter here, unlike the tiles: measured, it added
+  // nothing (83.5% with it and 5 segments, 83.9% without it and 3).
+  async function encodeBandSegs(bands, sentW) {
+    const s = snapshot.width / sentW;
+    const W = snapshot.width;
+    const ov = Math.round(W * 0.04);
+    const cuts = [];
+    for (const b of bands) {
+      const y0 = Math.max(0, Math.round(b.y0 * s));
+      const y1 = Math.min(snapshot.height, Math.round(b.y1 * s));
+      if (y1 - y0 < 24) continue;               // nothing readable in a sliver
+      for (let i = 0; i < BAND_SEGS; i++) {
+        const x0 = Math.floor(W * i / BAND_SEGS), x1 = Math.floor(W * (i + 1) / BAND_SEGS);
+        const lo = Math.max(0, x0 - (i ? ov : 0));
+        const hi = Math.min(W, x1 + (i < BAND_SEGS - 1 ? ov : 0));
+        cuts.push({ x: lo, y: y0, w: hi - lo, h: y1 - y0 });
+      }
+    }
+    return Promise.all(cuts.map(async c => {
+      const t = document.createElement('canvas');
+      t.width = c.w; t.height = c.h;
+      t.getContext('2d').drawImage(snapshot, c.x, c.y, c.w, c.h, 0, 0, c.w, c.h);
+      let blob = await new Promise(r => t.toBlob(r, 'image/jpeg', 0.88));
+      if (blob && blob.size > 1_000_000) {
+        const q2 = Math.min(0.8, Math.max(0.5, 0.88 * Math.pow(1_000_000 / blob.size, 0.7)));
+        blob = await new Promise(r => t.toBlob(r, 'image/jpeg', q2));
+      }
+      return { blob, xoff: c.x, yoff: c.y };
+    }));
+  }
+
   // Returns true if any two labels share the same primary sort key and therefore
   // need a title to break the tie (same Dewey+Cutter for nonfiction, same
   // surname+first for fiction).  Uses the same parse functions as compareKeys.
@@ -3077,22 +3183,71 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // Worth revisiting ONLY with the ordering side understood first —
           // why better neighbours made checkOrder decline. Do not just switch
           // tiling back on.
-          const tilesP = section !== 'fiction'
-            ? (pendingTiles ?? encodeTilesForOCR()).then(async ({ tiles }) => {
-                pendingTiles = null;
-                const ds = await Promise.all(
-                  tiles.map(t => callAzureOcr(t.blob, signal).catch(() => null)));
-                const out = [];
+          // Label bands replace the grid by default: measured better on
+          // recall, precision AND call count (see BAND_PAD). The grid is kept
+          // behind a switch rather than deleted, because it is the fallback
+          // whenever the full frame does not find enough labels to place a
+          // band from — a very dark or very oblique shelf.
+          //   ?bands=0     old grid only
+          //   ?bands=both  grid AND bands: +1.7pt recall for ~2x the calls
+          const bandMode = section === 'fiction' ? '0'
+            : (new URLSearchParams(location.search).get('bands') || 'on');
+          const wantTiles = section !== 'fiction' && bandMode !== 'on';
+          if (!wantTiles) pendingTiles = null;   // release the speculative encode
+          // Named, because the band path needs the very same read as its
+          // fallback and a copy of this loop in two places would drift.
+          const readGrid = () => (pendingTiles ?? encodeTilesForOCR())
+            .then(async ({ tiles }) => {
+              pendingTiles = null;
+              const ds = await Promise.all(
+                tiles.map(t => callAzureOcr(t.blob, signal).catch(() => null)));
+              const out = [];
+              ds.forEach((d, i) => {
+                if (!d) return;
+                for (const w of parseAzureWords(d)) {
+                  w.x += tiles[i].xoff; w.y += tiles[i].yoff; out.push(w);
+                }
+              });
+              return out;
+            }).catch(() => null);
+          const tilesP = wantTiles ? readGrid() : Promise.resolve(null);
+          [data, tileWords] = await Promise.all([callAzureOcr(enc.blob, signal), tilesP]);
+          // The band pass cannot start until the full read says where the
+          // shelves are, so this round trip is pure added latency (~400ms).
+          // It buys back more than it costs by replacing six tile calls with
+          // about four band calls. A failure here is never fatal: the read
+          // stands on the full frame (and the grid, in ?bands=both).
+          if (data && (bandMode === 'on' || bandMode === 'both')) {
+            try {
+              const bt0 = performance.now();
+              const seed = reconstructNonfictionAzure(parseAzureWords(data), ctx, false);
+              const bands = planLabelBands(seed, enc.sentH);
+              const segs = bands.length ? await encodeBandSegs(bands, enc.sentW) : [];
+              // No band could be placed, which means the full frame did not
+              // find BAND_MIN_N labels on any shelf — a dark or very oblique
+              // photo. Without this the read would silently fall back to the
+              // full frame ALONE, which measures 48.7%, far worse than the
+              // grid this replaced. So take the grid instead.
+              if (!segs.length && bandMode === 'on') {
+                tileWords = await readGrid();
+                console.log('[perf] label bands: none placed, fell back to the grid');
+              }
+              if (segs.length) {
+                const ds = await Promise.all(segs.map(s =>
+                  s.blob ? callAzureOcr(s.blob, signal).catch(() => null) : null));
+                const out = tileWords ? tileWords.slice() : [];
                 ds.forEach((d, i) => {
                   if (!d) return;
                   for (const w of parseAzureWords(d)) {
-                    w.x += tiles[i].xoff; w.y += tiles[i].yoff; out.push(w);
+                    w.x += segs[i].xoff; w.y += segs[i].yoff; out.push(w);
                   }
                 });
-                return out;
-              }).catch(() => null)
-            : Promise.resolve(null);
-          [data, tileWords] = await Promise.all([callAzureOcr(enc.blob, signal), tilesP]);
+                tileWords = out;
+              }
+              console.log(`[perf] label bands: ${bands.length} band(s), ` +
+                `${segs.length} call(s), ${(performance.now() - bt0) | 0}ms`);
+            } catch (e) { console.log('[perf] label bands skipped:', e.message); }
+          }
         } catch (err) {
           // Azure is out (network, CORS, or the 5,000/month allowance spent).
           // Latch it so deviceOcr stops standing down, then FALL THROUGH to the
