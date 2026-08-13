@@ -1442,6 +1442,45 @@
         break;
       }
     }
+    // SPACE AFTER THE DECIMAL POINT — the same split lying on its side.
+    // A second library prints its numbers as "796. 8309" and "641. 865", and
+    // Azure returns the two halves as separate words SIDE BY SIDE. Untreated,
+    // the label prints as "796 GEM" for a sticker that reads 796.8309.
+    //
+    // That is worse than a missing label. A short number sorts BELOW its
+    // neighbours, so the book looks out of place and the app reports a
+    // misfiling that is not on the shelf — it sends a volunteer to a book that
+    // was filed correctly. On the 2026-08-09 shelves this was 15 of 57 labels:
+    // one printed call number in three.
+    //
+    // The corroboration rule from the block above is kept unchanged, and it is
+    // what makes this safe on a library we have never seen: the joined number
+    // must ALREADY appear in full elsewhere on this shelf. A shelf is a run of
+    // near-identical call numbers, so a genuine split has a fully-read twin
+    // nearby, while a join across two neighbouring stickers almost never
+    // spells one. Where no twin exists the number is left short rather than
+    // completed by guesswork — printing a digit that is not on the sticker is
+    // the one thing this app must never do.
+    const RX_NUM_TAIL = /^\d{1,4}$/;
+    for (const a of small) {
+      if (stitched.has(a) || !RX_NUM3.test(a.t)) continue;
+      for (const b of small) {
+        if (b === a || stitched.has(b) || !RX_NUM_TAIL.test(b.t)) continue;
+        if (!shelfNums.has(a.t + '.' + b.t)) continue;
+        // b sits to the RIGHT of a, within about one space, on the same line.
+        const gap = b.x - (a.x + a.w);
+        if (gap < -a.w * 0.15 || gap > a.h * 1.4) continue;
+        const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+        if (oy / Math.max(1, Math.min(a.h, b.h)) < 0.5) continue;
+        a.t = a.t + '.' + b.t;
+        a.w = Math.max(a.x + a.w, b.x + b.w) - Math.min(a.x, b.x);
+        a.h = Math.max(a.y + a.h, b.y + b.h) - Math.min(a.y, b.y);
+        a.x = Math.min(a.x, b.x); a.y = Math.min(a.y, b.y);
+        a.c = Math.min(a.c ?? 0.9, b.c ?? 0.9);
+        stitched.add(b);
+        break;
+      }
+    }
     if (stitched.size) {
       for (let i = small.length - 1; i >= 0; i--) if (stitched.has(small[i])) small.splice(i, 1);
     }
