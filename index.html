@@ -1507,6 +1507,31 @@
   // worse one can win a cutter that belonged to its neighbour. Collapse
   // overlapping reads of the SAME KIND (number vs letters) first, preferring
   // the longer read.
+  // TRIED AND REVERTED (2026-08-13) — making the length tie-break respect
+  // confidence. The rule below prefers the LONGER read at any confidence gap,
+  // and measurably picks wrong ones: over the 8 nonfiction shelves it kept
+  // "loso" (0.37) over "OSO" (0.92), "LIAR" (0.43) over "JAB" (0.99) and
+  // "BUIR" (0.46) over "BUR" (1.00). Six wrong survivors in all, against 37
+  // right ones.
+  //
+  // Two measured results, both worth keeping:
+  //
+  // 1. Applying a confidence slack to NUMBERS costs 1.7 points of recall
+  //    (89.0% -> 87.3%). For a number a longer read means more decimals
+  //    actually resolved, and those trailing digits are legitimately less
+  //    confident — smaller, and curving off the spine. That is precisely the
+  //    deep-decimal read Azure was chosen for, and confidence must not be
+  //    allowed to arbitrate it away.
+  //
+  // 2. Restricting the slack to LETTERS fixes all three cases above and
+  //    changes recall by NOTHING (89.0%, precision 76.1%, identical at every
+  //    slack from 0.35 to 0.55). Keeping the right cutter word is not
+  //    sufficient: those labels are lost further downstream in the pairing
+  //    pass, which never marries the tag to an anchor.
+  //
+  // So the word-level pick is NOT the binding constraint on the remaining
+  // nonfiction misses, and tuning it is wasted effort. The gap is assembly —
+  // see the "4 PRESENT, read but never assembled" line in tag_presence.mjs.
   function dedupeWordReads(words) {
     const kind = w => /^\d/.test(w.t) ? 'n' : /^[A-Za-z]+$/.test(w.t) ? 'a' : null;
     const overlapMin = (a, b) => {
