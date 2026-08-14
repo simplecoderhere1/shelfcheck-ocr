@@ -10,31 +10,79 @@
   <link rel="preconnect" href="https://shelfcheck-ocr-proxy.krish-sundareswar.workers.dev">
   <link rel="preconnect" href="https://selfcheck-proxy.krish-sundareswar.workers.dev">
   <style>
+    /* One place for the palette. The app is used standing in a library aisle,
+       often on an older phone at an awkward angle, so every value here is
+       picked for CONTRAST first and mood second. The three status colours are
+       the whole vocabulary — red, amber, green — and nothing else in the UI is
+       allowed to use them, or a decorative accent starts looking like a
+       verdict. */
+    :root {
+      --bg:        #0b0b0c;
+      --surface:   #16171a;
+      --surface-2: #1e1f23;
+      --line:      #2a2c31;
+      --line-soft: #202126;
+      --text:      #f2f3f5;
+      --text-2:    #a8adb7;
+      --text-3:    #71767f;
+      --accent:    #3b82f6;
+      --accent-hi: #60a5fa;
+      --bad:       #ef4444;
+      --bad-bg:    #3f1013;
+      --warn:      #eab308;
+      --warn-bg:   #3d2c07;
+      --good:      #22c55e;
+      --good-bg:   #0e3a20;
+      --radius:    14px;
+      --shadow:    0 10px 30px rgba(0,0,0,.55);
+    }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html { height: 100%; }
     body {
       height: 100vh; height: 100dvh;
-      background: #0d0d0d; color: #f0f0f0;
+      background: var(--bg); color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
       display: flex; flex-direction: column;
       overflow: hidden; -webkit-tap-highlight-color: transparent;
+      -webkit-font-smoothing: antialiased;
     }
+    /* Keyboard focus must stay visible — the settings menu and the flagged
+       list are both reachable by tab, and :active alone leaves a keyboard user
+       with no idea where they are. */
+    :focus-visible { outline: 2px solid var(--accent-hi); outline-offset: 2px; border-radius: 6px; }
 
     /* ── Header ─────────────────────────────────── */
     .header {
       flex-shrink: 0; display: flex; align-items: center;
-      justify-content: space-between; padding: 12px 16px;
-      padding-top: max(12px, env(safe-area-inset-top));
-      background: #1c1c1c; border-bottom: 1px solid #2c2c2c;
+      justify-content: space-between; padding: 11px 14px;
+      padding-top: max(11px, env(safe-area-inset-top));
+      background: linear-gradient(180deg, var(--surface), #131418);
+      border-bottom: 1px solid var(--line);
     }
-    .app-name { font-size: 15px; font-weight: 600; letter-spacing: .05em; color: #e0e0e0; }
-    .section-tabs { display: flex; background: #2c2c2c; border-radius: 8px; padding: 3px; }
+    .brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
+    /* Three book spines, one leaning — the thing the app is looking for, at
+       16px. Drawn in CSS rather than shipped as an image because the page is a
+       single file with no asset pipeline. */
+    .brand-mark { display: flex; align-items: flex-end; gap: 2px; height: 17px; flex-shrink: 0; }
+    .brand-mark i {
+      display: block; width: 4px; border-radius: 1px; background: var(--text-3);
+    }
+    .brand-mark i:nth-child(1) { height: 14px; }
+    .brand-mark i:nth-child(2) { height: 17px; background: var(--accent); }
+    .brand-mark i:nth-child(3) { height: 12px; transform: rotate(12deg); transform-origin: bottom center; }
+    .app-name { font-size: 15px; font-weight: 650; letter-spacing: .01em; color: var(--text); }
+
+    .section-tabs {
+      display: flex; background: var(--surface-2); border-radius: 9px;
+      padding: 3px; border: 1px solid var(--line-soft);
+    }
     .tab-btn {
-      padding: 5px 14px; border-radius: 6px; border: none; background: transparent;
-      color: #888; font-size: 13px; font-weight: 500; cursor: pointer;
+      padding: 6px 15px; border-radius: 6px; border: none; background: transparent;
+      color: var(--text-3); font-size: 13px; font-weight: 600; cursor: pointer;
       transition: background .18s, color .18s; user-select: none;
     }
-    .tab-btn.active { background: #f0f0f0; color: #111; }
+    .tab-btn:hover:not(.active) { color: var(--text-2); }
+    .tab-btn.active { background: var(--text); color: #101114; }
 
     /* ── Camera area ─────────────────────────────── */
     .camera-wrap { flex: 1; position: relative; background: #000; min-height: 0; display: flex; flex-direction: column; }
@@ -104,10 +152,13 @@
       gap: 12px; pointer-events: none;
     }
     .results-overlay .btn-new-scan { pointer-events: auto; }
-    .overlay-badge { font-size: 14px; font-weight: 700; padding: 8px 14px; border-radius: 20px; }
-    .badge-ok           { background: #14532d; color: #4ade80; }
-    .badge-warn         { background: #450a0a; color: #f87171; }
-    .badge-unverifiable { background: #713f12; color: #fde047; }
+    .overlay-badge {
+      font-size: 14px; font-weight: 700; padding: 9px 15px; border-radius: 999px;
+      box-shadow: 0 4px 14px rgba(0,0,0,.45); backdrop-filter: blur(4px);
+    }
+    .badge-ok           { background: var(--good-bg); color: #6ee7a0; }
+    .badge-warn         { background: var(--bad-bg);  color: #fca5a5; }
+    .badge-unverifiable { background: var(--warn-bg); color: #fde047; }
 
     /* Error banner */
     .error-banner {
@@ -129,24 +180,54 @@
       display: flex; align-items: center; justify-content: center; padding: 28px;
     }
     .first-hint-card {
-      background: #1c1c1c; border: 1px solid #333; border-radius: 16px;
-      padding: 22px 20px; max-width: 320px; text-align: left;
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: 18px; padding: 22px 20px 18px; max-width: 340px;
+      text-align: left; box-shadow: var(--shadow);
+      max-height: 100%; overflow-y: auto;
     }
-    .first-hint-card h3 { font-size: 16px; color: #fff; margin-bottom: 12px; text-align: center; }
+    .first-hint-card h3 {
+      font-size: 17px; font-weight: 650; color: var(--text);
+      margin-bottom: 4px; text-align: center; letter-spacing: -.01em;
+    }
+    .first-hint-lede {
+      font-size: 12.5px; color: var(--text-2); text-align: center;
+      line-height: 1.5; margin-bottom: 16px;
+    }
+    .first-hint-key {
+      font-size: 10.5px; font-weight: 700; letter-spacing: .09em;
+      text-transform: uppercase; color: var(--text-3); margin-bottom: 9px;
+    }
     .first-hint-row {
-      display: flex; align-items: flex-start; gap: 10px; margin-bottom: 11px;
-      font-size: 13px; color: #ccc; line-height: 1.4;
+      display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px;
+      font-size: 13px; color: var(--text-2); line-height: 1.45;
     }
-    .first-hint-dot { flex-shrink: 0; width: 16px; height: 16px; border-radius: 50%; margin-top: 1px; }
+    .first-hint-row b { color: var(--text); font-weight: 650; }
+    .first-hint-dot {
+      flex-shrink: 0; width: 12px; height: 12px; border-radius: 3px; margin-top: 3px;
+    }
+    /* The promise the whole design rests on, so it is stated plainly and set
+       apart rather than left for a volunteer to infer from behaviour. */
+    .first-hint-note {
+      margin-top: 12px; padding: 10px 12px; border-radius: 10px;
+      background: var(--surface-2); border: 1px solid var(--line-soft);
+      font-size: 12px; color: var(--text-2); line-height: 1.5;
+    }
+    .first-hint-note b { color: var(--text); font-weight: 650; }
     .first-hint-btn {
-      width: 100%; margin-top: 8px; background: #2563eb; border: none;
-      color: #fff; font-size: 14px; font-weight: 600; padding: 12px; border-radius: 10px; cursor: pointer;
+      width: 100%; margin-top: 16px;
+      background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+      border: none; color: #fff; font-size: 15px; font-weight: 650;
+      padding: 13px; border-radius: 11px; cursor: pointer;
     }
+    .first-hint-btn:active { filter: brightness(.9); }
 
     .btn-new-scan {
-      padding: 10px 20px; border-radius: 10px; font-size: 14px;
-      font-weight: 600; border: none; cursor: pointer; background: #2563eb; color: #fff;
+      padding: 11px 21px; border-radius: 11px; font-size: 14px;
+      font-weight: 650; border: none; cursor: pointer; color: #fff;
+      background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+      box-shadow: 0 6px 18px rgba(59,130,246,.3);
     }
+    .btn-new-scan:active { filter: brightness(.9); }
 
     /* Expandable detail row inside flagged list */
     .flagged-item-detail {
@@ -185,22 +266,23 @@
     @keyframes refiningFadeIn { from { opacity: 0; transform: translate(-50%, -4px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
     .settings-btn {
-      background: transparent; border: none; color: #888; font-size: 18px;
+      background: transparent; border: none; color: var(--text-3); font-size: 18px;
       cursor: pointer; padding: 4px; line-height: 1; transition: color .15s;
     }
-    .settings-btn:active { color: #fff; }
+    .settings-btn:hover, .settings-btn:active { color: var(--text); }
     .settings-btn.debug-active { color: #dc2626; }
     .settings-menu {
-      display: none; position: absolute; top: 100%; right: 0; margin-top: 4px;
-      background: #1c1c1c; border: 1px solid #333; border-radius: 10px;
-      padding: 8px 0; z-index: 50; min-width: 180px; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+      display: none; position: absolute; top: 100%; right: 0; margin-top: 6px;
+      background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+      padding: 6px 0; z-index: 50; min-width: 190px; box-shadow: var(--shadow);
     }
     .settings-menu.show { display: block; }
     .settings-item {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 10px 16px; font-size: 13px; color: #ddd; cursor: pointer; user-select: none;
+      padding: 11px 16px; font-size: 13px; color: var(--text-2);
+      cursor: pointer; user-select: none;
     }
-    .settings-item:active { background: #2c2c2c; }
+    .settings-item:active { background: var(--surface-2); }
     .settings-toggle {
       width: 36px; height: 20px; border-radius: 10px; background: #444;
       position: relative; transition: background .2s; flex-shrink: 0;
@@ -243,17 +325,44 @@
     /* Pick buttons (idle state) */
     .pick-btns {
       display: flex; flex-direction: column; align-items: center;
-      gap: 14px; width: 100%; max-width: 300px; padding: 0 24px;
+      gap: 12px; width: 100%; max-width: 320px; padding: 0 24px;
+    }
+    .pick-title {
+      font-size: 19px; font-weight: 650; color: var(--text);
+      text-align: center; letter-spacing: -.01em;
+    }
+    .pick-sub {
+      font-size: 13px; color: var(--text-2); text-align: center;
+      line-height: 1.5; margin-top: -4px; margin-bottom: 6px;
     }
     .pick-btn {
-      width: 100%; padding: 16px 20px; border-radius: 14px; font-size: 16px;
-      font-weight: 600; border: none; cursor: pointer;
+      width: 100%; padding: 16px 20px; border-radius: var(--radius); font-size: 16px;
+      font-weight: 650; border: none; cursor: pointer;
       display: flex; align-items: center; justify-content: center;
-      gap: 10px; transition: transform .12s ease, opacity .12s;
+      gap: 10px; transition: transform .12s ease, filter .12s;
     }
-    .pick-btn:active { transform: scale(.97); opacity: .85; }
-    .pick-btn-camera { background: #2563eb; color: #fff; }
-    .pick-btn-upload { background: #2e2e2e; color: #ccc; }
+    .pick-btn:active { transform: scale(.97); filter: brightness(.88); }
+    .pick-btn-camera {
+      background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+      color: #fff; box-shadow: 0 6px 18px rgba(59,130,246,.28);
+    }
+    .pick-btn-upload {
+      background: var(--surface-2); color: var(--text-2); border: 1px solid var(--line);
+    }
+    /* The one thing that decides whether a scan works, so it gets its own
+       block rather than a clause buried in a paragraph: a volunteer who stands
+       too far back gets a blurry sticker and a shelf full of yellow. */
+    .pick-tips {
+      margin-top: 10px; width: 100%; display: flex; flex-direction: column; gap: 7px;
+      background: var(--surface); border: 1px solid var(--line-soft);
+      border-radius: 12px; padding: 12px 13px;
+    }
+    .pick-tip {
+      display: flex; align-items: flex-start; gap: 9px;
+      font-size: 12.5px; color: var(--text-2); line-height: 1.45; text-align: left;
+    }
+    .pick-tip svg { flex-shrink: 0; margin-top: 1px; color: var(--text-3); }
+    .pick-tip b { color: var(--text); font-weight: 650; }
 
     /* Action bar */
     .action-bar {
@@ -264,58 +373,75 @@
     }
     .action-bar.show { display: flex; }
     .btn {
-      flex: 1; padding: 13px 16px; border-radius: 10px; font-size: 15px;
-      font-weight: 600; border: none; cursor: pointer; transition: transform .1s ease;
+      flex: 1; padding: 14px 16px; border-radius: 11px; font-size: 15px;
+      font-weight: 650; border: none; cursor: pointer; transition: transform .1s ease;
     }
     .btn:active { transform: scale(.96); }
-    .btn-retake  { background: rgba(46,46,46,.92); color: #ddd; }
-    .btn-analyze { background: #2563eb; color: #fff; }
-    .btn-analyze:disabled { background: #1a2f5e; color: #4e71b5; cursor: not-allowed; transform: none; }
+    .btn-retake  { background: rgba(40,42,48,.94); color: var(--text-2); border: 1px solid var(--line); }
+    .btn-analyze {
+      background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+      color: #fff; box-shadow: 0 6px 18px rgba(59,130,246,.3);
+    }
+    .btn-analyze:disabled {
+      background: #1b2a44; color: #56718f; cursor: not-allowed;
+      transform: none; box-shadow: none;
+    }
 
     /* Flagged list */
     .flagged-list {
-      display: none; flex-direction: column; background: #111;
-      border-top: 1px solid #2c2c2c; overflow-y: auto;
-      -webkit-overflow-scrolling: touch; max-height: 200px; flex-shrink: 0;
+      display: none; flex-direction: column; background: var(--surface);
+      border-top: 1px solid var(--line); overflow-y: auto;
+      -webkit-overflow-scrolling: touch; max-height: 210px; flex-shrink: 0;
       opacity: 0; transition: opacity .18s ease-out;
+      padding-bottom: env(safe-area-inset-bottom);
     }
     .flagged-list.show { display: flex; opacity: 1; }
     .flagged-list-success {
-      display: flex; align-items: center; gap: 10px; padding: 14px;
-      font-size: 13px; color: #86efac; line-height: 1.4;
+      display: flex; align-items: center; gap: 11px; padding: 15px 14px;
+      font-size: 13.5px; color: #a7f3c0; line-height: 1.45;
     }
     .flagged-list-success-icon {
-      flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
-      background: #14532d; color: #4ade80; font-size: 13px; font-weight: 700;
+      flex-shrink: 0; width: 24px; height: 24px; border-radius: 50%;
+      background: var(--good-bg); color: #4ade80; font-size: 13px; font-weight: 700;
       display: flex; align-items: center; justify-content: center;
     }
     .flagged-list-note {
-      padding: 10px 14px; font-size: 12px; line-height: 1.45;
-      color: #fde047; border-top: 1px solid #2a2a2a;
+      padding: 10px 14px; font-size: 12px; line-height: 1.5;
+      color: #fde047; border-top: 1px solid var(--line-soft);
     }
     .flagged-list-header {
-      padding: 8px 14px 6px; font-size: 11px; font-weight: 700;
-      letter-spacing: .07em; text-transform: uppercase; color: #555;
-      flex-shrink: 0; position: sticky; top: 0; background: #111; border-bottom: 1px solid #1e1e1e;
+      padding: 9px 14px 7px; font-size: 10.5px; font-weight: 700;
+      letter-spacing: .09em; text-transform: uppercase; color: var(--text-3);
+      flex-shrink: 0; position: sticky; top: 0; background: var(--surface);
+      border-bottom: 1px solid var(--line-soft);
     }
     .flagged-item {
-      display: flex; align-items: center; gap: 10px;
-      padding: 9px 14px; border-bottom: 1px solid #1a1a1a;
+      display: flex; align-items: center; gap: 11px;
+      padding: 11px 14px; border-bottom: 1px solid var(--line-soft);
       cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent;
       transition: background .12s;
     }
-    .flagged-item:active { background: #1e1e1e; }
-    .flagged-item.active { background: #162316; }
-    .flagged-item-dot { flex-shrink: 0; width: 9px; height: 9px; border-radius: 50%; }
-    .flagged-item-dot-bad { background: #ef4444; }
-    .flagged-item-dot-unv { background: #eab308; }
+    .flagged-item:active { background: var(--surface-2); }
+    .flagged-item.active { background: #14261a; }
+    /* A bar rather than a dot: it reads as a book spine, and at 3px wide it
+       carries the status colour further down a dim aisle than a 9px circle. */
+    .flagged-item-dot { flex-shrink: 0; width: 3px; height: 26px; border-radius: 2px; }
+    .flagged-item-dot-bad { background: var(--bad); }
+    .flagged-item-dot-unv { background: var(--warn); }
     .flagged-item-text { flex: 1; min-width: 0; }
-    .flagged-item-label { font-size: 13px; font-weight: 600; color: #e2e2e2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .flagged-item-label {
+      font-size: 13.5px; font-weight: 650; color: var(--text);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      font-variant-numeric: tabular-nums;
+    }
     .flagged-item-title { font-size: 12px; color: #aaa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; font-style: italic; }
     .flagged-item-sub { font-size: 11px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
-    .flagged-item-status { flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 6px; }
-    .flagged-item-status-bad { background: #450a0a; color: #f87171; }
-    .flagged-item-status-unv { background: #713f12; color: #fde047; }
+    .flagged-item-status {
+      flex-shrink: 0; font-size: 11px; font-weight: 700; padding: 3px 9px;
+      border-radius: 999px; letter-spacing: .02em;
+    }
+    .flagged-item-status-bad { background: var(--bad-bg); color: #fca5a5; }
+    .flagged-item-status-unv { background: var(--warn-bg); color: #fde047; }
 
     /* Stage-based loading */
     .stage-list { display: flex; flex-direction: column; gap: 13px; width: 100%; max-width: 220px; }
@@ -334,7 +460,7 @@
       body { flex-direction: row; }
       .header {
         flex-direction: column; width: auto; border-bottom: none;
-        border-right: 1px solid #2c2c2c; padding: 8px;
+        border-right: 1px solid var(--line); padding: 8px;
         padding-top: max(8px, env(safe-area-inset-top));
         padding-left: max(8px, env(safe-area-inset-left));
         gap: 10px; justify-content: flex-start; align-items: center;
@@ -342,8 +468,17 @@
       .app-name { display: none; }
       .section-tabs { flex-direction: column; }
       .tab-btn { padding: 6px 10px; font-size: 12px; }
-      .pick-btns { flex-direction: row; max-width: none; padding: 0 16px; }
+      /* Row, but still bounded — uncapped this stretched each button across
+         half a desktop window, which reads as a banner rather than a button. */
+      .pick-btns { flex-direction: row; max-width: 560px; padding: 0 16px; }
+      /* The start-screen copy is a COLUMN of prose; laid out as flex-row
+         children it becomes three squashed towers. Landscape is also the
+         orientation with no vertical room for it, so it stands down and the
+         two buttons keep the space. The same words are still one tap away in
+         the first-run card. */
+      .pick-title, .pick-sub, .pick-tips { display: none; }
       .action-bar { flex-direction: row; }
+      .flagged-list { max-height: none; }
     }
 
     /* Live camera */
@@ -387,7 +522,10 @@
 <body>
 
 <header class="header">
-  <span class="app-name">ShelfCheck</span>
+  <span class="brand">
+    <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span class="app-name">ShelfCheck</span>
+  </span>
   <div class="section-tabs" role="tablist" aria-label="Collection section">
     <button class="tab-btn active" data-section="fiction"    role="tab" aria-selected="true"  aria-label="Fiction collection">Fiction</button>
     <button class="tab-btn"        data-section="nonfiction" role="tab" aria-selected="false" aria-label="Nonfiction collection">Nonfiction</button>
@@ -399,8 +537,11 @@
         <span>Debug Mode</span>
         <div class="settings-toggle" id="debugToggleSwitch"></div>
       </div>
-      <div style="padding:10px 16px;border-top:1px solid #2c2c2c">
-        <div style="font-size:11px;color:#555;line-height:1.5">Azure AI Vision<br>via Cloudflare proxy</div>
+      <div class="settings-item" id="showHelpBtn" role="menuitem" tabindex="0">
+        <span>How it works</span>
+      </div>
+      <div style="padding:10px 16px;border-top:1px solid var(--line-soft)">
+        <div style="font-size:11px;color:var(--text-3);line-height:1.5">Azure AI Vision<br>via Cloudflare proxy</div>
       </div>
     </div>
   </div>
@@ -410,6 +551,8 @@
   <div class="photo-area" id="photoArea">
     <div class="photo-placeholder" id="photoPlaceholder">
       <div class="pick-btns">
+        <p class="pick-title">Check a shelf</p>
+        <p class="pick-sub">Photograph a shelf and ShelfCheck marks anything filed out of order.</p>
         <button class="pick-btn pick-btn-camera" id="takePicBtn" aria-label="Take photo with camera">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false">
             <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
@@ -424,9 +567,20 @@
           </svg>
           Upload Image
         </button>
-        <p style="font-size:12px;color:#888;text-align:center;line-height:1.5;padding:0 8px">
-          Take a photo of a shelf — fit as many books as you like. Get close enough that the label stickers are <strong>sharp</strong>, then it reads and checks the order automatically.
-        </p>
+        <div class="pick-tips">
+          <div class="pick-tip">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.7" y2="16.7"/></svg>
+            <span>Get close enough that the white stickers look <b>sharp</b> — that is the whole job.</span>
+          </div>
+          <div class="pick-tip">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><rect x="4" y="2.5" width="16" height="19" rx="2"/><line x1="12" y1="6" x2="12" y2="18"/></svg>
+            <span>Hold the phone <b>upright and straight on</b>, not at an angle.</span>
+          </div>
+          <div class="pick-tip">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M4 19V6a2 2 0 0 1 2-2h3v15H6a2 2 0 0 0-2 2z"/><path d="M20 19V6a2 2 0 0 0-2-2h-3v15h3a2 2 0 0 1 2 2z"/></svg>
+            <span>One or two shelves at a time reads better than a whole bay.</span>
+          </div>
+        </div>
       </div>
     </div>
     <canvas id="snapshot" role="img" aria-label="Captured shelf photo"></canvas>
@@ -5362,6 +5516,13 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     settingsBtn.setAttribute('aria-expanded', 'false');
   });
 
+  document.getElementById('showHelpBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    settingsMenu.classList.remove('show');
+    settingsBtn.setAttribute('aria-expanded', 'false');
+    maybeShowFirstHint(true);
+  });
+
   function showTimingBadge(prepMs, apiMs, ocrMs) {
     document.getElementById('timingBadge')?.remove();
     const fmt   = ms => (ms / 1000).toFixed(1) + 's';
@@ -5464,10 +5625,14 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   }
 
   // ── First-run hint ────────────────────────────────────────────────────────
-  function maybeShowFirstHint() {
+  // `force` is the Settings entry: the card explains what the three colours
+  // mean, and a volunteer who dismissed it on day one has no other way back to
+  // that. Reaching it must not depend on clearing site data.
+  function maybeShowFirstHint(force) {
     let seen = false;
     try { seen = localStorage.getItem('shelfcheck.hintSeen') === '1'; } catch {}
-    if (seen) return;
+    if (seen && !force) return;
+    if (document.querySelector('.first-hint')) return;
     const hint = document.createElement('div');
     hint.className = 'first-hint';
     hint.setAttribute('role', 'dialog');
@@ -5475,21 +5640,30 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     hint.innerHTML = `
       <div class="first-hint-card">
         <h3>How ShelfCheck works</h3>
-        <div class="first-hint-row">
-          <span class="first-hint-dot" style="background:#3b82f6"></span>
-          <span>Hold your phone <b>upright</b> and pan across the shelf. Get close enough that the white label stickers are sharp.</span>
-        </div>
+        <p class="first-hint-lede">Pick <b>Fiction</b> or <b>Nonfiction</b>, photograph a shelf,
+          and every book gets a coloured box.</p>
+
+        <div class="first-hint-key">What the boxes mean</div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#ef4444"></span>
-          <span><b>Red box</b> on the photo = out of order — listed below with its box number.</span>
+          <span><b>Red — move it.</b> This book is filed out of order. It is listed
+            underneath the photo with the slot it belongs in.</span>
         </div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#eab308"></span>
-          <span><b>Yellow box</b> = label unclear — check it by eye.</span>
+          <span><b>Amber — check by eye.</b> The label could not be read clearly,
+            so the app will not judge it.</span>
         </div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#22c55e"></span>
-          <span><b>Green box</b> = in order. Tap a flagged item below for details.</span>
+          <span><b>Green — leave it.</b> In order. Tap any flagged book below to
+            see what was read off its spine.</span>
+        </div>
+
+        <div class="first-hint-note">
+          <b>It never guesses a number.</b> If part of a label is blurred or curls
+          round the spine, the app says amber rather than inventing the digits —
+          a wrong number would send you to the wrong book.
         </div>
         <button class="first-hint-btn" id="firstHintBtn">Got it</button>
       </div>`;
