@@ -870,7 +870,7 @@
       photosLeft: +(res.headers.get('X-Quota-Photos-Left') || 0),
       reset: res.headers.get('X-Quota-Reset') || '',
     };
-    if (azureQuota.photosLeft <= 0 && !azureDown) {
+    if (res.headers.get('X-Quota-Enough') === '0' && !azureDown) {
       azureDown = true;
       azureDownReason = 'quota';
       console.log('[perf] azure free allowance spent ' +

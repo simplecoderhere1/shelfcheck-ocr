@@ -186,9 +186,13 @@ function quotaHeaders(q) {
     'X-Quota-Used': String(q.used ?? ''),
     'X-Quota-Remaining': String(q.remaining ?? ''),
     'X-Quota-Photos-Left': String(q.photosLeft ?? ''),
+    // The authority on whether to start another shelf. Photos-Left is an
+    // estimate against a TYPICAL photo; this is the reserve check against the
+    // worst one, and it is the flag the app switches engines on.
+    'X-Quota-Enough': q.enoughForAPhoto ? '1' : '0',
     'X-Quota-Reset': String(q.reset ?? ''),
     'Access-Control-Expose-Headers':
-      'X-Quota-Used, X-Quota-Remaining, X-Quota-Photos-Left, X-Quota-Reset',
+      'X-Quota-Used, X-Quota-Remaining, X-Quota-Photos-Left, X-Quota-Enough, X-Quota-Reset',
   };
 }
 

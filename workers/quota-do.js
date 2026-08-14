@@ -23,12 +23,20 @@ const MINUTE_LIMIT = 20;
 // few reads sooner. The second is the cheaper mistake.
 const MONTH_BUDGET = 4900;
 
-// A photo costs about this many calls: 1 full frame + up to 9 band segments +
-// 1 zoom sheet. Below this there is not enough left to read a whole shelf, so
-// the app is told to switch engines BEFORE it starts rather than half way
-// through — a shelf read with three of its ten calls refused is worse than one
-// read by Gemini from the start.
-const PHOTO_COST = 12;
+// Two different numbers, because they answer two different questions.
+//
+// RESERVE is the WORST a photo can cost: 1 full frame + 3 bands x 3 segments +
+// 1 zoom sheet. The app is told to switch engines while at least this much is
+// left, so it never starts a shelf it cannot finish — a shelf read with three
+// of its calls refused is worse than one read by Gemini from the start.
+//
+// TYPICAL is what a photo actually costs, measured over the 8-photo corpus:
+// a mean of 1.5 bands, so 1 + 4.5 + 1 = 6.5. Reporting "photos left" against
+// the worst case would understate the real allowance by nearly half (408
+// shelves rather than about 750) and make the app look far closer to the wall
+// than it is.
+const PHOTO_RESERVE = 11;
+const PHOTO_TYPICAL = 6.5;
 
 const monthKey = (d = new Date()) =>
   `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
@@ -65,8 +73,8 @@ export class Quota {
       limit: MONTH_LIMIT,
       budget: MONTH_BUDGET,
       remaining: Math.max(0, MONTH_BUDGET - rec.used),
-      photosLeft: Math.floor(Math.max(0, MONTH_BUDGET - rec.used) / PHOTO_COST),
-      enoughForAPhoto: MONTH_BUDGET - rec.used >= PHOTO_COST,
+      photosLeft: Math.floor(Math.max(0, MONTH_BUDGET - rec.used) / PHOTO_TYPICAL),
+      enoughForAPhoto: MONTH_BUDGET - rec.used >= PHOTO_RESERVE,
       reset: monthReset(),
     };
   }
@@ -113,4 +121,6 @@ export class Quota {
   }
 }
 
-export const QUOTA_CONST = { MONTH_LIMIT, MINUTE_LIMIT, MONTH_BUDGET, PHOTO_COST };
+export const QUOTA_CONST = {
+  MONTH_LIMIT, MINUTE_LIMIT, MONTH_BUDGET, PHOTO_RESERVE, PHOTO_TYPICAL,
+};
