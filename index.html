@@ -497,7 +497,15 @@
   // was built to absorb.
   const GEMINI_READ_MAX_DIM   = 1536;
   const GEMINI_READ_QUALITY   = 0.85;
-  const GEMINI_READ_TIMEOUT_MS = 15000;
+  // This engine now only runs when Azure is unreachable or its allowance is
+  // spent, so it is not racing the 5s Azure target — a slower correct answer
+  // beats a fast failure. 15s measured too tight and live: a direct call
+  // through the proxy with an uncompressed 3MB photo (larger than what this
+  // path actually sends) took 8.2s, and callGeminiReadMerged retries once on
+  // any failure, so two near-misses at 15s compounded into a hard failure
+  // with NO reader left standing — reproduced live 2026-08-13 as
+  // "Analysis failed" on the very first Azure outage of a session.
+  const GEMINI_READ_TIMEOUT_MS = 28000;
 
   // ── State ────────────────────────────────────────────────────────────────
   const MAX_CANVAS_DIM = 4096;   // keep native resolution — nonfiction tiles need it
@@ -1502,16 +1510,24 @@
       if (stitched.has(a) || !RX_NUM3.test(a.t)) continue;
       for (const b of small) {
         if (b === a || stitched.has(b) || !RX_NUM3.test(b.t)) continue;
-        if (!shelfNums.has(a.t + '.' + b.t)) continue;
         const dy = b.y - (a.y + a.h);
         if (dy < -a.h * 0.6 || dy > a.h * 2.2) continue;
         const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
         if (ox / Math.max(1, Math.min(a.w, b.w)) < 0.35) continue;
+        // Geometry alone says this LOOKS like a split number — sitting right
+        // where a decimal tail would sit. Corroboration says whether to trust
+        // it enough to JOIN it. A geometric match that corroboration rejects
+        // is not nothing: it is a sign this anchor may be missing digits the
+        // shelf just cannot confirm, which is reason enough to keep it out of
+        // a red flag even though there is nothing to print differently — see
+        // the _ambiguousTail bar in checkOrderOneShelf.
+        if (!shelfNums.has(a.t + '.' + b.t)) { a._ambiguousTail = true; continue; }
         a.t = a.t + '.' + b.t;
         a.w = Math.max(a.x + a.w, b.x + b.w) - Math.min(a.x, b.x);
         a.h = Math.max(a.y + a.h, b.y + b.h) - Math.min(a.y, b.y);
         a.x = Math.min(a.x, b.x); a.y = Math.min(a.y, b.y);
         a.c = Math.min(a.c ?? 0.9, b.c ?? 0.9);
+        a._ambiguousTail = false;
         stitched.add(b);
         break;
       }
@@ -1540,17 +1556,19 @@
       if (stitched.has(a) || !RX_NUM3.test(a.t)) continue;
       for (const b of small) {
         if (b === a || stitched.has(b) || !RX_NUM_TAIL.test(b.t)) continue;
-        if (!shelfNums.has(a.t + '.' + b.t)) continue;
         // b sits to the RIGHT of a, within about one space, on the same line.
         const gap = b.x - (a.x + a.w);
         if (gap < -a.w * 0.15 || gap > a.h * 1.4) continue;
         const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
         if (oy / Math.max(1, Math.min(a.h, b.h)) < 0.5) continue;
+        // Same corroboration-vs-geometry split as the vertical join above.
+        if (!shelfNums.has(a.t + '.' + b.t)) { a._ambiguousTail = true; continue; }
         a.t = a.t + '.' + b.t;
         a.w = Math.max(a.x + a.w, b.x + b.w) - Math.min(a.x, b.x);
         a.h = Math.max(a.y + a.h, b.y + b.h) - Math.min(a.y, b.y);
         a.x = Math.min(a.x, b.x); a.y = Math.min(a.y, b.y);
         a.c = Math.min(a.c ?? 0.9, b.c ?? 0.9);
+        a._ambiguousTail = false;
         stitched.add(b);
         break;
       }
@@ -1689,6 +1707,13 @@
       labels.push({
         text: num + (cutter ? ' ' + cutter : ''), num, cut: cutter,
         truncated: false,
+        // A tail-shaped word sat right where this number's decimal would
+        // continue, but no full match for it exists anywhere else on the
+        // shelf to corroborate the join — see the two stitch loops above.
+        // Nothing was printed that isn't on the sticker; this only says the
+        // number may not be the WHOLE thing on the sticker, which is reason
+        // enough to keep it out of a red flag (checkOrderOneShelf).
+        ambiguousTail: !!a._ambiguousTail,
         unclear: conf < AZ_MIN_NUM_CONF,
         numBox: [a.x, a.y, a.w, a.h],
         bbox: [ux, uy, ur - ux, ub - uy],
@@ -2702,6 +2727,78 @@
     }));
   }
 
+  // Same 3 segments as encodeBandSegs, but STACKED into one sheet per band
+  // instead of sent as 3 separate calls. Cuts the mean cost of a photo from
+  // 6.5 Azure calls to 3.5 -- band segments are 4.5 of the 6.5, and this
+  // takes them to 1.5 -- which matters more for the 20-calls-a-minute cap
+  // (barely 3 photos/minute across volunteers shooting at once) than for the
+  // monthly allowance.
+  //
+  // Benched (pack_bench.mjs, no closer-look pass): 85.6% recall vs 87.3% for
+  // 3 separate calls -- 1.7 points, concentrated on one photo, not spread
+  // evenly. Production always runs the closer-look pass, which targets
+  // exactly the low-confidence/no-cut labels packing produces more of, so
+  // the live cost should be smaller than that number; it has not been
+  // re-measured with closer-look enabled.
+  //
+  // The letterbox penalty measured in planLabelBands's comment (a band sent
+  // as one WIDE ribbon lost 10 points) is about extreme ASPECT RATIO, not
+  // the long edge -- confirmed because a TALL stacked sheet (same 3 segments,
+  // same total pixels, normal-picture proportions) costs only 1.7 points, not
+  // 10. A gap between strips keeps a seam from ever reading as a text line.
+  const BAND_PACK_GAP = 24;
+
+  async function encodeBandPack(bands, sentW) {
+    const s = snapshot.width / sentW;
+    const W = snapshot.width;
+    const ov = Math.round(W * 0.04);
+    const out = [];
+    for (const b of bands) {
+      const y0 = Math.max(0, Math.round(b.y0 * s));
+      const y1 = Math.min(snapshot.height, Math.round(b.y1 * s));
+      if (y1 - y0 < 24) continue;               // nothing readable in a sliver
+      const cuts = [];
+      for (let i = 0; i < BAND_SEGS; i++) {
+        const x0 = Math.floor(W * i / BAND_SEGS), x1 = Math.floor(W * (i + 1) / BAND_SEGS);
+        const lo = Math.max(0, x0 - (i ? ov : 0));
+        const hi = Math.min(W, x1 + (i < BAND_SEGS - 1 ? ov : 0));
+        cuts.push({ x: lo, y: y0, w: hi - lo, h: y1 - y0 });
+      }
+      const sw = Math.max(...cuts.map(c => c.w));
+      const sh = cuts.reduce((a, c) => a + c.h, 0) + BAND_PACK_GAP * (cuts.length - 1);
+      const t = document.createElement('canvas');
+      t.width = sw; t.height = sh;
+      const tx = t.getContext('2d');
+      tx.fillStyle = '#000'; tx.fillRect(0, 0, sw, sh);
+      const place = [];
+      let sy = 0;
+      for (const c of cuts) {
+        tx.drawImage(snapshot, c.x, c.y, c.w, c.h, 0, sy, c.w, c.h);
+        place.push({ xoff: c.x, yoff: y0, sheetY: sy, h: c.h });
+        sy += c.h + BAND_PACK_GAP;
+      }
+      let blob = await new Promise(r => t.toBlob(r, 'image/jpeg', 0.88));
+      if (blob && blob.size > 1_000_000) {
+        const q2 = Math.min(0.8, Math.max(0.5, 0.88 * Math.pow(1_000_000 / blob.size, 0.7)));
+        blob = await new Promise(r => t.toBlob(r, 'image/jpeg', q2));
+      }
+      out.push({ blob, place });
+    }
+    return out;
+  }
+
+  // Undo encodeBandPack: a word read at sheet coordinates belongs to whichever
+  // strip its sheet-Y falls inside, offset back to the sent-image frame.
+  function unpackBandWords(data, place) {
+    const out = [];
+    for (const w of parseAzureWords(data)) {
+      const p = place.find(q => w.y >= q.sheetY && w.y < q.sheetY + q.h)
+             ?? place[place.length - 1];
+      out.push({ ...w, x: w.x + p.xoff, y: w.y - p.sheetY + p.yoff });
+    }
+    return out;
+  }
+
   // Returns true if any two labels share the same primary sort key and therefore
   // need a title to break the tie (same Dewey+Cutter for nonfiction, same
   // surname+first for fiction).  Uses the same parse functions as compareKeys.
@@ -3245,7 +3342,10 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
 
     // The standby reader. It resolves null while Azure is healthy and only
     // actually reads when Azure cannot be reached at all — see deviceOcr.
-    const localP = pendingLocal ?? deviceOcr(snapshot, signal);
+    // Remembered so the catch block below can tell whether THIS call is the
+    // one discovering Azure just went down (see azureWasDownAtStart).
+    const azureWasDownAtStart = azureDown;
+    let localP = pendingLocal ?? deviceOcr(snapshot, signal);
     pendingLocal = null;
 
     const ocrP = (async () => {
@@ -3305,7 +3405,15 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           //   ?bands=both  grid AND bands: +1.7pt recall for ~2x the calls
           const bandMode = section === 'fiction' ? '0'
             : (new URLSearchParams(location.search).get('bands') || 'on');
-          const wantTiles = section !== 'fiction' && bandMode !== 'on';
+          // Segments per band ship PACKED into one call by default (3.5 calls a
+          // photo instead of 6.5 -- see encodeBandPack), which is what makes
+          // three volunteers shooting at once survivable against the
+          // 20-calls-a-minute cap. ?bands=segs reverts to the old one-call-per-
+          // segment path, kept as an instant escape hatch if live monitoring
+          // ever shows the packed sheet losing more than the benched 1.7 points.
+          const packSegs = bandMode !== 'segs';
+          const bandsEnabled = bandMode === 'on' || bandMode === 'both' || bandMode === 'segs';
+          const wantTiles = section !== 'fiction' && !(bandMode === 'on' || bandMode === 'segs');
           if (!wantTiles) pendingTiles = null;   // release the speculative encode
           // Named, because the band path needs the very same read as its
           // fallback and a copy of this loop in two places would drift.
@@ -3330,22 +3438,32 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // It buys back more than it costs by replacing six tile calls with
           // about four band calls. A failure here is never fatal: the read
           // stands on the full frame (and the grid, in ?bands=both).
-          if (data && (bandMode === 'on' || bandMode === 'both')) {
+          if (data && bandsEnabled) {
             try {
               const bt0 = performance.now();
               const seed = reconstructNonfictionAzure(parseAzureWords(data), ctx, false);
               const bands = planLabelBands(seed, enc.sentH);
-              const segs = bands.length ? await encodeBandSegs(bands, enc.sentW) : [];
+              const packed = bands.length && packSegs ? await encodeBandPack(bands, enc.sentW) : null;
+              const segs = !packed && bands.length ? await encodeBandSegs(bands, enc.sentW) : [];
               // No band could be placed, which means the full frame did not
               // find BAND_MIN_N labels on any shelf — a dark or very oblique
               // photo. Without this the read would silently fall back to the
               // full frame ALONE, which measures 48.7%, far worse than the
               // grid this replaced. So take the grid instead.
-              if (!segs.length && bandMode === 'on') {
+              if (!(packed?.length || segs.length) && bandMode === 'on') {
                 tileWords = await readGrid();
                 console.log('[perf] label bands: none placed, fell back to the grid');
               }
-              if (segs.length) {
+              if (packed?.length) {
+                const ds = await Promise.all(packed.map(p =>
+                  p.blob ? callAzureOcr(p.blob, signal).catch(() => null) : null));
+                const out = tileWords ? tileWords.slice() : [];
+                ds.forEach((d, i) => {
+                  if (!d) return;
+                  out.push(...unpackBandWords(d, packed[i].place));
+                });
+                tileWords = out;
+              } else if (segs.length) {
                 const ds = await Promise.all(segs.map(s =>
                   s.blob ? callAzureOcr(s.blob, signal).catch(() => null) : null));
                 const out = tileWords ? tileWords.slice() : [];
@@ -3358,7 +3476,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
                 tileWords = out;
               }
               console.log(`[perf] label bands: ${bands.length} band(s), ` +
-                `${segs.length} call(s), ${(performance.now() - bt0) | 0}ms`);
+                `${packed?.length || segs.length} call(s), ${(performance.now() - bt0) | 0}ms`);
             } catch (e) { console.log('[perf] label bands skipped:', e.message); }
           }
         } catch (err) {
@@ -3390,8 +3508,17 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
             }, wait * 1000);
           }
           encoded = enc;               // the fiction fallback reads encoded.blob
-          console.log('[perf] azure failed, falling back to ocr.space:', err.message,
+          console.log('[perf] azure failed, falling back to gemini:', err.message,
             err.transient ? '(transient — azure stays enabled)' : '');
+          // The race the comment above warns about: localP was started at the
+          // TOP of this call, when Azure still looked healthy, so deviceOcr
+          // stood straight down without ever asking Gemini. This is the exact
+          // call finding out Azure just failed — too late for that decision.
+          // Ask Gemini for real now rather than accept the null localP already
+          // committed to. Without this the FIRST Azure failure of a session
+          // has no reader left standing at all: reproduced live 2026-08-13,
+          // "Analysis failed" with no Gemini call ever attempted.
+          if (!azureWasDownAtStart) localP = deviceOcr(snapshot, signal);
         }
         if (data) {
         labels = section === 'fiction'
@@ -3677,6 +3804,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       _truncated:     !!label.truncated,
       _unclear:       !!label.unclear,
       _malformed:     !!label.malformed,
+      _ambiguousTail: !!label.ambiguousTail,
       _src:           label.src || 'ocr',
     }));
   }
@@ -4937,6 +5065,15 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // "BOO WAL WALKER, Boo" is two stickers welded together, so flagging it
       // accuses whichever of the two the sort happened to land on.
       if (b._malformed && b.outOfOrder) {
+        b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+      }
+      // Same bar, for a number that geometry says may have a decimal tail
+      // (a tail-shaped word sat right where one would continue) which the
+      // shelf could not corroborate. Unlike _truncated this needs no sibling
+      // consensus to trip — it is a live, uncorroborated ambiguity on THIS
+      // sticker, exactly the "635 COM" case: a short number sorts below its
+      // full-length neighbours and reads as a misfiling that is not there.
+      if (b._ambiguousTail && b.outOfOrder) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
       }
     }
