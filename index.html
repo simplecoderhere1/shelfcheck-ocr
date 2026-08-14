@@ -2216,7 +2216,54 @@
       out.push({ text, bbox: [ux, uy, ur - ux, ub - uy], score: conf,
                  unclear: conf < AZ_MIN_NUM_CONF });
     }
-    return out;
+    return dropStrayFictionRows(out, ctx.canvas.height);
+  }
+
+  // A shelf is a RUN of books. Cover text is not.
+  //
+  // Fiction has no equivalent of the Dewey number's unmistakable shape, so on
+  // an alphabetical shelf any capitalised word on a pale spine looks like a
+  // surname: "JANE AUSTEN" off a cover, "TWENTY- ONE TRUTHS ABOUT LOVE" off a
+  // title, "USA Today and Wall Street Journal" off a review blurb. None of it
+  // is accused — labelPlausible bars it from a flag — but all of it lands in
+  // the volunteer's check-by-eye list, and a work list padded with text that is
+  // not a book wastes the trip it asks for. Measured live: 8 books to check, of
+  // which about 6 were not books.
+  //
+  // The separation is stark and it is not about height or brightness, both of
+  // which were checked and do not divide the two. It is COUNT. Cover text sits
+  // higher on the spine than the sticker band, so it clusters into its own row,
+  // and that row is tiny. Over six shelves from two libraries:
+  //
+  //     real sticker rows   14, 15, 16, 16, 17, 18, 18, 19, 23, 24, 25
+  //     stray text rows     1, 2, 2, 2, 3, 3
+  //
+  // Nothing lands between 3 and 14. Same reasoning as BAND_MIN_N in the
+  // nonfiction band planner: too few labels to be a shelf.
+  const FIC_ROW_MIN  = 4;   // below this a row is not a shelf
+  const FIC_ROW_REAL = 8;   // ...but only once a real shelf is present to judge against
+
+  function dropStrayFictionRows(labels, imgH) {
+    if (labels.length < FIC_ROW_REAL) return labels;
+    const rows = [];
+    for (const l of [...labels].sort((a, b) => a.bbox[1] - b.bbox[1])) {
+      const r = rows[rows.length - 1];
+      if (r && l.bbox[1] - r.last < imgH * 0.12) { r.items.push(l); r.last = l.bbox[1]; }
+      else rows.push({ items: [l], last: l.bbox[1] });
+    }
+    // The guard matters as much as the threshold. A photo of a genuinely short
+    // run — the last three books on a shelf — is all small rows, and there is
+    // nothing there to call stray. Only once this photo has shown what a real
+    // shelf row looks like does a lone trio become evidence of anything.
+    if (!rows.some(r => r.items.length >= FIC_ROW_REAL)) return labels;
+    const keep = new Set();
+    let dropped = 0;
+    for (const r of rows) {
+      if (r.items.length >= FIC_ROW_MIN) for (const l of r.items) keep.add(l);
+      else dropped += r.items.length;
+    }
+    if (dropped) console.log(`[shape] fiction: dropped ${dropped} label(s) in stray rows`);
+    return labels.filter(l => keep.has(l));
   }
 
   // ── Gemini fusion (pure; extracted by fusion_test.mjs) ──────────────────────
