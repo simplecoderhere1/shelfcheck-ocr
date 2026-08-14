@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "shelfcheck-azure-ocr",
+  "main": "azure-ocr-worker.js",
+  "compatibility_date": "2025-01-01",
+  // The app's AZURE_URL points at the workers.dev hostname, so this must stay
+  // on. Omitting it is not neutral — it takes the route down.
+  "workers_dev": true,
+
+  // The Azure subscription key is a SECRET, not a var, and is deliberately not
+  // named here. It already exists on the deployed Worker under the name
+  // AZURE_VISION_ENDPOINT (a leftover from when the endpoint was a separate
+  // setting; the code accepts either name). Do not add it to this file — a key
+  // in a tracked config is a published key.
+  //
+  //   wrangler secret put AZURE_VISION_KEY
+
+  // Free-plan Durable Objects must be SQLite-backed, hence new_sqlite_classes
+  // rather than new_classes. See quota-do.js for why this is a DO at all.
+  "durable_objects": {
+    "bindings": [{ "name": "QUOTA", "class_name": "Quota" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Quota"] }
+  ],
+
+  "observability": { "enabled": true }
+}

@@ -842,6 +842,63 @@
   // Latched when an Azure call fails, so the rest of the session falls back to
   // the Gemini reader instead of standing down for an engine that is not there.
   let azureDown = false;
+  // Why it latched, for the log and the debug badge. 'quota' is the free
+  // allowance being spent, which is a different thing from the Worker being
+  // unreachable even though both end at the same fallback.
+  let azureDownReason = '';
+  // Last reading of the free-tier meter, from the Worker's X-Quota-* headers.
+  // null until the first answer; `metered:false` if the Worker has no counter
+  // bound, in which case this whole mechanism stands aside.
+  let azureQuota = null;
+
+  // The F0 tier allows 5,000 reads a month, and a single shelf photo spends
+  // about a dozen of them — a full frame, up to nine band segments, a zoom
+  // sheet — so the allowance is roughly 400 shelves and it can genuinely run
+  // out mid-season.
+  //
+  // The switch is made BEFORE the photo that would run out, never during it.
+  // Half a shelf read by Azure and half refused is worse than the whole shelf
+  // read by Gemini: the refused calls are exactly the band segments that find
+  // the small stickers, so the volunteer gets a confident-looking result with
+  // a arbitrary subset of the shelf missing. The Worker reports how many whole
+  // photos are left and this flips at zero.
+  function noteQuota(res) {
+    const rem = res.headers.get('X-Quota-Remaining');
+    if (rem === null) return;                       // Worker has no counter
+    azureQuota = {
+      remaining: +rem,
+      photosLeft: +(res.headers.get('X-Quota-Photos-Left') || 0),
+      reset: res.headers.get('X-Quota-Reset') || '',
+    };
+    if (azureQuota.photosLeft <= 0 && !azureDown) {
+      azureDown = true;
+      azureDownReason = 'quota';
+      console.log('[perf] azure free allowance spent ' +
+        `(${azureQuota.remaining} call(s) left, resets ${azureQuota.reset}) — ` +
+        'switching to gemini');
+    }
+  }
+
+  // Asked once, at startup, and costs no Azure call. Without it a page opened
+  // after the allowance ran out would learn that by failing its first photo in
+  // front of a volunteer, instead of quietly starting on Gemini.
+  function primeQuota() {
+    if (!AZURE_URL) return;
+    fetch(AZURE_URL.replace(/\/$/, '') + '/quota')
+      .then(r => r.ok ? r.json() : null)
+      .then(q => {
+        if (!q || !q.metered) return;
+        azureQuota = { remaining: q.remaining, photosLeft: q.photosLeft, reset: q.reset };
+        if (!q.enoughForAPhoto) {
+          azureDown = true;
+          azureDownReason = 'quota';
+        }
+        console.log(`[perf] azure quota: ${q.used}/${q.budget} used, ` +
+          `${q.photosLeft} photo(s) left, resets ${q.reset}` +
+          (azureDown ? ' — starting on gemini' : ''));
+      })
+      .catch(() => {});   // no meter is not a reason to refuse to read a shelf
+  }
   // Azure as the SOLE engine. Measured 2.1s median / FP 0 — but recall collapses
   // to 56.4%, because reconstructNonfiction is tuned to ocr.space's word
   // geometry and only assembles about half the labels from Azure's (confirmed
@@ -982,7 +1039,24 @@
       headers: { 'Content-Type': 'application/octet-stream' },
       signal,
     });
-    if (!res.ok) throw new Error('azure ' + res.status);
+    noteQuota(res);
+    if (!res.ok) {
+      // 429 is two different things and they must not be confused. `month` is
+      // the allowance gone until the 1st — latch and switch engines. `minute`
+      // is the 20-calls-a-minute cap, which clears in seconds; treating that
+      // as Azure being down would strand the whole session on Gemini because
+      // the volunteer photographed two shelves quickly.
+      const info = await res.json().catch(() => ({}));
+      const err = new Error('azure ' + res.status +
+        (info.scope ? ' (' + info.scope + ')' : ''));
+      if (info.scope === 'month' || res.status === 403) {
+        err.quotaSpent = true;
+      } else if (info.scope === 'minute' || res.status === 429) {
+        err.transient = true;
+        err.retryAfter = info.retryAfter ?? null;
+      }
+      throw err;
+    }
     const data = await res.json();
     console.log(`[perf] callAzureOcr: ${(data?.readResult?.blocks || []).length} block(s) ` +
                 `at ${Math.round(performance.now() - t0)}ms`);
@@ -3297,9 +3371,27 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // called), so nothing was left to answer and the volunteer got an
           // error instead of a degraded result. Measured: with the Worker
           // unreachable, all 10 test images returned ERR and 0 labels.
+          //
+          // Except for the per-minute cap. That is Azure working normally and
+          // being asked too fast — two shelves photographed back to back is
+          // twenty-odd calls — and it clears within the minute. Latching on it
+          // would strand the rest of the session on Gemini over a burst.
           azureDown = true;
+          azureDownReason = err.transient ? 'rate'
+                          : err.quotaSpent ? 'quota' : 'unreachable';
+          if (err.transient) {
+            // Latch anyway, so the NEXT photo has a reader standing by instead
+            // of walking into the same wall — but unlatch on a timer, because
+            // this one heals itself. Without the timer a single fast pair of
+            // photos would cost the whole session its good engine.
+            const wait = Math.min(60, Math.max(5, err.retryAfter || 15));
+            setTimeout(() => {
+              if (azureDownReason === 'rate') { azureDown = false; azureDownReason = ''; }
+            }, wait * 1000);
+          }
           encoded = enc;               // the fiction fallback reads encoded.blob
-          console.log('[perf] azure failed, falling back to ocr.space:', err.message);
+          console.log('[perf] azure failed, falling back to ocr.space:', err.message,
+            err.transient ? '(transient — azure stays enabled)' : '');
         }
         if (data) {
         labels = section === 'fiction'
@@ -5272,6 +5364,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   }
 
   maybeShowFirstHint();
+  // Fire and forget. Nothing waits on it: if the meter is slow or missing the
+  // app reads shelves exactly as it always did.
+  primeQuota();
 </script>
 </body>
 </html>

@@ -30,3 +30,6 @@ hf_space/ocr_pipeline.py
 
 # Azure Functions deps (installed by the SWA build)
 api/node_modules/
+
+# wrangler local state (miniflare DO storage, build cache)
+workers/.wrangler/
