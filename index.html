@@ -100,17 +100,21 @@
        already busy, and a bright fill washes out the very spine the volunteer
        was sent to look at. Same colour as the box underneath, slightly larger,
        so the eye catches the size change without losing the pixels. */
+    /* A spine is about fifteen screen pixels wide, so a thick BORDER meets
+       itself in the middle and the highlight reads as a solid yellow bar —
+       covering the very book it is pointing at. The ring therefore goes
+       OUTSIDE the box, via outline + outline-offset, which is drawn beyond the
+       element's edge and never eats into it. The book stays fully visible
+       inside a heavy ring. */
     .box-pulse {
-      position: absolute; pointer-events: none; border-radius: 4px;
-      border: 4px solid currentColor;
+      position: absolute; pointer-events: none; border-radius: 3px;
+      border: 2px solid currentColor;
+      outline: 5px solid currentColor; outline-offset: 4px;
       opacity: 0; transform: scale(1); transform-origin: center;
       transition: opacity .15s ease-out, transform .22s cubic-bezier(.34,1.56,.64,1);
-      box-shadow: 0 0 0 9999px rgba(0,0,0,.45);
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.28);
     }
-    /* 1.18x was too subtle to find on a busy shelf at arm's length. The
-       surrounding dim comes from a huge spread shadow rather than an overlay
-       element, so it costs no extra node and cannot intercept taps. */
-    .box-pulse.show { opacity: 1; transform: scale(1.5); }
+    .box-pulse.show { opacity: 1; transform: scale(1.12); }
     .photo-placeholder p { font-size: 14px; line-height: 1.6; text-align: center; max-width: 220px; }
 
     #snapshot {
@@ -4383,11 +4387,30 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     document.getElementById('loadingCancel').onclick = cancelAnalysis;
   }
 
+  // A label's bbox is the STICKER, which is a few dozen pixels tall on a photo
+  // thousands of pixels wide — on screen about 43x19. That is too small to see
+  // across an aisle and too small to hit with a finger, which is why tapping a
+  // box on the photo felt broken even though the hit test was working.
+  //
+  // The sticker sits at the bottom of the spine, so the book itself is the
+  // rectangle directly ABOVE it. Growing the box upward marks the whole book
+  // rather than its label: far easier to see, and a tap target several times
+  // larger. Width is left alone on purpose — widening would overlap the
+  // neighbouring spine and make a tap ambiguous about which book was meant.
+  const BOX_SPINE_K = 4.0;   // total height, as a multiple of the label's own
+
+  function bookDisplayBox(bbox, canvasH) {
+    const [bx, by, bw, bh] = bbox;
+    const h = bh * BOX_SPINE_K;
+    const y = Math.max(0, by + bh - h);          // grow upward from the sticker
+    return [bx, y, bw, Math.min(h, canvasH - y)];
+  }
+
   function drawBoundingBoxes(checkedBooks, sentW, sentH, target = snapshot, unreadRects = null) {
     const ctx = target.getContext('2d');
     const sx  = target.width  / sentW;
     const sy  = target.height / sentH;
-    const lw  = Math.max(2, Math.round(target.width / 450));
+    const lw  = Math.max(3, Math.round(target.width / 340));
     const fs  = Math.max(11, Math.round(target.width / 65));
 
     ctx.save();
@@ -4403,7 +4426,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
 
     flagged.forEach((book) => {
       const i = checkedBooks.indexOf(book);
-      const [bx, by, bw, bh] = book._bbox;
+      const [bx, by, bw, bh] = bookDisplayBox(book._bbox, sentH);
       const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
       // Red only for confirmed (fused+verified) out-of-order; both "unsure"
       // states (unverifiable label, possibly-out-of-order title) are yellow.
@@ -4570,7 +4593,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       return;
     }
 
-    const [bx, by, bw, bh] = book._bbox;
+    // Same rectangle the box was drawn with, or the highlight would ring a
+    // different shape than the one on the photo.
+    const [bx, by, bw, bh] = bookDisplayBox(book._bbox, lastApiDims.sentH);
     const cRect = canvasContentRect(snapshot);
     const pRect = photoArea.getBoundingClientRect();
     const sx = cRect.width  / lastApiDims.sentW;
@@ -4601,12 +4626,22 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     if (!lastCheckedBooks.length || !lastApiDims) return null;
     const sx = canvasW / lastApiDims.sentW;
     const sy = canvasH / lastApiDims.sentH;
-    return lastCheckedBooks.find(b => {
-      if (!b._bbox) return false;
-      const [bx, by, bw, bh] = b._bbox;
-      return tapX >= bx * sx && tapX <= (bx + bw) * sx &&
-             tapY >= by * sy && tapY <= (by + bh) * sy;
-    }) || null;
+    // A finger is far bigger than a spine. Rather than demand a direct hit,
+    // take the NEAREST box within a slop of about 2% of the photo's width —
+    // ties go to whichever the tap is actually closest to, so a tap between
+    // two spines still resolves to one book instead of nothing.
+    const slop = canvasW * 0.02;
+    let best = null, bestD = Infinity;
+    for (const b of lastCheckedBooks) {
+      if (!b._bbox) continue;
+      const [bx, by, bw, bh] = bookDisplayBox(b._bbox, lastApiDims.sentH);
+      const x0 = bx * sx, y0 = by * sy, x1 = (bx + bw) * sx, y1 = (by + bh) * sy;
+      const dx = Math.max(x0 - tapX, 0, tapX - x1);
+      const dy = Math.max(y0 - tapY, 0, tapY - y1);
+      const d  = Math.hypot(dx, dy);
+      if (d < bestD) { bestD = d; best = b; }
+    }
+    return bestD <= slop ? best : null;
   }
 
   // Expand a flagged book's detail row within a given panel (scoped so the
