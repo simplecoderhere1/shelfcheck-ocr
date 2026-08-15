@@ -101,12 +101,16 @@
        was sent to look at. Same colour as the box underneath, slightly larger,
        so the eye catches the size change without losing the pixels. */
     .box-pulse {
-      position: absolute; pointer-events: none; border-radius: 3px;
-      border: 3px solid currentColor;
+      position: absolute; pointer-events: none; border-radius: 4px;
+      border: 4px solid currentColor;
       opacity: 0; transform: scale(1); transform-origin: center;
-      transition: opacity .15s ease-out, transform .18s ease-out;
+      transition: opacity .15s ease-out, transform .22s cubic-bezier(.34,1.56,.64,1);
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.45);
     }
-    .box-pulse.show { opacity: 1; transform: scale(1.18); }
+    /* 1.18x was too subtle to find on a busy shelf at arm's length. The
+       surrounding dim comes from a huge spread shadow rather than an overlay
+       element, so it costs no extra node and cannot intercept taps. */
+    .box-pulse.show { opacity: 1; transform: scale(1.5); }
     .photo-placeholder p { font-size: 14px; line-height: 1.6; text-align: center; max-width: 220px; }
 
     #snapshot {
@@ -145,12 +149,16 @@
 
     /* Results overlay */
     .results-overlay {
-      position: absolute; bottom: 0; left: 0; right: 0; z-index: 20;
-      padding: 20px 16px;
-      background: linear-gradient(transparent, rgba(0,0,0,.85));
+      flex-shrink: 0; z-index: 20;
+      padding: 10px 14px;
+      padding-bottom: max(10px, env(safe-area-inset-bottom));
+      background: var(--surface); border-top: 1px solid var(--line);
       display: flex; align-items: center; justify-content: space-between;
-      gap: 12px; pointer-events: none;
+      gap: 12px;
     }
+    /* When results are showing, the list sits under this bar and needs the
+       room back. */
+    .camera-wrap.has-results .flagged-list { max-height: 168px; }
     .results-overlay .btn-new-scan { pointer-events: auto; }
     .overlay-badge {
       font-size: 14px; font-weight: 700; padding: 9px 15px; border-radius: 999px;
@@ -283,6 +291,9 @@
       cursor: pointer; user-select: none;
     }
     .settings-item:active { background: var(--surface-2); }
+    /* `hidden` is display:none from the UA sheet, which a class setting
+       display:flex outranks — so the debug rows stayed visible. */
+    [hidden] { display: none !important; }
     .settings-toggle {
       width: 36px; height: 20px; border-radius: 10px; background: #444;
       position: relative; transition: background .2s; flex-shrink: 0;
@@ -533,14 +544,14 @@
   <div style="position:relative">
     <button class="settings-btn" id="settingsBtn" aria-label="Settings" aria-haspopup="true" aria-expanded="false">&#9881;</button>
     <div class="settings-menu" id="settingsMenu" role="menu" aria-label="Settings">
-      <div class="settings-item" id="debugToggle" role="menuitemcheckbox" aria-checked="false" tabindex="0">
-        <span>Debug Mode</span>
-        <div class="settings-toggle" id="debugToggleSwitch"></div>
-      </div>
       <div class="settings-item" id="showHelpBtn" role="menuitem" tabindex="0">
         <span>How it works</span>
       </div>
-      <div style="padding:10px 16px;border-top:1px solid var(--line-soft)">
+      <div class="settings-item" id="debugToggle" role="menuitemcheckbox" aria-checked="false" tabindex="0" hidden>
+        <span>Debug Mode</span>
+        <div class="settings-toggle" id="debugToggleSwitch"></div>
+      </div>
+      <div id="engineNote" style="padding:10px 16px;border-top:1px solid var(--line-soft)" hidden>
         <div style="font-size:11px;color:var(--text-3);line-height:1.5">Azure AI Vision<br>via Cloudflare proxy</div>
       </div>
     </div>
@@ -4532,7 +4543,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // books, so a non-flagged book never reaches here in that mode anyway —
     // this guard only matters for classic mode. AR mode now draws (and can
     // pulse) a box for every book, including confidently-correct ones.
-    if (!book?._bbox || !lastApiDims || (!arActive && !book.outOfOrder && !book.unverifiable)) {
+    if (!book?._bbox || !lastApiDims ||
+        (!arActive && !book.outOfOrder && !book.unverifiable && !book.possiblyOutOfOrder)) {
       pulse.classList.remove('show');
       return;
     }
@@ -5375,6 +5387,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     lastCheckedBooks = checked;
 
     document.getElementById('resultsOverlay')?.remove();
+    cameraWrap.classList.remove('has-results');
     actionBar.classList.remove('show');
     clearProgressBoxes();  // the provisional "reading" boxes hand off to the real ones
     restoreCleanPhoto();   // redraw the clean photo before overlaying boxes
@@ -5436,7 +5449,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     overlay.id = 'resultsOverlay'; overlay.className = 'results-overlay';
     overlay.innerHTML = `<div class="overlay-badge badge-warn">No labels detected — retake</div>
       <button class="btn-new-scan" onclick="newScan()">Retake</button>`;
-    photoArea.appendChild(overlay);
+    cameraWrap.insertBefore(overlay, document.getElementById('flaggedList'));
+    cameraWrap.classList.add('has-results');
   }
 
   function showSummaryBadge(total, outCount, unvCount) {
@@ -5448,7 +5462,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     overlay.id = 'resultsOverlay'; overlay.className = 'results-overlay';
     overlay.innerHTML = `<div class="overlay-badge ${cls}">${text}</div>
       <button class="btn-new-scan" onclick="newScan()">New Scan</button>`;
-    photoArea.appendChild(overlay);
+    // Between the photo and the list, not on top of the photo.
+    cameraWrap.insertBefore(overlay, document.getElementById('flaggedList'));
+    cameraWrap.classList.add('has-results');
   }
 
   // Why is this book amber? Amber covers two situations a volunteer has to
@@ -5571,9 +5587,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
                                                 : 'Check manually');
       detail.innerHTML = `
         ${book.title ? `<div class="fi-drow"><span class="fi-dk">Title</span><span class="fi-dv">${escapeHtml(book.title)}${book.title_verified ? ' <span style="opacity:.5;font-size:10px">✓</span>' : ''}</span></div>` : ''}
-        <div class="fi-drow"><span class="fi-dk">Confidence</span><span class="fi-dv">${Math.round((book._score || 0) * 100)}%${book._title_score ? ` · title ${Math.round(book._title_score * 100)}%` : ''}</span></div>
-        <div class="fi-drow"><span class="fi-dk">Position</span><span class="fi-dv">#${book.shelfPosition} of ${book.shelfSize} on shelf ${(book.shelfIndex ?? 0) + 1}</span></div>
-        ${book.outOfOrder ? `<div class="fi-drow"><span class="fi-dk">Should be</span><span class="fi-dv">slot ${book.idealPosition ?? '?'}</span></div>` : ''}
+        <div class="fi-drow"><span class="fi-dk">Where</span><span class="fi-dv">#${book.shelfPosition} of ${book.shelfSize} on shelf ${(book.shelfIndex ?? 0) + 1}</span></div>
+        ${book.outOfOrder ? `<div class="fi-drow"><span class="fi-dk">Move to</span><span class="fi-dv">slot ${book.idealPosition ?? '?'}</span></div>` : ''}
+        ${debugMode ? `<div class="fi-drow"><span class="fi-dk">Confidence</span><span class="fi-dv">${Math.round((book._score || 0) * 100)}%${book._title_score ? ` · title ${Math.round(book._title_score * 100)}%` : ''}</span></div>` : ''}
         <div class="fi-dstatus" style="color:${dcolor}">${dstatus}</div>`;
 
       const toggleDetail = () => {
@@ -5598,6 +5614,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
 
   function newScan() {
     document.getElementById('resultsOverlay')?.remove();
+    cameraWrap.classList.remove('has-results');
     document.getElementById('debugOverlay')?.remove();
     const panel = document.getElementById('flaggedList');
     panel.classList.remove('show'); panel.innerHTML = '';
@@ -5606,7 +5623,23 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   }
 
   // ── Debug mode ────────────────────────────────────────────────────────────
+  // Revealed by tapping the app name five times, or ?debug=1. Kept out of the
+  // volunteer's menu without being taken away from whoever maintains the app.
   let debugMode = false;
+  (function unlockDebug() {
+    const show = () => {
+      document.getElementById('debugToggle')?.removeAttribute('hidden');
+      document.getElementById('engineNote')?.removeAttribute('hidden');
+    };
+    try { if (new URLSearchParams(location.search).get('debug') === '1') show(); } catch {}
+    let taps = 0, last = 0;
+    document.querySelector('.brand')?.addEventListener('click', () => {
+      const now = Date.now();
+      taps = (now - last < 800) ? taps + 1 : 1;
+      last = now;
+      if (taps >= 5) { show(); taps = 0; }
+    });
+  })();
   const settingsBtn  = document.getElementById('settingsBtn');
   const settingsMenu = document.getElementById('settingsMenu');
   const debugToggle  = document.getElementById('debugToggle');
