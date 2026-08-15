@@ -704,8 +704,18 @@
       btn.classList.add('active');
       btn.setAttribute('aria-selected', 'true');
       try { localStorage.setItem('shelfcheck.section', btn.dataset.section); } catch {}
-      if (lastRawBooks && document.getElementById('resultsOverlay')) {
-        showResults(lastRawBooks, btn.dataset.section);
+      // Re-READ, do not re-render. The two sections use different
+      // reconstructors — nonfiction assembles "635 PAR" from a number and a
+      // cutter, fiction assembles "PARKER, Jo" from a surname and a given name
+      // — so labels read as one section are not labels of the other. Re-sorting
+      // them under the new section's rules produced confident nonsense: a
+      // fiction read of a Dewey shelf came back as "PAR", "GAR", "TIMBER" and
+      // was then ranked by Dewey rules.
+      //
+      // Switching section after a scan means the last answer was read the wrong
+      // way, so the only honest response is to read it again.
+      if (lastRawBooks && document.getElementById('resultsOverlay') && snapshot.width) {
+        analyzeShelf();
       }
     });
   });
@@ -5056,7 +5066,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
 
     const checked = books.map((book, i) => {
       const pos = i + 1;
-      if (!keys[i]) return { ...book, outOfOrder: false, unverifiable: true, possiblyOutOfOrder: false, idealPosition: null, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: null };
+      if (!keys[i]) return { ...book, _why: 'nokey', outOfOrder: false, unverifiable: true, possiblyOutOfOrder: false, idealPosition: null, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: null };
       const ideal    = idealRank.get(i) ?? null;
       const tied     = tiedSlots.get(i) || null;
       const inTied   = tied && pos >= tied[0] && pos <= tied[1];
@@ -5115,7 +5125,10 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           if (cM && cN && cM !== cN && editDistance(cM, cN) <= 1) { demote = true; break; }
         }
       }
-      if (demote) { checked[i].outOfOrder = false; checked[i].unverifiable = true; checked[i].idealPosition = null; }
+      if (demote) {
+        checked[i].outOfOrder = false; checked[i].unverifiable = true;
+        checked[i].idealPosition = null; checked[i]._why = 'neartwin';
+      }
     }
 
     // ── Unverified-title order pass → possiblyOutOfOrder (yellow) ────────────
@@ -5277,6 +5290,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       if (b.outOfOrder && b._src &&
           !((b._src === 'both' || b._src === 'azure') && b._score >= RED_MIN_SCORE)) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+        b._why = 'lowconf';
       }
       // A truncated read can never be red, whatever the ordering says. We do not
       // know the digits that would decide it, so "out of order" would be an
@@ -5285,6 +5299,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // reason — we cannot name a slot we cannot compute.
       if (b._truncated && b.outOfOrder) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+        b._why = 'trunc';
       }
       // A malformed label can never be red either, for a stronger reason than
       // truncation: there is no single book it reliably refers to.
@@ -5292,6 +5307,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // accuses whichever of the two the sort happened to land on.
       if (b._malformed && b.outOfOrder) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+        b._why = 'malformed';
       }
       // Same bar, for a number that geometry says may have a decimal tail
       // (a tail-shaped word sat right where one would continue) which the
@@ -5301,6 +5317,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // full-length neighbours and reads as a misfiling that is not there.
       if (b._ambiguousTail && b.outOfOrder) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+        b._why = 'tail';
       }
     }
 
@@ -5323,6 +5340,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       if (n && checked.some(o => o !== b && !o.outOfOrder && !o.unverifiable &&
                                  o.shelfRow !== b.shelfRow && dupNorm(o.spine_label) === n)) {
         b.outOfOrder = false; b.unverifiable = true; b.idealPosition = null;
+        b._why = 'dupe';
       }
     }
     return checked;
@@ -5433,6 +5451,33 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     photoArea.appendChild(overlay);
   }
 
+  // Why is this book amber? Amber covers two situations a volunteer has to
+  // treat differently, and showing "Check" for both is what makes a book the
+  // app read at 98% look like a bug.
+  //
+  //   the read failed      go and read the sticker yourself
+  //   the read was fine,   the app is declining to accuse on a structural
+  //   the ORDER is doubted doubt; a glance settles it
+  //
+  // The second kind is not a confidence problem and raising a confidence bar
+  // would not fix it. Measured on the 8 nonfiction shelves: 9 of 183
+  // confidently-read books (>=0.90) end up amber, 6 of them from the near-twin
+  // rule alone — and ground truth says all 6 are reading artefacts, not
+  // misfiled books. Promoting them on confidence would have manufactured six
+  // false accusations and recovered nothing.
+  const AMBER_WHY = {
+    neartwin:  'Almost the same label as the book beside it — probably one sticker read twice, not a misfiling',
+    dupe:      'This exact label also appears, in order, elsewhere in the photo',
+    trunc:     'Part of the number runs off the spine, so the order cannot be judged',
+    tail:      'The number may be missing digits that nothing else on the shelf confirms',
+    malformed: 'This does not have the shape of a call label',
+    nokey:     'No sortable call number could be read from this spine',
+    lowconf:   'Read confidence too low to accuse on',
+  };
+  function amberReason(book) {
+    return book.outOfOrder ? null : (AMBER_WHY[book._why] || null);
+  }
+
   function showFlaggedList(checked, panel = document.getElementById('flaggedList'), unreadCount = 0) {
     // Same overlap-collapse the boxes use, so a sticker read several times is
     // one row here too (not three near-identical "check" rows for one book).
@@ -5521,8 +5566,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       detail.className = 'flagged-item-detail';
       const dcolor = book.outOfOrder ? '#ef4444' : '#eab308';
       const dstatus = book.outOfOrder ? 'Out of order'
-                    : book.possiblyOutOfOrder ? 'Possibly out of order — check title order'
-                    : 'Check manually';
+                    : amberReason(book)
+                    || (book.possiblyOutOfOrder ? 'Possibly out of order — check title order'
+                                                : 'Check manually');
       detail.innerHTML = `
         ${book.title ? `<div class="fi-drow"><span class="fi-dk">Title</span><span class="fi-dv">${escapeHtml(book.title)}${book.title_verified ? ' <span style="opacity:.5;font-size:10px">✓</span>' : ''}</span></div>` : ''}
         <div class="fi-drow"><span class="fi-dk">Confidence</span><span class="fi-dv">${Math.round((book._score || 0) * 100)}%${book._title_score ? ` · title ${Math.round(book._title_score * 100)}%` : ''}</span></div>
@@ -5732,11 +5778,6 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
             see what was read off its spine.</span>
         </div>
 
-        <div class="first-hint-note">
-          <b>It never guesses a number.</b> If part of a label is blurred or curls
-          round the spine, the app says amber rather than inventing the digits —
-          a wrong number would send you to the wrong book.
-        </div>
         <button class="first-hint-btn" id="firstHintBtn">Got it</button>
       </div>`;
     photoArea.appendChild(hint);
