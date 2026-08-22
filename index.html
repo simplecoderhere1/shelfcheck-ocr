@@ -1529,7 +1529,22 @@
     let restored = 0;
     for (const o of labels) {
       if (!o.malformed) continue;
-      const toks = String(o.text || '').trim().replace(/[,.]/g, ' ').split(/\s+/).filter(Boolean);
+      const raw = String(o.text || '').trim();
+      // Case-only failure: the surname is intact and the given name is a whole
+      // word that merely came back lower-case ("WALSH chloe"). labelPlausible
+      // rejects a lower-case opening because it usually means the read lost the
+      // first letter -- "WALKER aren Com" for "WALKER, Karen Thompson" -- but
+      // in BOTH readings the surname, which is the only thing filing depends
+      // on, is fine. If capitalising would make the label plausible, take it,
+      // with noGiven so no within-author claim is made.
+      if (/\s[a-z]/.test(raw)) {
+        const cap = raw.replace(/(\s)([a-z])/g, (m, a, b) => a + b.toUpperCase());
+        if (labelPlausible(cap, 'fiction')) {
+          o.malformed = false; o.unclear = false; o.noGiven = true; restored++;
+          continue;
+        }
+      }
+      const toks = raw.replace(/[,.]/g, ' ').split(/\s+/).filter(Boolean);
       if (toks.length !== 1) continue;
       const w = toks[0];
       if (w !== w.toUpperCase()) continue;
@@ -5610,7 +5625,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // pipelines (app FP 11 -> 13; geometry FP 8 -> 9 plus a must_not_flag
       // violation). The demotion it disables is doing real work. Left exactly
       // as-is, deliberately.
-      const crossConfirmed = checked[i]._score >= 0.9 && checked[i]._src === 'both';
+      const crossConfirmed = checked[i]._score >= STRONG_ANCHOR && !checked[i]._malformed && !checked[i]._truncated;
       let demote = !crossConfirmed && compareKeys(kL, kR) === 0;
       if (!demote && kL.kind === kR.kind && kM.kind === kL.kind) {
         const vL = kL.kind === 'str' ? kL.val : String(kL.val.num ?? '');
@@ -6042,8 +6057,19 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // WITHIN that author: a run of one surname is ordered by given name, and
       // we did not read one. Yellow is the honest verdict.
       if (b._noGiven && b.outOfOrder) {
-        b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
-        b._why = 'nogiven';
+        // ...but only where the given name is what the ordering turns on, i.e.
+        // a neighbour shares this surname. A surname sitting in the wrong place
+        // among DIFFERENT surnames ("WALSH" inside a run of WALKERs) is a real
+        // misfile and the missing given name is irrelevant to it.
+        const sur = t => String(t || '').trim().toUpperCase()
+                             .replace(/[^A-Z ]/g, '').split(/\s+/)[0] || '';
+        const mine = sur(b.spine_label);
+        const twin = mine && checked.some(o => o !== b && !o._malformed &&
+                                               sur(o.spine_label) === mine);
+        if (twin) {
+          b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+          b._why = 'nogiven';
+        }
       }
       // A malformed label can never be red either, for a stronger reason than
       // truncation: there is no single book it reliably refers to.
