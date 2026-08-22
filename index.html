@@ -1913,7 +1913,21 @@
       // costing real books and buying almost nothing. 0.10 takes most of the
       // gain; what it lets through is malformed, and the shape gate in
       // finishLabels is a better filter for that than a pixel threshold.
-      if (lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8) < 0.10) continue;
+      //
+      // Swept again below 0.05 (2026-08-22), on the current reader:
+      //
+      //     0.10  recall 89.0%  precision 76.1%
+      //     0.05  recall 89.8%  precision 75.2%
+      //     0.02  recall 90.7%  precision 75.4%
+      //     0.00  recall 91.5%  precision 75.3%
+      //
+      // Still linear with no knee, which says the gate is not separating
+      // labels from cover art at all any more — it is just deleting books. Of
+      // the 26 labels still missed at 0.10, 18 had BOTH their number and their
+      // cutter sitting in Azure's word list (azure_recon_bench --why), i.e.
+      // they were read and then thrown away here. 0.02 keeps a token guard
+      // against a genuinely black region while recovering most of that.
+      if (lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8) < 0.02) continue;
 
       const conf = Math.min(...parts.map(p => p.c ?? 0.9));
       labels.push({
@@ -1934,6 +1948,73 @@
     }
 
     markTruncatedByConsensus(labels, l => inkRightOfNumber(ctx, l.numBox));
+
+    // ── Pass 4: account for anchorless tags ─────────────────────────────────
+    // Books whose author tag Azure READ but whose call number it never emitted.
+    // This is the largest single miss cause on nonfiction (28 of 36), and the
+    // TRIED AND REVERTED note by AZ_ZOOM_CUT_DX rules out RE-READING them:
+    // isolation cannot conjure text the detector never found, and it costs a
+    // call. But that experiment was about recovering the NUMBER. Letting the
+    // book vanish entirely is a separate and worse failure — the volunteer is
+    // never told a book was there at all, so it is not even a candidate for a
+    // hand check. Emitting it costs NO extra Azure call. It carries no number,
+    // so sortKey returns null for it and it can never sort or be flagged red;
+    // it renders as "couldn't read this one" and gets counted.
+    // A real tag sits ON THE STICKER ROW — the same line as every other label's
+    // tag on this shelf. Without that test, AZ_RX_CUTTER plus the light gate
+    // admits any 2-4 letter capitalised word on a pale spine, which measured
+    // 212 extra labels across the corpus (~26 spurious yellow boxes per photo,
+    // enough to bury the real ones). Interpolate the row from the labels that
+    // DID pair, and require a candidate to sit on it.
+    const onRow = labels.filter(l => l.num && l.cut)
+                        .map(l => ({ cx: l.bbox[0] + l.bbox[2] / 2, yb: l.bbox[1] + l.bbox[3] }))
+                        .sort((a, b) => a.cx - b.cx);
+    // Book pitch on this shelf: the median centre-to-centre gap of the labels
+    // that did pair.
+    const pitchGaps = [];
+    for (let i = 1; i < onRow.length; i++) pitchGaps.push(onRow[i].cx - onRow[i - 1].cx);
+    pitchGaps.sort((a, b) => a - b);
+    const pitchPx = pitchGaps.length ? pitchGaps[pitchGaps.length >> 1] : 0;
+    const rowYAt = cx => {
+      if (!onRow.length) return null;
+      if (cx <= onRow[0].cx) return onRow[0].yb;
+      const last = onRow[onRow.length - 1];
+      if (cx >= last.cx) return last.yb;
+      for (let i = 1; i < onRow.length; i++) if (onRow[i].cx >= cx) {
+        const a = onRow[i - 1], b = onRow[i];
+        return a.yb + ((cx - a.cx) / Math.max(1, b.cx - a.cx)) * (b.yb - a.yb);
+      }
+      return last.yb;
+    };
+    for (const w of small) {
+      if (used.has(w)) continue;
+      const u = w.t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
+      if (!AZ_RX_CUTTER.test(u)) continue;
+      // Three letters minimum, stricter than a PAIRED tag needs to be. A paired
+      // tag has a call number sitting above it vouching for it; this one has
+      // nothing, and two-letter candidates ("AK", "MO", "BA", "CO") were all
+      // fragments, never books.
+      if (u.replace(/[^A-Z]/g, '').length < 3) continue;
+      const wc = w.x + w.w / 2;
+      const ry = rowYAt(wc);
+      if (ry == null || Math.abs((w.y + w.h) - ry) > w.h * 2) continue;
+      // A book the pairing missed leaves a GAP in the row. A title fragment
+      // that merely happens to sit at label height does not — it lands on top
+      // of a spine whose label was already built. Requiring a real hole took
+      // this from 4-of-20 candidates being genuine books to a set small enough
+      // to show a volunteer without burying the real boxes.
+      if (pitchPx && onRow.some(o => Math.abs(o.cx - wc) < pitchPx * 0.45)) continue;
+      // Same light-background gate the real labels pass: a tag is printed on
+      // the white sticker, so this keeps spine and cover lettering out.
+      if (lightRatio(ctx, w.x - 4, w.y - 4, w.w + 8, w.h + 8) < 0.10) continue;
+      labels.push({
+        text: u, num: null, cut: u, truncated: false, ambiguousTail: false,
+        unclear: true, malformed: true, anchorless: true,
+        numBox: [w.x, w.y, w.w, w.h], bbox: [w.x, w.y, w.w, w.h],
+        score: w.c ?? 0.9,
+      });
+    }
+
     return dedupeStickerLabels(keepUnpaired ? labels : labels.filter(l => l.cut));
   }
 
@@ -2180,6 +2261,23 @@
     const onSticker = words.filter(w => {
       if (!w.t || w.h > preMax || w.w < w.h * 0.5) return false;
       if (!/[A-Za-z]/.test(w.t)) return false;
+      // SWEPT 2026-08-22 (fiction_recon_bench --ficlit=). This gate had never
+      // been measured and was suspected of being too strict at 3.5x the
+      // nonfiction value. It is not — it is already at its optimum:
+      //
+      //     0.35  recall 88.0%  precision 85.4%   <- current
+      //     0.30  recall 86.0%  precision 84.3%
+      //     0.25  recall 87.0%  precision 82.9%
+      //     0.20  recall 87.0%  precision 82.9%
+      //     0.15  recall 88.0%  precision 83.0%
+      //     0.10  recall 87.0%  precision 77.0%
+      //     0.05  recall 87.0%  precision 72.5%
+      //
+      // Recall never beats 0.35 and precision falls away steadily, the exact
+      // opposite of the nonfiction gate's behaviour. Fiction has no Dewey shape
+      // to fall back on, so a pale-background test really is the thing keeping
+      // cover text out. Leave it. Do not "harmonise" it with the nonfiction
+      // value — they are not measuring the same problem.
       return lightRatio(ctx, w.x - 4, w.y - 4, w.w + 8, w.h + 8) >= 0.35;
     });
     const stickerHs = onSticker.map(w => w.h).sort((a, b) => a - b);
@@ -5434,6 +5532,19 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           const minLen = Math.min(vM.length, vN.length);
           if (vM !== vN && ((minLen >= 5 && editDistance(vM, vN) <= 2) ||
                             (minLen >= 4 && editDistance(vM, vN) <= 1))) { demote = true; break; }
+          // Long shared prefix: several damaged reads of ONE surname. A dense
+          // author run returns "TREMBLAY", "TREMBES", "TREMBL", "TREME" for the
+          // same five books; the tails diverge too far for edit distance (3+)
+          // but a five-character common prefix is not something two different
+          // surnames on the same shelf produce by accident. Sorting on the
+          // garbled tails made the CORRECT read the odd one out and reddened a
+          // book already confirmed correctly shelved. Five is deliberately long:
+          // WALSH/WALKER share 3, TATA/TAWADA 2, THOMAS/THORPE 3, TOIBIN/TODD 2
+          // — every real misfile in the corpus stays flaggable.
+          if (vM !== vN && minLen >= 5) {
+            let i = 0; while (i < minLen && vM[i] === vN[i]) i++;
+            if (i >= 5) { demote = true; break; }
+          }
         }
       }
       // Dewey cutter near-twin: same call number as both neighbors and a
@@ -5781,11 +5892,29 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // Measured on 28 photos: false positives 17 -> 8, true positives unchanged.
     if (section === 'nonfiction') {
       const numTxt = checked.map(b => (/^\s*([\d.]+)/.exec(b.spine_label || '') || [])[1] || '');
+      const intOf = m => m.split('.')[0];
+      const widths = numTxt.filter(Boolean).map(m => intOf(m).length).sort((a, b) => a - b);
+      const modalW = widths[widths.length >> 1] || 3;
       checked.forEach((b, i) => {
         const n = numTxt[i];
-        if (!n || !n.includes('.')) return;
-        if (numTxt.some((m, j) => j !== i && m.length > n.length && m.startsWith(n)))
-          b._truncated = true;
+        if (!n) return;
+        const ip = intOf(n);
+        let trunc = n.includes('.') &&
+                    numTxt.some((m, j) => j !== i && m.length > n.length && m.startsWith(n));
+        // A Dewey class is three digits, so an integer part narrower than the
+        // shelf's own modal width is a damaged read, not a real number --
+        // "3.7" on a shelf of 363.70xx.
+        if (!trunc && ip.length < modalW) trunc = true;
+        // No decimal of its own, on a shelf where this same class almost always
+        // has one: "363" among 363.7052/363.7063 is the same sticker with its
+        // decimals unread. The majority guard keeps a genuine whole number
+        // ("635" on a shelf of plain 635s) out of this.
+        if (!trunc && !n.includes('.')) {
+          const same = numTxt.filter(m => m && intOf(m) === ip);
+          const dec  = same.filter(m => m.includes('.')).length;
+          if (same.length >= 3 && dec / same.length > 0.6) trunc = true;
+        }
+        if (trunc) b._truncated = true;
       });
     }
 
