@@ -4785,9 +4785,19 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // This only ever hides a redundant flag (can never create a red one), and
     // full high-confidence reads of that author are GREEN (not in this flagged
     // set), so they're never collapsed away.
-    const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    // Strip a leading call NUMBER before comparing. This test is about the same
+    // AUTHOR being read repeatedly, and on a nonfiction shelf every label opens
+    // with the same Dewey number: "616.8588 GAR" and "616.8527 RIL" share
+    // "61685" and were collapsed into one group, so a shelf with two genuinely
+    // misfiled books displayed exactly ONE flag -- and which one survived was
+    // decided by sort order, not by which read was better. Comparing the cutter
+    // ("GAR" vs "RIL", 0 shared) keeps them apart, while fiction is unaffected
+    // because a surname has no leading digits to strip.
+    const norm = s => String(s || '').toUpperCase()
+                          .replace(/^\s*[\d.]+\s*/, '').replace(/[^A-Z0-9]/g, '');
     const sharePrefix = (a, b) => {
       const na = norm(a.spine_label), nb = norm(b.spine_label);
+      if (!na || !nb) return false;
       let n = 0; const m = Math.min(na.length, nb.length);
       while (n < m && na[n] === nb[n]) n++;
       return n >= 5;   // 5+ shared leading chars: same author, not a coincidence
@@ -6103,6 +6113,50 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       if (b._truncated && b.outOfOrder) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
         b._why = 'trunc';
+      }
+      // Same label, twice on one row, far apart, and the other copy sits IN
+      // ORDER: the flagged one is a misread wearing a real label's text. The
+      // first sticker on this shelf came back "635 COM" at 0.99 where the shelf
+      // truly begins "635 BAK", and a genuine "635 COM" stood fifteen books
+      // later exactly where it belongs. Confidence cannot separate those -- the
+      // misread is the MORE confident of the two.
+      // Distance is what makes this safe: real duplicate call numbers sit side
+      // by side ("635 COL 635 COL", "635 DAM 635 DAM") and never flag each
+      // other, so requiring a gap leaves genuine repeats alone. Cross-ROW
+      // repeats are handled separately and geometrically, because a Dewey run
+      // legitimately carries the same number onto the next shelf.
+      if (section !== 'fiction' && b.outOfOrder) {
+        const norm2 = t => String(t || '').toUpperCase().replace(/\s+/g, ' ').trim();
+        const me = norm2(b.spine_label), iMe = checked.indexOf(b);
+        if (me) for (let j = 0; j < checked.length; j++) {
+          const o = checked[j];
+          if (o === b || Math.abs(j - iMe) < 3) continue;
+          if ((o.shelfRow ?? 0) !== (b.shelfRow ?? 0)) continue;
+          if (o.outOfOrder || o.unverifiable || o._malformed) continue;
+          if (norm2(o.spine_label) !== me) continue;
+          b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+          b._why = 'rowdupe';
+          break;
+        }
+      }
+      // A very short fiction surname needs corroboration before it may accuse.
+      // Azure returns the tail of a clipped sticker as a whole word -- "VER" at
+      // 0.989 where the spine says OLIVER -- and three letters sort nowhere near
+      // the real name, so it lands mid-shelf looking misfiled. Confidence cannot
+      // catch this; the read IS confident, it is just not the whole name.
+      // Corroboration rather than a ban, because real three-letter surnames
+      // exist (Lee, Fox, Poe): a genuine one has siblings on an author-run
+      // shelf, a clipped fragment has none. Ground truth here contains exactly
+      // one three-letter "surname" and it is the filing prefix VON.
+      if (section === 'fiction' && b.outOfOrder) {
+        const sur = t => String(t || '').trim().toUpperCase()
+                             .replace(/[^A-Z ]/g, '').split(/\s+/)[0] || '';
+        const mine = sur(b.spine_label);
+        if (mine && mine.length <= 3 &&
+            !checked.some(o => o !== b && !o._malformed && sur(o.spine_label) === mine)) {
+          b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+          b._why = 'shortsurname';
+        }
       }
       // A surname read with no given name can be filed under its author but not
       // WITHIN that author: a run of one surname is ordered by given name, and
