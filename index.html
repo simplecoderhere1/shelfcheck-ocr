@@ -102,19 +102,26 @@
        so the eye catches the size change without losing the pixels. */
     /* A spine is about fifteen screen pixels wide, so a thick BORDER meets
        itself in the middle and the highlight reads as a solid yellow bar —
-       covering the very book it is pointing at. The ring therefore goes
-       OUTSIDE the box, via outline + outline-offset, which is drawn beyond the
-       element's edge and never eats into it. The book stays fully visible
-       inside a heavy ring. */
+       covering the very book it is pointing at. So the highlight is a single
+       OUTLINE, which is drawn OUTWARD from the element's edge and never eats
+       into it, leaving the book fully visible inside the ring.
+       ONE ring only, on purpose: an inner border plus an offset outer outline
+       used to render as two concentric squares, and a held scale(1.12) left
+       that ring permanently larger than the box already drawn on the photo —
+       so tapping a book stacked up two or three nested squares ("one bigger,
+       one smaller"). The outline now hugs the box (offset 0) so it lands on
+       the drawn box as a single emphasised ring, and the pop is a brief
+       animation that SETTLES back to the box's own size instead of holding
+       larger. The full-screen box-shadow dims everything else to spotlight it. */
     .box-pulse {
       position: absolute; pointer-events: none; border-radius: 3px;
-      border: 2px solid currentColor;
-      outline: 5px solid currentColor; outline-offset: 4px;
-      opacity: 0; transform: scale(1); transform-origin: center;
-      transition: opacity .15s ease-out, transform .22s cubic-bezier(.34,1.56,.64,1);
+      outline: 4px solid currentColor; outline-offset: 0;
+      opacity: 0; transform-origin: center;
+      transition: opacity .15s ease-out;
       box-shadow: 0 0 0 9999px rgba(0,0,0,.28);
     }
-    .box-pulse.show { opacity: 1; transform: scale(1.12); }
+    .box-pulse.show { opacity: 1; animation: box-pulse-pop .5s cubic-bezier(.34,1.56,.64,1); }
+    @keyframes box-pulse-pop { 0% { transform: scale(1.14); } 100% { transform: scale(1); } }
     .photo-placeholder p { font-size: 14px; line-height: 1.6; text-align: center; max-width: 220px; }
 
     #snapshot {
@@ -917,13 +924,14 @@
   // digits in by inference where Azure reports only what the camera captured,
   // so it is strictly a better-than-nothing path and never the default.
   function deviceOcr(src, signal) {
-    if (AZURE_URL && !azureDown) return Promise.resolve(null);
-    if (!GEMINI_URL) return Promise.resolve(null);
-    return callGeminiReadMerged(src, getSection(), signal)
-      .catch(err => {
-        console.log('[perf] gemini fallback read failed:', err.message);
-        return null;
-      });
+    // Gemini removed from the pipeline (2026-08-17): Azure is the sole reader.
+    // Gemini was only ever an emergency fallback for when Azure was unreachable
+    // or past its 5,000/month quota (it already returned null whenever Azure was
+    // healthy, so it never touched the normal assembly). That fallback is now
+    // intentionally gone: a failed Azure read surfaces as "couldn't read" rather
+    // than a Gemini guess. Stub kept because runOcr still calls it; the
+    // callGemini* / fuseLabels gem-path below is now dead code.
+    return Promise.resolve(null);
   }
 
   // The Gemini reader returns no geometry (asking for per-book boxes measured
@@ -2131,7 +2139,23 @@
     return out;
   }
 
+  // ?ficassembly=anchor switches fiction assembly to the anchor-first path
+  // below (reconstructFictionAzureAnchor). Default stays the legacy
+  // union-find path until the anchor path is validated live against the
+  // ground-truth baseline on BOTH axes — books read AND misfiles still
+  // flagged (see shelfcheck-audit-findings memory: reading more of a shelf
+  // previously changed neighbour relationships and cost real detections).
+  // Flip the default only after that comparison, not before.
+  const FIC_ASSEMBLY_ANCHOR = typeof location !== 'undefined' &&
+    new URLSearchParams(location.search).get('ficassembly') === 'anchor';
+
   function reconstructFictionAzure(words, ctx) {
+    return FIC_ASSEMBLY_ANCHOR
+      ? reconstructFictionAzureAnchor(words, ctx)
+      : reconstructFictionAzureLegacy(words, ctx);
+  }
+
+  function reconstructFictionAzureLegacy(words, ctx) {
     const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
     // Same fix as the nonfiction reader, by a different route. "A label word is
     // at most 2.5% of the long edge" encodes how far away the camera was, not
@@ -2267,6 +2291,216 @@
                  unclear: conf < AZ_MIN_NUM_CONF });
     }
     return dropStrayFictionRows(out, ctx.canvas.height);
+  }
+
+  // ── Fiction assembly v2: anchor-first (2026-08-17) ──────────────────────────
+  // The legacy path above builds each label by TRANSITIVELY unioning nearby
+  // words (union-find). On a packed shelf that lets a chain of loose pairwise
+  // matches connect two DIFFERENT books' fragments into one label — measured:
+  // "TRIC Adr" and "WALKEREN Carlie" exist NOWHERE in Azure's own output for
+  // those photos (checked directly against the raw response); the app
+  // manufactured both strings itself by chaining unrelated candidates. The
+  // legacy path also has no way to reject a single Azure WORD that is itself a
+  // weld of two spines: "WEISBERGHAST", one 232px-wide token whose x-span
+  // CONTAINS both the correct "WEISBERGE" (0.766 conf) and "WEST" (0.993
+  // conf) — two clean reads Azure ALSO returned at the same spot. The legacy
+  // dedup keeps the LONGER text on a tie, which systematically prefers a weld
+  // over the two correct words it fused, because a weld is always longer than
+  // either half alone.
+  //
+  // This path instead: (1) treats the ALL-CAPS surname word as the one ANCHOR
+  // per book — the same capitalisation convention sortKey already relies on to
+  // split surname from given name, so this is not a new assumption; (2)
+  // explicitly detects and drops a candidate whose box contains two other real
+  // anchors (a weld — the two anchors it fused already stand on their own, so
+  // nothing is lost by dropping it) or is itself contained by a
+  // higher-confidence anchor at the same spot (a duplicate/garbled re-read —
+  // confidence decides, not length); (3) attaches at most ONE given-name line
+  // per anchor via nearest-neighbour matching, claimed one-to-one, so a bad
+  // match can never chain two books' labels together the way transitive
+  // union-find could.
+  function reconstructFictionAzureAnchor(words, ctx) {
+    const maxDim = Math.max(ctx.canvas.width, ctx.canvas.height);
+    const preMax = maxDim * 0.15;
+    const onSticker = words.filter(w => {
+      if (!w.t || w.h > preMax || w.w < w.h * 0.5) return false;
+      if (!/[A-Za-z]/.test(w.t)) return false;
+      return lightRatio(ctx, w.x - 4, w.y - 4, w.w + 8, w.h + 8) >= 0.35;
+    });
+    const stickerHs = onSticker.map(w => w.h).sort((a, b) => a - b);
+    const maxH = stickerHs.length >= AZ_CAL_MIN_N
+      ? stickerHs[stickerHs.length >> 1] * AZ_TEXT_H_K_FIC
+      : maxDim * 0.025;
+    const cand = onSticker.filter(w => w.h <= maxH);
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('ficdebug') === '1') {
+      console.log('[ficdebug] maxH=' + maxH.toFixed(1) + ' cand=' + cand.length);
+      for (const w of [...cand].sort((a, b) => a.y - b.y || a.x - b.x))
+        console.log(`[ficdebug]  c=${(w.c ?? 0.9).toFixed(3)} x=[${Math.round(w.x)}-${Math.round(w.x + w.w)}] y=[${Math.round(w.y)}-${Math.round(w.y + w.h)}] "${w.t}"`);
+    }
+    return dropStrayFictionRows(assembleFictionAnchors(cand), ctx.canvas.height);
+  }
+
+  // Pure geometric assembly, split out from reconstructFictionAzureAnchor so it
+  // can be tested directly against real Azure word coordinates without a
+  // canvas (the sticker/height filtering above needs pixel data; this does
+  // not — it only reasons about the already-filtered candidate boxes).
+  function assembleFictionAnchors(cand) {
+    const letters  = w => w.t.replace(/[^A-Za-z]/g, '');
+    const isCapsW  = w => letters(w).length > 0 && letters(w) === letters(w).toUpperCase();
+    const sameLine = (a, b) => Math.abs(a.y - b.y) <= Math.min(a.h, b.h) * 0.6;
+    // A real given name is mostly lowercase after its leading capital — even
+    // a noisy OCR read of one stays that way ("RacAnne" for "RaeAnne": 2 of 7
+    // letters capitalised). A word whose MAJORITY of letters are capitalised
+    // is a fragment of a SURNAME read, not a first name, even though it isn't
+    // literally all-caps (measured live: "REINHOLDSiIV", 11 of 12 letters
+    // capitalised, attached to a neighbouring "ZIEGESAR" anchor purely by
+    // proximity in a dense cluster of four VON-prefixed books shelved
+    // alphabetically adjacent — Von Arnim/Kreisler/Reinhold/Ziegesar all sit
+    // within a few pixels of each other's stickers, and Azure's own raw
+    // output has overlapping duplicate reads of all four at once).
+    const looksLikeGivenName = w => {
+      const L = letters(w);
+      if (L.length < 2) return false;
+      let upp = 0; for (const c of L) if (c >= 'A' && c <= 'Z') upp++;
+      return upp / L.length <= 0.5;
+    };
+
+    // ── 1. Anchors: all-caps sticker words of plausible surname length.
+    // Prefix words (VON, MAC, DEL...) are excluded here — they attach to an
+    // anchor in step 4, but must never stand alone as one.
+    let anchors = cand.filter(w => isCapsW(w) && letters(w).length >= 3 &&
+      !FICTION_STOPWORDS.has(letters(w).toUpperCase()) &&
+      !PLAUSIBLE_PREFIXES.has(letters(w).toLowerCase()));
+
+    // ── 2. Weld rejection: drop an anchor whose box contains two OTHER real,
+    // mutually-distinct anchors roughly on its row — it is a single Azure
+    // token that fused two spines together. Splitting it is not attempted;
+    // the two anchors it contains already stand on their own.
+    //
+    // Uses vNear (ANY vertical overlap), not the strict sameLine used
+    // elsewhere: a weld token's box is an average over the two regions it
+    // fused, so its baseline sits BETWEEN the two clean reads it welded —
+    // measured on a real weld ("WEISBERGHAST" fusing "WEISBERGE" 0.766 and
+    // "WEST" 0.993), sameLine's center-distance test missed both by a few
+    // pixels even though the boxes plainly overlap vertically. The x-side
+    // containment test below is what actually keeps this precise — two
+    // genuinely different books' anchors essentially never have one's text
+    // width fully swallow the other's, so loosening the y-test here doesn't
+    // invite new false welds.
+    const contains = (outer, inner, marginFrac = 0.12) => {
+      const m = outer.w * marginFrac;
+      return inner.x >= outer.x - m && (inner.x + inner.w) <= (outer.x + outer.w) + m;
+    };
+    const vNear = (a, b) => Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 0;
+    const weldIdx = new Set();
+    for (let i = 0; i < anchors.length; i++) {
+      const w = anchors[i];
+      const inside = anchors.filter((o, j) => j !== i && vNear(o, w) && contains(w, o));
+      if (inside.length < 2) continue;
+      let distinctPair = false;
+      for (let a = 0; a < inside.length && !distinctPair; a++)
+        for (let b = a + 1; b < inside.length; b++) {
+          const A = inside[a], B = inside[b];
+          const ov = Math.min(A.x + A.w, B.x + B.w) - Math.max(A.x, B.x);
+          if (ov / Math.min(A.w, B.w) < 0.3) { distinctPair = true; break; }
+        }
+      if (distinctPair) weldIdx.add(i);
+    }
+    anchors = anchors.filter((_, i) => !weldIdx.has(i));
+
+    // ── 3. Duplicate-read collapse: among remaining same-line anchors that
+    // still substantially overlap, keep only the highest-confidence one.
+    // Confidence decides, not length — this is what lets a clean "WEISBERGE"
+    // (0.766) beat a longer, lower-confidence overlapping alternative outright.
+    const overlapFrac = (a, b) => {
+      const ov = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+      return ov <= 0 ? 0 : ov / Math.min(a.w, b.w);
+    };
+    anchors = [...anchors].sort((a, b) => (b.c ?? 0.9) - (a.c ?? 0.9));
+    const keptAnchors = [];
+    for (const w of anchors) {
+      if (!keptAnchors.some(k => vNear(k, w) && overlapFrac(k, w) >= 0.5)) keptAnchors.push(w);
+    }
+    anchors = keptAnchors;
+
+    // ── 4/5. Prefix + given-name attachment via GLOBAL greedy matching:
+    // score every valid (anchor, candidate) pair, then assign strictly in
+    // best-score-first order across ALL anchors at once. An earlier version
+    // attached anchor-by-anchor in whatever order step 3's confidence-sort
+    // happened to leave `anchors` in — an order that has nothing to do with
+    // shelf position — so an unrelated higher-confidence anchor considered
+    // first could steal a given-name word that rightfully belonged to a
+    // lower-confidence anchor met later in the loop. Measured: "WERTH,
+    // Janet" lost "Janet" to a different anchor this way, leaving a bare
+    // "WERTM" that then tripped the malformed-label gate and got demoted off
+    // the misshelving flag it deserved. Global best-first assignment has no
+    // such iteration-order dependence.
+    //
+    // ── 4. VON-prefix: same-line ALL-CAPS prefix word to the anchor's left.
+    const prefixPairs = [];
+    for (const w of anchors) {
+      for (const p of cand) {
+        if (p === w || !isCapsW(p) || !sameLine(p, w)) continue;
+        if (!PLAUSIBLE_PREFIXES.has(letters(p).toLowerCase())) continue;
+        if (p.x >= w.x) continue;
+        const gap = w.x - (p.x + p.w);
+        if (gap < 0 || gap > Math.max(p.h, w.h) * 1.5) continue;
+        prefixPairs.push({ w, p, score: gap });
+      }
+    }
+    prefixPairs.sort((a, b) => a.score - b.score);
+    const usedPrefixWord = new Set(), gotPrefix = new Set();
+    for (const { w, p } of prefixPairs) {
+      if (usedPrefixWord.has(p) || gotPrefix.has(w)) continue;
+      w._prefix = p; usedPrefixWord.add(p); gotPrefix.add(w);
+    }
+
+    // ── 5. Given-name: ONE nearest mixed-case word below each anchor.
+    const givenCand = cand.filter(w => !anchors.includes(w) && !isCapsW(w) &&
+      !usedPrefixWord.has(w) && looksLikeGivenName(w));
+    const givenPairs = [];
+    for (const w of anchors) {
+      const left = w._prefix ? Math.min(w._prefix.x, w.x) : w.x;
+      const right = w.x + w.w;
+      for (const g of givenCand) {
+        const ov = Math.min(right, g.x + g.w) - Math.max(left, g.x);
+        if (ov / Math.max(1, Math.min(right - left, g.w)) < 0.25) continue;
+        // Lower bound at -0.6*h, matching sameLine's own "close enough to be
+        // adjacent" tolerance elsewhere in this file — a real surname/given-
+        // name pair can have a few px of vertical overlap at small on-shelf
+        // scale (measured live: "WERTM"/"Janet" overlapped by 6px against a
+        // 17px-tall anchor, just past the old -0.3*h=-5.1px cutoff, which
+        // left the given name unattached and demoted the label as malformed).
+        const dy = g.y - (w.y + w.h);
+        if (dy < -w.h * 0.6 || dy > w.h * 1.4) continue;
+        givenPairs.push({ w, g, score: Math.abs(dy) + Math.abs(g.x - w.x) * 0.15 });
+      }
+    }
+    givenPairs.sort((a, b) => a.score - b.score);
+    const usedGivenWord = new Set(), gotGiven = new Set();
+    for (const { w, g } of givenPairs) {
+      if (usedGivenWord.has(g) || gotGiven.has(w)) continue;
+      w._given = g; usedGivenWord.add(g); gotGiven.add(w);
+    }
+
+    // ── 6. Build output labels — same shape the legacy path produces.
+    const out = [];
+    for (const w of anchors) {
+      const parts = [w._prefix, w, w._given].filter(Boolean);
+      const text = collapseRepeats(parts.map(p => p.t)).join(' ').replace(/\s+/g, ' ').trim();
+      const first = (text.split(/[\s,.]+/)[0] || '').replace(/[^A-Za-z]/g, '');
+      if (first.length < 3 || FICTION_STOPWORDS.has(first.toUpperCase())) continue;
+      const ux = Math.min(...parts.map(p => p.x)), uy = Math.min(...parts.map(p => p.y));
+      const ur = Math.max(...parts.map(p => p.x + p.w)), ub = Math.max(...parts.map(p => p.y + p.h));
+      // Confidence over the SURNAME LINE only (anchor + prefix) — same
+      // rationale as legacy: the given name can't change shelf position, so a
+      // poor given-name read must not sink a confident surname below the bar.
+      const surnameParts = [w._prefix, w].filter(Boolean);
+      const conf = Math.min(...surnameParts.map(p => p.c ?? 0.9));
+      out.push({ text, bbox: [ux, uy, ur - ux, ub - uy], score: conf,
+                 unclear: conf < AZ_MIN_NUM_CONF });
+    }
+    return out;
   }
 
   // A shelf is a RUN of books. Cover text is not.
@@ -3797,9 +4031,16 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
               }
             }
           } catch (e) { console.log('[perf] closer look skipped:', e.message); }
-          // Anchors that still have no author tag cannot be sorted, so they stop
-          // here rather than reaching the volunteer as half a label.
-          labels = labels.filter(l => l.cut);
+          // Anchors that still have no author tag cannot be SORTED — sortKey's
+          // nonfiction branch already refuses a label with an empty cutter for
+          // exactly this reason — but that is no longer a reason to make the
+          // book vanish. It used to be dropped entirely here; now it is kept,
+          // marked unclear/malformed so it can only ever render as "couldn't
+          // read the cutter" and can never be sorted or flagged red, and
+          // still reaches the volunteer as a book to check by hand instead of
+          // silently disappearing (the tag-read/number-missing mirror case is
+          // handled the same way earlier in reconstructNonfictionAzure).
+          for (const l of labels) if (!l.cut) { l.unclear = true; l.malformed = true; }
         } else {
           try {
             const zt0 = performance.now();
@@ -4921,7 +5162,19 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       return { kind: 'str', val: surname, first, vol, title };
     }
     if (section === 'fiction')    return book.spine_label ? strKey(book.spine_label) : null;
-    if (section === 'nonfiction') { const d = parseDewey(book.spine_label); return d ? { kind: 'dewey', val: d, vol, title, trunc: !!book._truncated } : null; }
+    if (section === 'nonfiction') {
+      const d = parseDewey(book.spine_label);
+      // A number read with NO cutter (d.cut === '', not null — parseDewey
+      // always returns a string) sorts before every real cutter under
+      // localeCompare, a fabricated tie-break with no basis in the sticker.
+      // Treat it exactly like any other unparseable label (null key -> the
+      // existing 'nokey'/unclear path in checkOrderOneShelf): it is counted
+      // and shown as unreadable, but never sorted and never red. This is what
+      // makes it safe for the assembly stage to stop DELETING these labels
+      // (the reason they used to vanish rather than show as "couldn't read")
+      // without opening a new false-positive path.
+      return d && d.cut ? { kind: 'dewey', val: d, vol, title, trunc: !!book._truncated } : null;
+    }
     const d = parseDewey(book.spine_label);
     if (d && d.num !== null) return { kind: 'dewey', val: d, vol, title };
     return book.spine_label ? strKey(book.spine_label) : null;
@@ -5094,8 +5347,20 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     for (const i of misreads) keys[i] = null;
 
     const vIdx = []; keys.forEach((k, i) => { if (k) vIdx.push(i); });
-    const lisLocal  = longestNonDecreasingSubseq(vIdx.map(i => keys[i]));
-    const lisGlobal = new Set([...lisLocal].map(li => vIdx[li]));
+    // The in-order run is measured over COMPLETE reads only. A truncated read
+    // ties every number it is a prefix of (compareKeys treats "616.8" as equal
+    // to both "616.8527" and "616.8588"), so leaving it in the run lets it
+    // BRIDGE a genuinely-misfiled clean read into a subsequence that only looks
+    // non-decreasing because the truncated neighbour ties everything: a
+    // "616.8588 GAR" sitting in a run of "616.8527" came back unflagged because
+    // a truncated "616.8" beside it tied them together. Building the backbone
+    // from complete reads keeps that bridge out; a truncated read that then
+    // falls outside the run is never turned red — the _truncated demotion below
+    // sends it to "check by hand" instead, which is the honest verdict for a
+    // number we could not fully read.
+    const backbone  = vIdx.filter(i => !books[i]._truncated);
+    const lisLocal  = longestNonDecreasingSubseq(backbone.map(i => keys[i]));
+    const lisGlobal = new Set([...lisLocal].map(li => backbone[li]));
 
     const sortedV = [...vIdx].sort((a, b) => compareKeys(keys[a], keys[b]));
     const idealRank = new Map();
@@ -5175,6 +5440,165 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       if (demote) {
         checked[i].outOfOrder = false; checked[i].unverifiable = true;
         checked[i].idealPosition = null; checked[i]._why = 'neartwin';
+      }
+    }
+
+    // Post-pass: a confident, correctly-placed book must not take the fall for a
+    // neighbour's garbled read. The LIS can only keep one book from a conflicting
+    // pair; when it keeps a WEAK misread and drops the CONFIDENT neighbour, the
+    // red lands on the wrong book (measured: a "363.7052 U LOA" sticker read as
+    // cutter "ULOA" sorted after "THO" and got the correctly-shelved "363.7052
+    // THO" flagged, while ULOA itself — the actual misread — stayed in the run).
+    // If a flagged book sits in non-decreasing order between its nearest STRONG,
+    // in-order (LIS-backbone) neighbours on BOTH sides, it is genuinely in place,
+    // so clear it. This only ever REMOVES a red — it cannot manufacture a false
+    // positive; its one cost is possibly missing a real misfile, which the
+    // strong-anchor-on-both-sides requirement bounds. A weak neighbour that then
+    // stands alone as the out-of-run read falls to the confidence demotion below.
+    const STRONG_ANCHOR = 0.9;   // trustworthy enough to anchor a correctness claim
+    for (let i = 0; i < checked.length; i++) {
+      if (!checked[i].outOfOrder || !keys[i] || !(checked[i]._score >= STRONG_ANCHOR)) continue;
+      let L = i - 1;
+      while (L >= 0 && !(keys[L] && lisGlobal.has(L) && checked[L]._score >= STRONG_ANCHOR)) L--;
+      let R = i + 1;
+      while (R < checked.length && !(keys[R] && lisGlobal.has(R) && checked[R]._score >= STRONG_ANCHOR)) R++;
+      if (L < 0 || R >= checked.length) continue;
+      if (compareKeys(keys[L], keys[i]) <= 0 && compareKeys(keys[i], keys[R]) <= 0) {
+        checked[i].outOfOrder = false;   // correctly shelved between confirmed in-order anchors
+      }
+    }
+
+    // Fiction: never turn a book RED for its order WITHIN a run of its own
+    // author. Libraries shelve one author's books together, so a red caused
+    // PURELY by first-name / OCR-variant noise among same-surname neighbours
+    // is not a misfiling a volunteer would reshelve (measured: a clean
+    // "THAYNE RaeAnn" flagged red inside its own Thayne run; "TAYLOR Bred"
+    // flagged inside a 15-book Taylor block; the clean-GT suite's "WALKER,
+    // Ann Marie"/"WALKER, Boo").
+    //
+    // An earlier version of this rule demoted on ANY same-surname word within
+    // a fixed physical window, regardless of why the book was flagged — that
+    // wrongly demoted two REAL detections: "WILLIAMS Hattie" stranded in a
+    // WILSON zone (its window just happened to also contain other WILLIAMS
+    // entries) and "TOIBIN, Colm" misordered against TODD (three duplicate
+    // reads of the same Toibin sticker sat in each other's window and
+    // demoted one another). The fix: only demote when the SURNAME ITSELF
+    // (compareFiling, the same comparator compareKeys uses before the
+    // first-name tiebreak) is in correct order against the nearest
+    // LIS-included neighbour on each side. If the surname is fine and only
+    // the full key (surname+given name) violates the run, the given name is
+    // the whole story — safe to demote. If the surname itself is out of
+    // order against a flank (WILLIAMS after WILSON; TOIBIN before TODD),
+    // that is a real cross-author stranding and must stay red.
+    // nameSlip still guards a misread surname (a flank that is the SAME
+    // author read slightly wrong) from being treated as a real cross-author
+    // boundary. This only ever removes a red, so it cannot manufacture a
+    // false positive.
+    if (section === 'fiction') {
+      for (let i = 0; i < checked.length; i++) {
+        if (!checked[i].outOfOrder || !keys[i] || keys[i].kind !== 'str') continue;
+        const sur = keys[i].val || '';
+        if (!sur) continue;
+        const sameRow = j => (books[j].shelfRow ?? 0) === (books[i].shelfRow ?? 0);
+        let L = i - 1; while (L >= 0 && !(keys[L] && lisGlobal.has(L) && sameRow(L))) L--;
+        let R = i + 1; while (R < checked.length && !(keys[R] && lisGlobal.has(R) && sameRow(R))) R++;
+        const flankOk = (j, dir) => {
+          if (j < 0 || j >= checked.length || !keys[j]) return true;   // no flank, vacuously fine
+          const v = keys[j].val || '';
+          if (!v || nameSlip(sur, v)) return true;                    // same author, misread surname
+          // A same-author flank can itself be a badly garbled MULTI-WORD OCR
+          // read of the identical sticker ("THAY! THATNE." parsed as surname
+          // "thay thatne" for a book whose true surname is "Thayne") that
+          // nameSlip's single-name edit-distance test does not recognise.
+          // Compare just the leading token on each side with the same prefix
+          // tolerance — still same-author evidence, not a licence to ignore a
+          // real cross-author boundary (both leading tokens must clear
+          // NAME_PREFIX_MIN, same bar nameSlip itself uses).
+          const a0 = sur.split(' ')[0] || '', b0 = v.split(' ')[0] || '';
+          if (a0.length >= NAME_PREFIX_MIN && b0.length >= NAME_PREFIX_MIN &&
+              (a0.startsWith(b0) || b0.startsWith(a0))) return true;
+          return dir < 0 ? compareFiling(v, sur) <= 0 : compareFiling(sur, v) <= 0;
+        };
+        if (flankOk(L, -1) && flankOk(R, 1)) {
+          checked[i].outOfOrder = false; checked[i].possiblyOutOfOrder = true;
+          checked[i].idealPosition = null; checked[i]._why = 'sameauthor';
+        }
+      }
+    }
+
+    // Fiction: a red flag is a GARBLED FRAGMENT of a read Azure ALSO produced
+    // correctly, elsewhere on the same shelf, at higher confidence — not a
+    // second, differently-named book. Measured: Azure returns "TRIGIANI" at
+    // 0.99+ many times on a shelf, and once returns "TRIC" (0.76) — a genuine
+    // standalone OCR word, not a weld of two spines — that sorts far from
+    // TRIGIANI's true position and gets flagged. Same for "RIGIA" against
+    // "TRIGIANI" and "HIRKELL" against "THIRKELL" (a dropped leading letter).
+    // The fragment is short and degraded; the full read is long, confident,
+    // and the shelf itself already accepted it into the in-order run.
+    //
+    // Length-scaled containment, not a flat edit-distance bar, is load-
+    // bearing: under a flat "≤1 edit" rule, "TATA" (a REAL misfile, stranded
+    // among TAWADAs) is edit-distance 1 from "TAWA" and would be wrongly
+    // demoted, silencing a genuine detection. A short fragment (4-5 letters)
+    // must be an EXACT substring of the longer read to count; only surnames
+    // long enough to be unambiguous (6+) get the 1-edit tolerance, and even
+    // then only within a matching-length WINDOW of the longer string, not
+    // the whole thing. Demote only, never drop — this only ever removes a
+    // red, so it cannot manufacture a false positive.
+    if (section === 'fiction') {
+      const isFragmentOf = (s, t) => {
+        if (t.length < s.length + 1) return false;
+        if (s.length <= 5) return t.includes(s);
+        for (let start = 0; start <= t.length - s.length + 1; start++) {
+          for (const len of [s.length - 1, s.length, s.length + 1]) {
+            if (len < 1 || start + len > t.length) continue;
+            if (editDistance(s, t.slice(start, start + len)) <= 1) return true;
+          }
+        }
+        return false;
+      };
+      // Deliberately no "t's confidence must beat s's" comparison. Confidence
+      // does not separate a misread from a good one — a documented, measured
+      // fact elsewhere in this file (the fusion tie-break comment: "the
+      // misreads come back just as confident as the good reads") — and it is
+      // measured again here: "RIGIA Adrian" reads at 0.988, higher than every
+      // surviving "TRIGIANI, Adriana" anchor on its own shelf (0.984, 0.914 —
+      // the one at 0.993 was itself collapsed by the duplicate-read pre-pass
+      // above before this rule ever saw it). An absolute floor (STRONG_ANCHOR)
+      // is the load-bearing bar, not a relative one.
+      for (let i = 0; i < checked.length; i++) {
+        if (!checked[i].outOfOrder || !keys[i] || keys[i].kind !== 'str') continue;
+        const s = keys[i].val || '';
+        if (s.length < 3) continue;
+        for (let j = 0; j < checked.length; j++) {
+          if (j === i || !keys[j] || keys[j].kind !== 'str' || !lisGlobal.has(j)) continue;
+          const t = keys[j].val || '';
+          if ((checked[j]._score ?? 0) < STRONG_ANCHOR) continue;
+          if (isFragmentOf(s, t)) {
+            checked[i].outOfOrder = false; checked[i].possiblyOutOfOrder = true;
+            checked[i].idealPosition = null; checked[i]._why = 'fragment';
+            break;
+          }
+        }
+      }
+      // Companion bar for a short garbled surname with NO surviving sibling
+      // read to contain-match against ("TRIC", 0.76 — Azure's own only
+      // reading of that spine at the shipped 2400px frame; the cleaner
+      // "TRIGIANI" reads elsewhere on the shelf don't share enough of TRIC's
+      // letters for isFragmentOf to connect them). Length capped at 4:
+      // longer surnames keep their evidence even at moderate confidence, and
+      // 4-5 letter surnames that clear 0.85 stay red — this is specifically
+      // why isFragmentOf demands an EXACT substring at that length rather
+      // than reaching for a bar here too. Verified against the one real
+      // 4-letter misfile in this shelf set: "TATA" (Direct Fire, stranded
+      // after TAWADA) reads at 0.881 and clears this bar untouched.
+      for (const b of checked) {
+        if (!b.outOfOrder || !b._src) continue;
+        const sur = (b.spine_label || '').split(/[,\s]+/)[0] || '';
+        if (sur.length <= 4 && (b._score ?? 0) < 0.85) {
+          b.outOfOrder = false; b.possiblyOutOfOrder = true;
+          b.idealPosition = null; b._why = 'fragment';
+        }
       }
     }
 
@@ -5462,6 +5886,10 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         shelfIndex:         b.shelfIndex ?? null,
         shelfPosition:      b.shelfPosition ?? null,
         idealPosition:      b.idealPosition ?? null,
+        _truncated:         !!b._truncated,
+        _ambiguousTail:     !!b._ambiguousTail,
+        _malformed:         !!b._malformed,
+        _why:               b._why ?? null,
       })),
     });
 
