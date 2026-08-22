@@ -5809,6 +5809,25 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         const flankOk = (j, dir) => {
           if (j < 0 || j >= checked.length || !keys[j]) return true;   // no flank, vacuously fine
           const v = keys[j].val || '';
+          // TRIED AND REVERTED (2026-08-22) — comparing GIVEN names here when
+          // the flank is the same author, so that one Walker book out of
+          // first-name order inside a run of Walkers could go red. That is the
+          // commonest shelving mistake there is, and this rule is the only
+          // thing standing between the app and detecting it, so it looked like
+          // the obvious win.
+          //
+          // Measured over 36 shelves: true positives 12 -> 13, false positives
+          // 1 -> 6, AND a must_not_flag violation. Every new false positive was
+          // a garbled given name accusing a correctly shelved book -- "WELTY
+          // Eud" for Eudora, "TILLY, Med" for Meg, "WHITE Kafe" for Kate. A
+          // confidence bar does not rescue it: swept 0.85 / 0.75 / 0.65 / 0.0
+          // and the false positives are identical at every level, because (as
+          // the note in the pairing loop already records) an OCR misread comes
+          // back just as confident as a good read. One extra detection is not
+          // worth five false accusations and a book already confirmed correct.
+          //
+          // Do not retry without a way to VERIFY a given name -- a second read
+          // of the same sticker agreeing, or the spine text corroborating it.
           if (!v || nameSlip(sur, v)) return true;                    // same author, misread surname
           // A same-author flank can itself be a badly garbled MULTI-WORD OCR
           // read of the identical sticker ("THAY! THATNE." parsed as surname
