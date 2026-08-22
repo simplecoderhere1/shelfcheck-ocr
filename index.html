@@ -5385,6 +5385,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       return { ...book, outOfOrder: !lisGlobal.has(i) && !inTied, unverifiable: false, possiblyOutOfOrder: false, idealPosition: ideal, shelfPosition: pos, shelfSize: books.length, tiedGroupSlots: tied };
     });
 
+    // trustworthy enough to anchor a correctness claim; used by both the
+    // near-twin demotion below and the strong-anchor rescue after it
+    const STRONG_ANCHOR = 0.9;
     // Post-pass: sandwich / near-twin demotion
     for (let i = 0; i < checked.length; i++) {
       if (!checked[i].outOfOrder) continue;
@@ -5406,6 +5409,13 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // neighbors happen to share a key", so demoting it anyway just
       // because duplicate copies of the same call number legitimately sit
       // on the shelf was needlessly turning good reads into "please check".
+      // NOTE: `_src === 'both'` meant two ENGINES agreed on the text. Gemini
+      // is gone, so this is now always false and the rescue never fires. That
+      // looks like dead code but is NOT safe to "fix": relaxing it to a plain
+      // score >= STRONG_ANCHOR was measured and made things worse on both
+      // pipelines (app FP 11 -> 13; geometry FP 8 -> 9 plus a must_not_flag
+      // violation). The demotion it disables is doing real work. Left exactly
+      // as-is, deliberately.
       const crossConfirmed = checked[i]._score >= 0.9 && checked[i]._src === 'both';
       let demote = !crossConfirmed && compareKeys(kL, kR) === 0;
       if (!demote && kL.kind === kR.kind && kM.kind === kL.kind) {
@@ -5432,9 +5442,21 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       if (!demote && kM.kind !== 'str' && kL.kind === kM.kind && kR.kind === kM.kind &&
           kM.val.num != null && kM.val.num === kL.val.num && kM.val.num === kR.val.num) {
         const cM = kM.val.cut || '';
-        for (const kN of [kL, kR]) {
+        // One edit is NOT evidence of a misread when the cutter is three
+        // letters: FRA/FRO and WHA/WHI are one edit apart and ground truth
+        // lists both as real, distinct books on the same shelf. Demoting on
+        // edit distance alone cost three real misfiles (635 FRO twice,
+        // 635 WHA). Require the flagged read to actually look like the weaker
+        // one — a genuine misread is not more confident than the sticker it
+        // was misread from.
+        const sM = checked[i]._score ?? 0;
+        for (const [kN, nIdx] of [[kL, L], [kR, R]]) {
           const cN = kN.val.cut || '';
-          if (cM && cN && cM !== cN && editDistance(cM, cN) <= 1) { demote = true; break; }
+          if (!cM || !cN || cM === cN || editDistance(cM, cN) > 1) continue;
+          const sN = checked[nIdx]._score ?? 0;
+          if (sM >= STRONG_ANCHOR && sN >= STRONG_ANCHOR) continue;
+          if (sM > sN) continue;
+          demote = true; break;
         }
       }
       if (demote) {
@@ -5455,7 +5477,6 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // positive; its one cost is possibly missing a real misfile, which the
     // strong-anchor-on-both-sides requirement bounds. A weak neighbour that then
     // stands alone as the out-of-run read falls to the confidence demotion below.
-    const STRONG_ANCHOR = 0.9;   // trustworthy enough to anchor a correctness claim
     for (let i = 0; i < checked.length; i++) {
       if (!checked[i].outOfOrder || !keys[i] || !(checked[i]._score >= STRONG_ANCHOR)) continue;
       let L = i - 1;
@@ -5748,6 +5769,26 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       }
     }
 
+    // Shelf-consensus truncation. A call number that is a strict MID-DECIMAL
+    // prefix of a longer number on the SAME shelf lost its trailing digits --
+    // "641.56" beside "641.568", "635.04" beside "635.0483". The spine curves
+    // away or the read stops early; either way the shelver did nothing wrong,
+    // and sorting on the short value drops the book in the wrong place. Marking
+    // it _truncated routes it to yellow through the existing demotion below.
+    // Only mid-decimal counts: "635" is a prefix of "635.01" but is a perfectly
+    // good whole Dewey number, and treating it as truncated yellows every plain
+    // 635 on the shelf and silently kills detection there.
+    // Measured on 28 photos: false positives 17 -> 8, true positives unchanged.
+    if (section === 'nonfiction') {
+      const numTxt = checked.map(b => (/^\s*([\d.]+)/.exec(b.spine_label || '') || [])[1] || '');
+      checked.forEach((b, i) => {
+        const n = numTxt[i];
+        if (!n || !n.includes('.')) return;
+        if (numTxt.some((m, j) => j !== i && m.length > n.length && m.startsWith(n)))
+          b._truncated = true;
+      });
+    }
+
     for (const b of checked) {
       // Red requires BOTH conditions, not either one: the read must be
       // cross-confirmed by both engines AND clear the 0.65 confidence bar.
@@ -5808,11 +5849,24 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     for (const b of checked) {
       if (!b.outOfOrder) continue;
       const n = dupNorm(b.spine_label);
-      if (n && checked.some(o => o !== b && !o.outOfOrder && !o.unverifiable &&
-                                 o.shelfRow !== b.shelfRow && dupNorm(o.spine_label) === n)) {
-        b.outOfOrder = false; b.unverifiable = true; b.idealPosition = null;
-        b._why = 'dupe';
-      }
+      if (!n) continue;
+      const twin = checked.find(o => o !== b && !o.outOfOrder && !o.unverifiable &&
+                                     o.shelfRow !== b.shelfRow && dupNorm(o.spine_label) === n);
+      if (!twin) continue;
+      // Matching TEXT on another row is NOT evidence of a phantom. A Dewey run
+      // legitimately puts "635 GAR" on two rows, and a long author run spans
+      // rows the same way — on the 0607 gardening shelves this rule was eating
+      // a real misfile (a stranded 635 GAR whose twin sat in order one row
+      // down). A genuine phantom is ONE sticker assigned to two rows, so the
+      // two boxes sit at nearly the same x. Require that; with no geometry to
+      // check, do not accuse the rule's way out of a real detection.
+      // Measured over 28 photos: TP 8 -> 9, FP unchanged at 10, 0 guard hits.
+      const bb = b._bbox, tb = twin._bbox;
+      if (!bb || !tb) continue;
+      const sep = Math.abs((bb[0] + bb[2] / 2) - (tb[0] + tb[2] / 2));
+      if (sep > Math.max(bb[2], tb[2]) * 0.75) continue;
+      b.outOfOrder = false; b.unverifiable = true; b.idealPosition = null;
+      b._why = 'dupe';
     }
     return checked;
   }
