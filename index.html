@@ -4082,7 +4082,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
 
   async function runOcr(encoded, signal, onCall1Done, _unused, onFirstReads) {
     const t0 = performance.now();
-    const section = getSection();
+    let section = getSection();
 
     // The standby reader. It resolves null while Azure is healthy and only
     // actually reads when Azure cannot be reached at all — see deviceOcr.
@@ -4265,6 +4265,33 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           if (!azureWasDownAtStart) localP = deviceOcr(snapshot, signal);
         }
         if (data) {
+        // Wrong-tab guard. `section` comes from the UI TAB, which the
+        // volunteer taps before shooting -- and forgetting to switch it is
+        // silent and total: a nonfiction shelf read by the fiction reader
+        // returns bare cutters with no call numbers, every one gets demoted for
+        // shape, and the volunteer is told the shelf is fine. That is the worst
+        // possible failure, a confident all-clear on a shelf nobody checked.
+        // Measured live on 184044900: 19 labels, 0 flags, two real misfiles
+        // missed.
+        //
+        // autoDetectSection already runs, but only AFTER assembly and on the
+        // labels the wrong reader produced -- with no numbers in them it agrees
+        // with the mistake. Azure's own words settle it before either reader
+        // runs, and the margin is not close: across 36 shelves a fiction shelf
+        // yields 0-1 Dewey-shaped words and a nonfiction shelf 14-55.
+        {
+          const words0 = parseAzureWords(data);
+          const dewey = words0.filter(w => /^\d{3}(\.\d+)?$/.test(String(w.t).trim())).length;
+          if (section === 'fiction' && dewey >= 6) {
+            console.log(`[shape] section: tab says fiction but ${dewey} call numbers were read - reading as nonfiction`);
+            section = 'nonfiction';
+            setActiveTab('nonfiction');
+          } else if (section === 'nonfiction' && dewey === 0 && words0.length >= 40) {
+            console.log('[shape] section: tab says nonfiction but no call numbers were read - reading as fiction');
+            section = 'fiction';
+            setActiveTab('fiction');
+          }
+        }
         labels = section === 'fiction'
           ? reconstructFictionAzure(parseAzureWords(data), ctx)
           : reconstructNonfictionAzure(
