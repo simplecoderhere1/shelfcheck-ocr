@@ -1505,6 +1505,46 @@
     return /^[A-Za-z][A-Za-z'’-]+$/.test(last);
   }
 
+  // Surname-only recovery (fiction). labelPlausible requires a given name,
+  // because "VED"/"WAIDN" are fragments of a half-read sticker. But a sticker
+  // whose given-name LINE simply was not returned leaves a complete and
+  // perfectly filable surname -- "WAHLGREN", "TREVOR", "TRENOW" -- and demoting
+  // it costs a book that could have been sorted and flagged. On the GT shelves
+  // 43 of 100 fiction books were held back this way, which is most of why
+  // fiction detection lagged nonfiction.
+  //
+  // The safe discriminator is the shelf itself: restore a surname-only label
+  // only when that SAME surname also appears on this shelf inside a label that
+  // did pass the shape test. A real author has other books beside it, or a
+  // fuller read of its own sticker; a fragment has no such corroboration.
+  function restoreSurnameOnly(labels) {
+    const firstTok = t => String(t || '').trim().replace(/[,.]/g, ' ')
+                              .split(/\s+/).filter(Boolean)[0] || '';
+    const corroborated = new Set();
+    for (const o of labels) {
+      if (o.malformed) continue;
+      const w = firstTok(o.text);
+      if (w && w === w.toUpperCase()) corroborated.add(w.replace(/[^A-Z]/g, ''));
+    }
+    let restored = 0;
+    for (const o of labels) {
+      if (!o.malformed) continue;
+      const toks = String(o.text || '').trim().replace(/[,.]/g, ' ').split(/\s+/).filter(Boolean);
+      if (toks.length !== 1) continue;
+      const w = toks[0];
+      if (w !== w.toUpperCase()) continue;
+      const key = w.replace(/[^A-Z]/g, '');
+      if (key.length < 4 || !corroborated.has(key)) continue;
+      // Sortable by SURNAME, but not flaggable: with no given name read we
+      // cannot place it inside its own author's run, and a shelf of Williamses
+      // is ordered by given name. Restoring these without noGiven reddened
+      // three correctly-shelved Williams books.
+      o.malformed = false; o.unclear = false; o.noGiven = true; restored++;
+    }
+    if (restored) console.log(`[shape] restored ${restored} corroborated surname-only label(s)`);
+    return labels;
+  }
+
   // ── Azure nonfiction reconstruction ──────────────────────────────────────
   // The nonfiction twin of reconstructFictionAzure, and it exists for the same
   // reason: the SHARED reconstructNonfiction was tuned to ocr.space's output
@@ -3850,6 +3890,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     }
     if (demoted) console.log(`[perf] finishLabels: ${demoted} malformed label(s) demoted below the flag bar`);
 
+    if (tieSect === 'fiction') restoreSurnameOnly(out);
+
     // Verify-before-accusing: a false misshelving flag is the worst mistake
     // this app can make, so a label the provisional order check would flag gets
     // one more chance to be shown innocent before it reaches the volunteer.
@@ -4395,6 +4437,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       _unclear:       !!label.unclear,
       _malformed:     !!label.malformed,
       _ambiguousTail: !!label.ambiguousTail,
+      _noGiven:       !!label.noGiven,
       _src:           label.src || 'ocr',
     }));
   }
@@ -5941,6 +5984,13 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       if (b._truncated && b.outOfOrder) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
         b._why = 'trunc';
+      }
+      // A surname read with no given name can be filed under its author but not
+      // WITHIN that author: a run of one surname is ordered by given name, and
+      // we did not read one. Yellow is the honest verdict.
+      if (b._noGiven && b.outOfOrder) {
+        b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
+        b._why = 'nogiven';
       }
       // A malformed label can never be red either, for a stronger reason than
       // truncation: there is no single book it reliably refers to.
