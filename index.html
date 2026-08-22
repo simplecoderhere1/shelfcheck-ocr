@@ -1469,6 +1469,27 @@
     if (toks.length < 2) return false;              // "VED", "WAIDN": no given name
     const isUpper = w => w === w.toUpperCase() && /[A-Z]/.test(w);
 
+    // Given name written as INITIALS: "TATA, A.J." tokenises to TATA / A / J.
+    // Every initial scans as ALL-CAPS, so the given-name search below finds
+    // nothing and rejects the label -- which quietly made every author filed by
+    // initials (A.J. Tata, P.D. James, J.K. Rowling) permanently unreadable,
+    // and therefore permanently unflaggable. Two or more trailing single
+    // letters are a name; ONE is the half-read sticker the pop below handles
+    // ("WAGGONER T"), so the two cases stay separate.
+    {
+      let k = toks.length;
+      while (k > 0 && toks[k - 1].length === 1) k--;
+      if (k > 0 && toks.length - k >= 2) {
+        const surI = toks.slice(0, k);
+        if (surI.length > 3) return false;
+        for (let j = 0; j < surI.length - 1; j++)
+          if (!PLAUSIBLE_PREFIXES.has(surI[j].toLowerCase().replace(/[^a-z]/g, ''))) return false;
+        const lastI = surI[surI.length - 1];
+        return lastI.length >= 3 && lastI.length <= 14 &&
+               /^[A-Za-z][A-Za-z'’-]+$/.test(lastI);
+      }
+    }
+
     // A trailing single letter is a middle initial ("WAHLGREN, Anna E."), which
     // would otherwise scan as ALL-CAPS and be mistaken for part of the surname.
     // Only when something precedes the given name — on its own a lone initial
