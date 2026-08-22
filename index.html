@@ -2270,10 +2270,63 @@
   const FIC_ASSEMBLY_ANCHOR = typeof location !== 'undefined' &&
     new URLSearchParams(location.search).get('ficassembly') === 'anchor';
 
+  // Column repair: a sticker read that DROPPED characters, fixed from the
+  // spine read of the same book.
+  //
+  // A book occupies one narrow x-column, and its author's name is printed
+  // twice in it -- once on the sticker (horizontal, small) and once up the
+  // spine (vertical, large). When the sticker read clips a letter, the spine
+  // read of the SAME COLUMN usually has it: on the shelf where Chika Unigwe is
+  // misfiled, the sticker came back "NIGWE," at 0.959 while "UNIGWE" sat in
+  // the same column at 0.994. Filed under N, the misfile is invisible; filed
+  // under U it is obvious.
+  //
+  // EXACT containment only, never an edit. Repair exists to restore characters
+  // the sticker dropped; allowing one substitution as well lets a title word
+  // swallow the label, because "HUNTER" contains "UNTER" and "STRANGER"
+  // contains "ANGER" -- both one edit from "UNGER", and both measured
+  // rewriting real Lisa Unger books into false misfiles.
+  function repairSurnameFromSpine(labels, words) {
+    const up = t => String(t || '').toUpperCase().replace(/[^A-Z]/g, '');
+    const spine = words.filter(w => w.h > w.w * 1.1 && (w.c ?? 0) >= 0.9 &&
+                                    /^[A-Za-z][A-Za-z'’-]{3,}$/.test(String(w.t).trim()));
+    if (!spine.length) return labels;
+    let fixed = 0;
+    for (const l of labels) {
+      const txt = String(l.text || '');
+      const m = /^([A-Za-z'’-]+)/.exec(txt.trim());
+      if (!m) continue;
+      const sur = up(m[1]);
+      if (sur.length < 4) continue;              // too short to repair safely
+      const [lx, , lw] = l.bbox;
+      for (const w of spine) {
+        // same column as this book
+        if (w.x + w.w < lx - 4 || w.x > lx + lw + 4) continue;
+        const v = up(w.t);
+        // At most TWO characters back. A real clipped read loses a letter or
+        // two off the front ("NIGWE" for "UNIGWE"); a longer "completion" is a
+        // different string that merely contains this one. At +4 the spine token
+        // "KATEWHITE" -- a given name welded onto the surname -- was allowed to
+        // rewrite "WHITE" and filed a confirmed-correct book under K.
+        if (v.length <= sur.length || v.length > sur.length + 2) continue;
+        if (!v.includes(sur)) continue;
+        // Never let the label's OWN given name be pulled into its surname.
+        const given = up((/[,.]?\s+([A-Za-z'’-]+)\s*$/.exec(txt.trim()) || [])[1] || '');
+        if (given && given.length >= 3 && v.startsWith(given)) continue;
+        l.text = txt.replace(m[1], v);
+        l.score = Math.max(l.score ?? 0, 0.9);
+        fixed++;
+        break;
+      }
+    }
+    if (fixed) console.log(`[shape] fiction: repaired ${fixed} surname(s) from the spine read`);
+    return labels;
+  }
+
   function reconstructFictionAzure(words, ctx) {
-    return FIC_ASSEMBLY_ANCHOR
+    return repairSurnameFromSpine(FIC_ASSEMBLY_ANCHOR
       ? reconstructFictionAzureAnchor(words, ctx)
-      : reconstructFictionAzureLegacy(words, ctx);
+      : reconstructFictionAzureLegacy(words, ctx), words);
   }
 
   function reconstructFictionAzureLegacy(words, ctx) {
