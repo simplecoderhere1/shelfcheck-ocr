@@ -1538,6 +1538,35 @@
   // only when that SAME surname also appears on this shelf inside a label that
   // did pass the shape test. A real author has other books beside it, or a
   // fuller read of its own sticker; a fragment has no such corroboration.
+  // Strip a trailing fragment of the label's OWN surname. Azure re-reads the
+  // same sticker inside one line and returns "WEISBERGER Lauren WEISBEN" -- a
+  // complete, correct label with a broken echo of itself welded on the end.
+  // labelPlausible rejects the whole thing (a third token that is not a filing
+  // prefix), so a correctly read book became unflaggable. Only a trailing token
+  // sharing five or more leading characters with the surname is removed: that
+  // is an echo, not a second name.
+  function stripWeldedEcho(labels) {
+    let n = 0;
+    for (const l of labels) {
+      const toks = String(l.text || '').trim().split(/\s+/).filter(Boolean);
+      if (toks.length < 3) continue;
+      const bare = t => t.toUpperCase().replace(/[^A-Z]/g, '');
+      const sur = bare(toks[0]);
+      if (sur.length < 5) continue;
+      let end = toks.length;
+      while (end > 2) {
+        const t = bare(toks[end - 1]);
+        if (t.length < 4) break;
+        let i = 0; while (i < Math.min(t.length, sur.length) && t[i] === sur[i]) i++;
+        if (i < 5) break;
+        end--;
+      }
+      if (end < toks.length) { l.text = toks.slice(0, end).join(' '); n++; }
+    }
+    if (n) console.log(`[shape] fiction: stripped ${n} welded echo(es)`);
+    return labels;
+  }
+
   function restoreSurnameOnly(labels) {
     const firstTok = t => String(t || '').trim().replace(/[,.]/g, ' ')
                               .split(/\s+/).filter(Boolean)[0] || '';
@@ -3961,6 +3990,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // on the shelf; demoting below the 0.65 flag bar keeps it visible and
     // honestly marked unread, and — per the flag-safety invariant — makes it
     // impossible for it to raise a red misshelving flag.
+    if (tieSect === 'fiction') stripWeldedEcho(out);
     let demoted = 0;
     // Learn this shelf's cutter length before judging any label by it.
     const cutLen = tieSect === 'fiction' ? null : dominantCutLen(out);
