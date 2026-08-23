@@ -30,13 +30,17 @@ const MONTH_BUDGET = 4900;
 // left, so it never starts a shelf it cannot finish — a shelf read with three
 // of its calls refused is worse than one read by Gemini from the start.
 //
-// TYPICAL is what a photo actually costs, measured over the 8-photo corpus:
-// a mean of 1.5 bands, so 1 + 4.5 + 1 = 6.5. Reporting "photos left" against
-// the worst case would understate the real allowance by nearly half (408
-// shelves rather than about 750) and make the app look far closer to the wall
-// than it is.
+// TYPICAL is what a photo actually costs. Nonfiction bands now ship PACKED
+// into one call per band instead of one per segment (encodeBandPack), which
+// dropped a nonfiction shelf from 1 full + 4.5 band-segment calls + 1 closer
+// look = 6.5 down to 1 + 1.5 packed + 1 = 3.5. Fiction never tiles or bands
+// (see the revert note in runOcr), so it costs 1 full + 1 closer look = 2.
+// Blended by the corpus mix (17 nonfiction / 19 fiction shelves), that is
+// about 2.7 calls/photo. Reporting "photos left" against the worst case
+// would understate the real allowance by 4x (445 shelves rather than about
+// 1,800) and make the app look far closer to the wall than it is.
 const PHOTO_RESERVE = 11;
-const PHOTO_TYPICAL = 6.5;
+const PHOTO_TYPICAL = 2.7;
 
 const monthKey = (d = new Date()) =>
   `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
