@@ -5622,7 +5622,26 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         if ((books[j].shelfRow ?? 0) !== (books[i].shelfRow ?? 0)) continue;
         const b = String(keys[j].val || '');
         if (b.length <= a.length) continue;            // only ever drop the SHORTER read
-        if (b.startsWith(a) || b.endsWith(a)) { dupDrops.add(i); break; }
+        if (!(b.startsWith(a) || b.endsWith(a))) continue;
+        // A shared prefix is NOT evidence on its own. This shelf is sorted
+        // alphabetically, so genuinely different authors whose names share a
+        // prefix are neighbours BY CONSTRUCTION -- WAITE beside WAITES, WAKE
+        // beside WAKEFIELD, TRAN beside TRANTER. Dropping on text alone deleted
+        // 145 real books across the corpus, 11% of every shelf, and sent them
+        // all to "couldn't read this one".
+        //
+        // What separates a truncated RE-READ from a real neighbour is physical:
+        // two reads of one sticker sit on top of each other, two different
+        // books sit side by side. Require the boxes to overlap. With no box to
+        // check, keep the old text-only behaviour rather than risk letting a
+        // true fragment back into the ordering.
+        const bi = books[i]._bbox, bj = books[j]._bbox;
+        if (bi && bj) {
+          const lo = Math.max(bi[0], bj[0]), hi = Math.min(bi[0] + bi[2], bj[0] + bj[2]);
+          const ov = hi - lo;
+          if (!(ov > 0 && ov >= 0.5 * Math.min(bi[2], bj[2]))) continue;
+        }
+        dupDrops.add(i); break;
       }
     }
     for (const i of dupDrops) keys[i] = null;
