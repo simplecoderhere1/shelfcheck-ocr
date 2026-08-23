@@ -6261,6 +6261,40 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       }
     }
 
+    // Surface the OTHER side of every accusation.
+    //
+    // "Out of order" is a statement about a PAIR: book A sorts after book B
+    // while sitting before it. The app names one of them, and which one it
+    // names is decided by whichever choice leaves the longer in-order run --
+    // usually right, but genuinely undecidable when the book physically
+    // between them was unreadable. Measured: on one shelf "635 FRE" is flagged
+    // and "635 FRO" shown GREEN, when ground truth says FRO is the misfile and
+    // the book between them (635 FRA, 0.47) could not be read to settle it.
+    // The volunteer was being sent to one of two adjacent books with no hint
+    // that its neighbour was the other candidate.
+    //
+    // So mark the conflicting partner YELLOW. It cannot raise a false
+    // accusation -- yellow is "check this", not "this is wrong" -- and it turns
+    // a silent miss into a book the volunteer actually looks at. Only ever
+    // touches a book that is currently clean; never downgrades a red.
+    for (let i = 0; i < checked.length; i++) {
+      if (!checked[i].outOfOrder || !keys[i]) continue;
+      for (const dir of [-1, 1]) {
+        let j = i + dir;
+        while (j >= 0 && j < checked.length && !keys[j]) j += dir;
+        if (j < 0 || j >= checked.length) continue;
+        if (checked[j].outOfOrder || checked[j].unverifiable || checked[j].possiblyOutOfOrder) continue;
+        if ((books[j].shelfRow ?? 0) !== (books[i].shelfRow ?? 0)) continue;
+        // the inversion runs whichever way the pair sits on the shelf
+        const bad = dir > 0 ? compareKeys(keys[i], keys[j]) > 0
+                            : compareKeys(keys[j], keys[i]) > 0;
+        if (!bad) continue;
+        checked[j].possiblyOutOfOrder = true;
+        checked[j].idealPosition = null;
+        checked[j]._why = 'pair';
+      }
+    }
+
     return checked;
   }
 
