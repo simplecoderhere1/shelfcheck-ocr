@@ -5321,6 +5321,34 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     return edits + (l.length - j) + (s.length - i) === 1;
   }
 
+  // A given-name sibling of nameSlip, deliberately more lenient. nameSlip's
+  // floors (NAME_PREFIX_MIN/NAME_EDIT_MIN) are tuned for SURNAMES, which run
+  // long enough that a short match is genuinely uninformative. Given names
+  // are shorter by nature ("Brad", "Meg", "Jim") and just as unreliably
+  // read, so those same floors reject an obvious one-letter slip ("Brad" /
+  // "Bred", 4 letters, below NAME_EDIT_MIN) as a real disagreement — which
+  // then wrongly broke the corroborated-surname guard above and un-excused
+  // a correctly shelved "TAYLOR Brad" (measured: replay_order regression).
+  // Used only to decide whether two given names plainly DISAGREE (a strong
+  // veto), never to decide they match on its own, so leaning permissive
+  // here is the safe direction — it can only make the app cautious less
+  // often, never accuse a name it isn't sure about.
+  function givenSlip(a, b) {
+    const norm = s => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+    const x = norm(a), y = norm(b);
+    if (!x || !y || x === y) return true;
+    const [s, l] = x.length <= y.length ? [x, y] : [y, x];
+    if (l.startsWith(s)) return true;
+    if (l.length - s.length > 1) return false;
+    let i = 0, j = 0, edits = 0;
+    while (i < s.length && j < l.length) {
+      if (s[i] === l[j]) { i++; j++; continue; }
+      if (++edits > 1) return false;
+      if (s.length === l.length) { i++; j++; } else { j++; }
+    }
+    return edits + (l.length - j) + (s.length - i) <= 1;
+  }
+
   // Dewey number compare: integer part numerically, then decimal digits
   // positionally, shorter decimal first — standard shelf filing order
   // (635 < 635.01 < 635.04 < 635.0483 < 635.1).
@@ -5477,12 +5505,43 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     return book.spine_label ? strKey(book.spine_label) : null;
   }
 
+  // Set fresh per shelf in checkOrderOneShelf, read by compareKeys below.
+  // Counts how many entries on THIS shelf carry each exact surname string —
+  // see the corroboration check where it's used.
+  let CURRENT_SURNAME_COUNTS = null;
+
   function compareKeys(a, b) {
     if (a.kind !== b.kind) return a.kind === 'dewey' ? -1 : 1;
     let cmp;
     if (a.kind === 'str') {
-      // Undecidable rather than out of order — see nameSlip().
-      if (nameSlip(a.val, b.val)) return 0;
+      // Undecidable rather than out of order — see nameSlip(). But not when
+      // BOTH of two things hold: the surname is independently CORROBORATED
+      // (read as its own complete, exact string more than once on this
+      // shelf), AND the given names plainly disagree. Corroboration alone
+      // is not enough to break the tie — a real same-author run legitimately
+      // repeats its correct surname while ALSO containing a genuinely
+      // garbled copy of it ("WALKER" x2 alongside a misread "WALKEN"), and
+      // requiring only corroboration flagged that innocent run (measured:
+      // name_slip_test regression). Given names alone aren't enough either —
+      // they're read even less reliably than surnames and a bare truncation
+      // ("Eud" for "Eudora") would misfire (see the TRIED AND REVERTED note
+      // below in checkOrderOneShelf). Together they're specific: "CARR,
+      // Robyn" x11 next to "CARREY, Jim" has a corroborated surname AND an
+      // unrelated given name — that pair is two different real people, not
+      // one misread (measured live, 2026-08-23).
+      const slip = nameSlip(a.val, b.val);
+      // Scoped to a bare one-word surname on both sides — see the matching
+      // note in checkOrderOneShelf's sameauthor pass. A multi-word garble
+      // ("taylor blakem" for "Taylor") looks like a one-word prefix too,
+      // once nameSlip strips its internal space, but it is a mangled read
+      // of ONE sticker regardless of corroboration or given names.
+      const bothSingleWord = a.val.indexOf(' ') === -1 && b.val.indexOf(' ') === -1;
+      const corroborated = bothSingleWord && CURRENT_SURNAME_COUNTS && (
+        (CURRENT_SURNAME_COUNTS.get(a.val) || 0) >= 2 ||
+        (CURRENT_SURNAME_COUNTS.get(b.val) || 0) >= 2);
+      const namesDisagree = bothSingleWord && a.first && b.first &&
+        a.first !== b.first && !givenSlip(a.first, b.first);
+      if (slip && !(corroborated && namesDisagree)) return 0;
       cmp = compareFiling(a.val, b.val);
     } else {
       if (a.val.numStr === null || b.val.numStr === null) {
@@ -5654,13 +5713,36 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       let R = i + 1; while (R < keys.length && !keys[R]) R++;
       if (L < 0 || R >= keys.length) continue;
       const kL = keys[L], kR = keys[R], kM = keys[i];
-      if (samePrimary(kL, kR) && !samePrimary(kM, kL)) { misreads.push(i); continue; }
+      // A different entry sandwiched between two IDENTICAL author+given-name
+      // reads is usually an OCR duplicate of that surrounding sticker landing
+      // as a mangled reading — but not always: a real book by a different
+      // author fits the same shape when it is genuinely misfiled into the
+      // middle of someone else's run ("CARREY, Jim" between two "CARR,
+      // Robyn" entries). Text shape alone can't tell those apart; physical
+      // position can. Only demote when M's box overlaps L's or R's — two
+      // reads of one sticker occupy the same spot, two different books sit
+      // side by side. With no box to check, keep the old text-only call.
+      if (samePrimary(kL, kR) && !samePrimary(kM, kL)) {
+        const bm = books[i]._bbox, bl = books[L]._bbox, br = books[R]._bbox;
+        const overlaps = (x, y) => {
+          if (!x || !y) return true;
+          const lo = Math.max(x[0], y[0]), hi = Math.min(x[0] + x[2], y[0] + y[2]);
+          return hi - lo > 0 && hi - lo >= 0.5 * Math.min(x[2], y[2]);
+        };
+        if (overlaps(bm, bl) || overlaps(bm, br)) { misreads.push(i); continue; }
+      }
       const vL = primaryStr(kL), vR = primaryStr(kR), vM = primaryStr(kM);
       if (vL && vR && vM && vL[0] === vR[0] &&
           Math.abs(vM.charCodeAt(0) - vL.charCodeAt(0)) >= 3 &&
           Math.abs(vM.charCodeAt(0) - vR.charCodeAt(0)) >= 3) misreads.push(i);
     }
     for (const i of misreads) keys[i] = null;
+
+    CURRENT_SURNAME_COUNTS = new Map();
+    for (const k of keys) {
+      if (!k || k.kind !== 'str' || !k.val) continue;
+      CURRENT_SURNAME_COUNTS.set(k.val, (CURRENT_SURNAME_COUNTS.get(k.val) || 0) + 1);
+    }
 
     const vIdx = []; keys.forEach((k, i) => { if (k) vIdx.push(i); });
     // The in-order run is measured over COMPLETE reads only. A truncated read
@@ -5874,7 +5956,31 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           //
           // Do not retry without a way to VERIFY a given name -- a second read
           // of the same sticker agreeing, or the spine text corroborating it.
-          if (!v || nameSlip(sur, v)) return true;                    // same author, misread surname
+          // Same combined guard as compareKeys (corroborated surname AND
+          // disagreeing given names — see the comment there for why NEITHER
+          // alone is safe: corroboration alone flags an innocent same-author
+          // run with one garbled copy of its own correct surname; given
+          // names alone misfire on ordinary given-name truncation). "CARR"
+          // x11 next to "CARREY, Jim" clears both; "WALKER" x2 next to a
+          // misread "WALKEN" (both blank given names) clears neither.
+          // The veto below only applies to a bare one-word surname prefix
+          // ("carr"/"carrey") — the same job nameSlip is already doing. It
+          // must NOT apply when either side is a genuine multi-word garble
+          // ("taylor blakem" for a book whose true surname is "Taylor",
+          // "thay thatne" for "Thayne"): nameSlip's own space-stripping
+          // makes those look like a one-word prefix too, but they're a
+          // mangled read of ONE sticker regardless of given names or
+          // repetition elsewhere — vetoing them broke two confirmed-correct
+          // books (must_not_flag regressions, both measured).
+          const bothSingleWord = sur.indexOf(' ') === -1 && v.indexOf(' ') === -1;
+          const firstI = keys[i].first || '', firstJ = keys[j].first || '';
+          const namesDisagree = bothSingleWord && firstI && firstJ &&
+            firstI !== firstJ && !givenSlip(firstI, firstJ);
+          const corroborated = bothSingleWord && CURRENT_SURNAME_COUNTS && (
+            (CURRENT_SURNAME_COUNTS.get(sur) || 0) >= 2 ||
+            (CURRENT_SURNAME_COUNTS.get(v) || 0) >= 2);
+          const slipOk = nameSlip(sur, v) && !(corroborated && namesDisagree);
+          if (!v || slipOk) return true;                    // same author, misread surname
           // A same-author flank can itself be a badly garbled MULTI-WORD OCR
           // read of the identical sticker ("THAY! THATNE." parsed as surname
           // "thay thatne" for a book whose true surname is "Thayne") that
@@ -5884,7 +5990,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // real cross-author boundary (both leading tokens must clear
           // NAME_PREFIX_MIN, same bar nameSlip itself uses).
           const a0 = sur.split(' ')[0] || '', b0 = v.split(' ')[0] || '';
-          if (a0.length >= NAME_PREFIX_MIN && b0.length >= NAME_PREFIX_MIN &&
+          if (!(corroborated && namesDisagree) &&
+              a0.length >= NAME_PREFIX_MIN && b0.length >= NAME_PREFIX_MIN &&
               (a0.startsWith(b0) || b0.startsWith(a0))) return true;
           return dir < 0 ? compareFiling(v, sur) <= 0 : compareFiling(sur, v) <= 0;
         };
@@ -5943,6 +6050,14 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           if (j === i || !keys[j] || keys[j].kind !== 'str' || !lisGlobal.has(j)) continue;
           const t = keys[j].val || '';
           if ((checked[j]._score ?? 0) < STRONG_ANCHOR) continue;
+          // A surname collision this close still isn't the same author when
+          // the GIVEN names plainly disagree ("Jim" vs "Emmanuel" for
+          // "Carrey"/"Carrère" — edit-distance 1 apart as surnames, real
+          // people). Only fires as a veto: no first name on either side, or
+          // an exact/slip match, is silently fine and falls through to the
+          // surname-only fragment test as before.
+          const gI = keys[i].first || '', gJ = keys[j].first || '';
+          if (gI && gJ && gI !== gJ && !givenSlip(gI, gJ)) continue;
           if (isFragmentOf(s, t)) {
             checked[i].outOfOrder = false; checked[i].possiblyOutOfOrder = true;
             checked[i].idealPosition = null; checked[i]._why = 'fragment';
