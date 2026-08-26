@@ -5296,7 +5296,28 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   // a cliff, not a slope: 0.65 detects nothing at all, and every value from
   // 0.60 down to 0.40 gives identical results. 0.60 is the top of that
   // plateau — the most conservative setting that still detects anything.
-  const RED_MIN_SCORE = 0.60;
+  //
+  // That sweep is BLIND to this bar's real cost, because order_fixture.json
+  // does not carry the low-confidence books the bar actually decides. Re-swept
+  // 2026-08-23 over all 36 shelves of app_fixture.json (`_bar_sweep.mjs`),
+  // scoring known misfiles promoted to red against must_not_flag books wrongly
+  // accused:
+  //
+  //   bar     misfiles RED   guard violations   total reds
+  //   0.60         11               0               15
+  //   0.57         12               0               16     <- the only new red
+  //   0.55         12               0               17        IS the true one
+  //   0.50         12               0               18
+  //
+  // 0.57 is free: it promotes exactly one book and that book is a real
+  // misfile ("WEISBERGER Lauren", read as precisely the right text, genuinely
+  // out of order, scored 0.59 — a hundredth of a point deciding whether a
+  // volunteer is sent to it). Below 0.57 the red count keeps climbing while
+  // detections do not, so those extra flags are unverified and not worth it.
+  // Do not read this as "confidence works" — this file records repeatedly that
+  // a misread comes back as confident as a good read. The bar bounds damage;
+  // it does not identify truth.
+  const RED_MIN_SCORE = 0.57;
 
   // What a demote writes. Several passes lower a label's score to say "this one
   // must not be flagged" — the row-consensus bare-number rule, the class-outlier
