@@ -754,6 +754,22 @@
 
   function getSection() { return document.querySelector('.tab-btn.active').dataset.section; }
 
+  // Which read strategy a section uses, in ONE place. runOcr and loadPhoto
+  // both need this: runOcr to choose the path, loadPhoto to decide whether
+  // pre-encoding the grid is worth doing. They disagreed before — loadPhoto
+  // pre-encoded six full-resolution tiles for EVERY nonfiction photo while
+  // runOcr, with label bands on by default, discarded them unread. Pure
+  // waste, and invisible on a desktop: 1.8s of image encoding on a phone
+  // (measured at 4x CPU throttle) for a result nothing ever looked at.
+  function bandModeFor(section) {
+    return section === 'fiction' ? '0'
+      : (new URLSearchParams(location.search).get('bands') || 'on');
+  }
+  function tilesWanted(section) {
+    const m = bandModeFor(section);
+    return section !== 'fiction' && !(m === 'on' || m === 'segs');
+  }
+
   // ── Photo loading ─────────────────────────────────────────────────────────
   // autoAnalyze: the native camera (photoInput) already had the user confirm the
   // shot, so go straight to results. Gallery upload (uploadInput) keeps the
@@ -779,7 +795,11 @@
       // await, which would otherwise block this same paint.
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
       pendingEncode = encodeForOCR();
-      pendingTiles  = getSection() === 'nonfiction' ? encodeTilesForOCR() : null;
+      // Only when the read path will actually USE the grid — see tilesWanted.
+      // With label bands on (the default) it will not, and encoding it here
+      // just burns phone CPU on the critical path. The grid fallback still
+      // encodes on demand in readGrid, which is the rare case it's for.
+      pendingTiles  = tilesWanted(getSection()) ? encodeTilesForOCR() : null;
       // Take-photo → results with no extra tap (native camera only). Retake
       // stays available for a redo; analyzeShelf flips Analyze to "Reading…".
       if (autoAnalyze) analyzeShelf();
@@ -1336,7 +1356,11 @@
   // back as 655/535 on the full frame and "635" at 0.99 once cropped out, with
   // NO upscaling. So the pass is about ISOLATION, not resolution.
   const AZ_ZOOM_MIN_CONF = 0.80;   // a re-read below this is not trusted
-  const AZ_ZOOM_MAX      = 36;     // cap crops per sheet (one Azure call)
+  // ?zoommax=N overrides for sweeping this against latency; see the trim
+  // logic in encodeZoomSheet, where sheet size drives both the encode cost on
+  // the device and the upload/OCR time.
+  const AZ_ZOOM_MAX      = (typeof location !== 'undefined' &&
+    Number(new URLSearchParams(location.search).get('zoommax'))) || 36;
   const AZ_ZOOM_CENTRE   = 0.22;   // re-read number must be near the cell centre
   const AZ_ZOOM_CUT_DX   = 1.5;    // tag must sit this close under its number
 
@@ -3273,7 +3297,7 @@
   async function encodeZoomSheet(labels, idxs, sentW) {
     if (!idxs.length || !snapshot.width) return null;
     const s = snapshot.width / sentW;
-    const crops = [];
+    let crops = [];
     for (const i of idxs) {
       const nb = labels[i].numBox || labels[i].bbox;
       if (!nb) continue;
@@ -3287,14 +3311,50 @@
     }
     if (!crops.length) return null;
 
-    // 2x helps Azure's detector find text it otherwise skips, but the sheet must
-    // stay inside a sane upload size — drop to 1x rather than send a huge JPEG.
+    // 2x is the whole point of this pass: it helps Azure's detector find text
+    // it otherwise skips. The sheet must still fit a sane upload, and cells
+    // are uniform (sized to the LARGEST crop), so one oversized label used to
+    // push the entire grid past the limit and drop everything to 1x.
+    //
+    // At 1x the pass shows Azure the same pixels at the same scale it already
+    // read, and measured, it earns nothing: on a crowded fiction shelf it
+    // sharpened 0 of 32 labels while costing 3.0s of phone time (4x throttle)
+    // and a full Azure call. So instead of de-zooming, send FEWER crops at a
+    // real 2x — zoomCandidates hands them over in priority order, so trimming
+    // from the end keeps the shakiest labels, which are the ones this pass
+    // exists to rescue.
+    // Before trimming by priority, drop SIZE OUTLIERS. Cells are uniform, so
+    // the single largest crop sets the size of all of them: one merged-label
+    // bbox three times the median forced 30 of 32 real candidates off the
+    // sheet. Such a crop is not one sticker anyway — this pass zooms a single
+    // call number or surname, and a box that big is two stickers welded by a
+    // bad read, which a closer look cannot repair. Dropping it lets the
+    // ordinary candidates through at a real 2x.
     const G = 40;                       // white gutters keep neighbouring crops
+    const wanted = crops.length;
+    if (crops.length >= 4) {
+      const med = a => { const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
+      const mw = med(crops.map(c => c.w)), mh = med(crops.map(c => c.h));
+      const kept = crops.filter(c => c.w <= mw * 2.5 && c.h <= mh * 2.5);
+      if (kept.length >= Math.max(4, crops.length * 0.5)) crops = kept;
+    }
+    const fits = (n, z) => {
+      const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
+      const rows = Math.ceil(n / cols);
+      let cw = 0, ch = 0;
+      for (let k = 0; k < n; k++) { if (crops[k].w > cw) cw = crops[k].w; if (crops[k].h > ch) ch = crops[k].h; }
+      return (cols * (cw * z + G) + G) <= 4000 && (rows * (ch * z + G) + G) <= 4000;
+    };
+    let n = crops.length, z = 2;
+    while (n > 1 && !fits(n, z)) n--;
+    const dropped = wanted - n;
+    // A single crop too big even at 2x: keep the old 1x behaviour rather than
+    // send nothing, since one isolated sticker still benefits from the crop.
+    if (n <= 1 && !fits(1, 2)) { n = crops.length; z = 1; }
+    if (n < crops.length) crops.length = n;
     const cols = Math.max(1, Math.ceil(Math.sqrt(crops.length)));
     const cw = Math.max(...crops.map(c => c.w)), ch = Math.max(...crops.map(c => c.h));
     const rows = Math.ceil(crops.length / cols);
-    let z = 2;
-    if ((cols * (cw * z + G) + G) > 4000 || (rows * (ch * z + G) + G) > 4000) z = 1;
 
     const cvW = cols * (cw * z + G) + G, cvH = rows * (ch * z + G) + G;
     const cv = document.createElement('canvas');
@@ -3310,7 +3370,7 @@
     });
     const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.9));
     if (!blob) return null;
-    return { blob, rects, idxs: crops.map(c => c.i) };
+    return { blob, rects, idxs: crops.map(c => c.i), z, dropped };
   }
 
   async function encodeTilesForOCR() {
@@ -4147,8 +4207,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // band from — a very dark or very oblique shelf.
           //   ?bands=0     old grid only
           //   ?bands=both  grid AND bands: +1.7pt recall for ~2x the calls
-          const bandMode = section === 'fiction' ? '0'
-            : (new URLSearchParams(location.search).get('bands') || 'on');
+          const bandMode = bandModeFor(section);
           // Segments per band ship PACKED into one call by default (3.5 calls a
           // photo instead of 6.5 -- see encodeBandPack), which is what makes
           // three volunteers shooting at once survivable against the
@@ -4157,7 +4216,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // ever shows the packed sheet losing more than the benched 1.7 points.
           const packSegs = bandMode !== 'segs';
           const bandsEnabled = bandMode === 'on' || bandMode === 'both' || bandMode === 'segs';
-          const wantTiles = section !== 'fiction' && !(bandMode === 'on' || bandMode === 'segs');
+          const wantTiles = tilesWanted(section);
           if (!wantTiles) pendingTiles = null;   // release the speculative encode
           // Named, because the band path needs the very same read as its
           // fallback and a copy of this loop in two places would drift.
@@ -4313,6 +4372,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
                 // Broken out because this pass is pure ADDED latency: it cannot
                 // start until the first read has said which stickers are shaky.
                 console.log(`[perf] closer look: ${n} of ${sheet.idxs.length} sharpened` +
+                  ` at ${sheet.z}x${sheet.dropped ? ` (${sheet.dropped} trimmed to keep 2x)` : ''}` +
                   ` — sheet ${(zt1 - zt0) | 0}ms, total ${(performance.now() - zt0) | 0}ms`);
               }
             }
@@ -4338,7 +4398,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
                 const n = mergeZoomReadsFiction(labels, sheet.idxs,
                             readZoomCellsFiction(parseAzureWords(zd), sheet.rects));
                 console.log(`[perf] closer look (fiction): ${n} of ${sheet.idxs.length}` +
-                  ` sharpened — total ${(performance.now() - zt0) | 0}ms`);
+                  ` sharpened at ${sheet.z}x${sheet.dropped ? ` (${sheet.dropped} trimmed to keep 2x)` : ''}` +
+                  ` — total ${(performance.now() - zt0) | 0}ms`);
               }
             }
           } catch (e) { console.log('[perf] closer look skipped:', e.message); }
