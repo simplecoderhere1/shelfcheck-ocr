@@ -5431,6 +5431,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     return edits + (l.length - j) + (s.length - i) <= 1;
   }
 
+
   // Dewey number compare: integer part numerically, then decimal digits
   // positionally, shorter decimal first — standard shelf filing order
   // (635 < 635.01 < 635.04 < 635.0483 < 635.1).
@@ -6036,8 +6037,32 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // back just as confident as a good read. One extra detection is not
           // worth five false accusations and a book already confirmed correct.
           //
-          // Do not retry without a way to VERIFY a given name -- a second read
-          // of the same sticker agreeing, or the spine text corroborating it.
+          // RETRIED AND REVERTED AGAIN (2026-08-23), three ways, all measured:
+          //   a) gated on a second read of the same sticker agreeing -- the
+          //      verification this note asks for. It NEVER FIRES: duplicate
+          //      reads are merged upstream in the reader, so by the time books
+          //      reach checkOrder the overlapping boxes are gone (measured: 0
+          //      corroborated books on both test shelves, 0/4 overlapping
+          //      pairs). The evidence exists in the READER, not here.
+          //   b) blind but tolerant, via givenSlip -- which does absorb all
+          //      three garbles above ("eud"/"eudora", "med"/"meg",
+          //      "kafe"/"kate" all compare equal). FP 7 -> 9, TWO guard
+          //      violations.
+          //   c) strictest form: names must be unmistakably different (no
+          //      containment either way, edit budget scaled by length). Still
+          //      1 guard violation, FP 7 -> 8.
+          // Every variant gained ZERO true positives (TP 11 -> 11, and the
+          // clean-GT suite 2 -> 2). The books this was meant to catch --
+          // "WALKER, Ann Marie" and "WALKER, Boo" -- are not reachable from
+          // here at all: that shelf's surnames read WALKE / WALKET / WALKEN /
+          // WALKED / "TRI WALKER" / "BOO WALKER" and its given names read
+          // "Ann Mario", "Laren nom homesal", "waren". They are demoted by
+          // the near-twin rule, never by this one, and no first-name
+          // comparison can order text that garbled. It is a READING problem.
+          //
+          // Do not retry at the ordering layer. The only thing that would
+          // change the answer is a given name verified in the READER, before
+          // duplicate reads are merged.
           // Same combined guard as compareKeys (corroborated surname AND
           // disagreeing given names — see the comment there for why NEITHER
           // alone is safe: corroboration alone flags an innocent same-author
