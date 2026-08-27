@@ -762,8 +762,24 @@
   // waste, and invisible on a desktop: 1.8s of image encoding on a phone
   // (measured at 4x CPU throttle) for a result nothing ever looked at.
   function bandModeFor(section) {
-    return section === 'fiction' ? '0'
-      : (new URLSearchParams(location.search).get('bands') || 'on');
+    const qs = new URLSearchParams(location.search);
+    // Fiction has never had a band pass. It is the section that needs one
+    // most — a fiction shelf is the most crowded thing the app sees (54 books
+    // in a frame against 20-odd on a gardening shelf) and its surnames come
+    // back garbled (WALKE / WALKET / WALKEN / WALKED off four adjacent
+    // spines). Bands are NOT the tiling that was tried and reverted here: a
+    // tile is half the frame and mostly spine artwork, while a band is the
+    // thin strip the stickers actually live in, which is what took nonfiction
+    // from 48.7% to 83.9%.
+    //
+    // MEASURED (2026-08-23, live, both row-GT fiction shelves): surname
+    // recall 90.0% -> 93.0%, and given names read correctly 58.0% -> 68.0%,
+    // which is the number that matters -- a wrong given name is what stops a
+    // misfiled book going red. Across all 17 fiction shelves: 44 more books
+    // read, 6 fewer yellow boxes, red count and must_not_flag violations
+    // unchanged. ?fbands=0 disables.
+    if (section === 'fiction') return qs.get('fbands') || 'on';
+    return qs.get('bands') || 'on';
   }
   function tilesWanted(section) {
     const m = bandModeFor(section);
@@ -1344,6 +1360,10 @@
                           // — a plausible reason it was missed — is still inside
   const BAND_SEGS  = 3;   // pieces per band; see above, do not change to 1
   const BAND_MIN_N = 3;   // labels needed before a row's band is trusted
+  // A fiction band must be a ROW STRIP, not the whole photo. Real strips
+  // measure 15-21% of image height; a merged cluster measured 86% and cost
+  // more than it gained (see the drop in runOcr).
+  const FIC_BAND_MAX_FRAC = 0.40;
   // Below this Azure word confidence a call number is more likely wrong than
   // right, so the label is marked unclear rather than trusted.
   const AZ_MIN_NUM_CONF = 0.70;
@@ -1359,8 +1379,13 @@
   // ?zoommax=N overrides for sweeping this against latency; see the trim
   // logic in encodeZoomSheet, where sheet size drives both the encode cost on
   // the device and the upload/OCR time.
-  const AZ_ZOOM_MAX      = (typeof location !== 'undefined' &&
-    Number(new URLSearchParams(location.search).get('zoommax'))) || 36;
+  const AZ_ZOOM_MAX      = (() => {
+    if (typeof location === 'undefined') return 36;
+    const q = new URLSearchParams(location.search).get('zoommax');
+    if (q === null || q === '') return 36;
+    const n = Number(q);
+    return Number.isFinite(n) && n >= 0 ? n : 36;   // 0 disables the pass
+  })();
   const AZ_ZOOM_CENTRE   = 0.22;   // re-read number must be near the cell centre
   const AZ_ZOOM_CUT_DX   = 1.5;    // tag must sit this close under its number
 
@@ -1645,6 +1670,34 @@
   // tiles. `s` scales tile coordinates (native) into the full frame's space.
   // Tiles are additive only: a word the full frame already found is not
   // duplicated, but one only the tiles saw is kept.
+  // Fiction merge: a band word REPLACES the full-frame word it overlaps.
+  //
+  // mergeAzureWordSets keeps both unless the text is identical, which is right
+  // for nonfiction (the pairing race downstream sorts it out) but wrong for
+  // fiction: its grouper is union-find over neighbouring words, so two reads of
+  // one sticker sitting on top of each other ("WALKE" and "WALKER") weld into
+  // "WALKE WALKER". That welding is exactly what sank the earlier attempt to
+  // tile fiction.
+  //
+  // Replacing instead of appending avoids it and takes the better read: a band
+  // is the same sticker at roughly 3x the pixels-per-character of the full
+  // frame, so where the two disagree the band is the one to believe.
+  function mergeFictionBandWords(full, band, s) {
+    if (!band || !band.length) return full;
+    const scaled = band.map(w => ({ ...w, x: w.x * s, y: w.y * s, w: w.w * s, h: w.h * s }));
+    const iou = (a, b) => {
+      const ix = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+      const iy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+      if (ix <= 0 || iy <= 0) return 0;
+      const inter = ix * iy;
+      return inter / (a.w * a.h + b.w * b.h - inter);
+    };
+    const superseded = new Set();
+    for (const t of scaled)
+      for (const o of full) if (!superseded.has(o) && iou(o, t) >= 0.4) superseded.add(o);
+    return full.filter(o => !superseded.has(o)).concat(scaled);
+  }
+
   function mergeAzureWordSets(full, tiles, s) {
     if (!tiles || !tiles.length) return full;
     const out = full.slice();
@@ -4244,8 +4297,44 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           if (data && bandsEnabled) {
             try {
               const bt0 = performance.now();
-              const seed = reconstructNonfictionAzure(parseAzureWords(data), ctx, false);
-              const bands = planLabelBands(seed, enc.sentH);
+              // planLabelBands only needs labels with boxes, so it is
+              // section-agnostic — but the SEED must come from the reader that
+              // matches the shelf, or the rows land in the wrong place.
+              const seed = section === 'fiction'
+                ? reconstructFictionAzure(parseAzureWords(data), ctx)
+                : reconstructNonfictionAzure(parseAzureWords(data), ctx, false);
+              let bands = planLabelBands(seed, enc.sentH);
+              // FICTION: all the rows or none of them.
+              //
+              // Measured on the two row-GT fiction shelves: with bands over
+              // all 3 rows, given names read correctly went 31 -> 41 of 54.
+              // With a band over only 1 of 3 rows, the same change took the
+              // other shelf from 27 -> 10 and doubled welded labels (3 -> 8).
+              //
+              // The reason is that fiction's grouper is union-find over
+              // neighbouring words, so it assumes ONE read of the shelf. Band
+              // rows come back at a different effective resolution and word
+              // split than full-frame rows, and a shelf holding both confuses
+              // it far more than a uniformly worse read would. Nonfiction is
+              // immune — it pairs numbers to cutters by geometry, not by
+              // grouping neighbours — which is why it never needed this.
+              // A band is only worth sending if it is actually a ROW STRIP.
+              // planLabelBands clusters labels by y, and on a shelf whose rows
+              // sit close together (or a photo shot at an angle) the clusters
+              // merge: measured on 200006014, two rows collapsed into ONE band
+              // spanning 86% of the photo, against 15-21% for the three real
+              // strips on 200004299. A band that size carries no magnification
+              // — it is the whole frame again — while still arriving with a
+              // different word split that the union-find grouper then welds
+              // against the full-frame read. That is the entire regression:
+              // given names 27 -> 10, welded labels 3 -> 8. Drop those bands.
+              if (section === 'fiction' && bands.length) {
+                const before = bands.length;
+                bands = bands.filter(b => (b.y1 - b.y0) <= enc.sentH * FIC_BAND_MAX_FRAC);
+                if (bands.length !== before)
+                  console.log(`[perf] label bands: dropped ${before - bands.length} fiction band(s) ` +
+                              `spanning more than ${(FIC_BAND_MAX_FRAC*100)|0}% of the photo (row clusters merged)`);
+              }
               const packed = bands.length && packSegs ? await encodeBandPack(bands, enc.sentW) : null;
               const segs = !packed && bands.length ? await encodeBandSegs(bands, enc.sentW) : [];
               // No band could be placed, which means the full frame did not
@@ -4253,7 +4342,10 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
               // photo. Without this the read would silently fall back to the
               // full frame ALONE, which measures 48.7%, far worse than the
               // grid this replaced. So take the grid instead.
-              if (!(packed?.length || segs.length) && bandMode === 'on') {
+              // Fiction has no grid path to fall back to (tiling it was tried
+              // and reverted — see the note above), so it just keeps the full
+              // frame, which is what it has always used.
+              if (!(packed?.length || segs.length) && bandMode === 'on' && section !== 'fiction') {
                 tileWords = await readGrid();
                 console.log('[perf] label bands: none placed, fell back to the grid');
               }
@@ -4352,7 +4444,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           }
         }
         labels = section === 'fiction'
-          ? reconstructFictionAzure(parseAzureWords(data), ctx)
+          ? reconstructFictionAzure(
+              mergeFictionBandWords(parseAzureWords(data), tileWords,
+                                    enc.sentW / snapshot.width), ctx)
           : reconstructNonfictionAzure(
               mergeAzureWordSets(parseAzureWords(data), tileWords,
                                  enc.sentW / snapshot.width), ctx, true);
@@ -4387,7 +4481,26 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // silently disappearing (the tag-read/number-missing mirror case is
           // handled the same way earlier in reconstructNonfictionAzure).
           for (const l of labels) if (!l.cut) { l.unclear = true; l.malformed = true; }
-        } else {
+        // bandModeFor(section), NOT the bandMode const above: that one is
+        // scoped to the try block around the Azure calls and is not in scope
+        // here, and referencing it throws a ReferenceError that rejects the
+        // whole read with no error banner — the page just waits forever.
+        // Recomputing also picks up any section change the wrong-tab guard made.
+        } else if (bandModeFor(section) === '0') {
+          // FICTION CLOSER LOOK — only when the band pass is off.
+          //
+          // Measured (2026-08-23, live, both row-GT fiction shelves): running
+          // it changes NOTHING. Surname recall, given-name accuracy, precision
+          // and welded-label count come back identical to the decimal with it
+          // on and off, both with bands (93.0 / 68.0 / 86.1 / 6) and without
+          // (90.0 / 58.0 / 86.5 / 5). It was costing an Azure call and up to
+          // 2.8s of phone time per shelf for no measurable gain — on the
+          // crowded 50-book shelf it reported "0 of 32 sharpened".
+          //
+          // Kept behind ?fbands=0 rather than deleted, because that is the
+          // escape hatch if bands ever have to be turned off in the field, and
+          // the nonfiction branch above still uses this pass, where it DOES
+          // pay (4 of 6 sharpened on a typical shelf).
           try {
             const zt0 = performance.now();
             const idxs = zoomCandidatesFiction(labels).slice(0, AZ_ZOOM_MAX);
