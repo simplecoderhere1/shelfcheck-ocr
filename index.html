@@ -2715,6 +2715,31 @@
     const isCaps   = w => letters(w).length > 0 && letters(w) === letters(w).toUpperCase();
     const sameLine = (a, b) => Math.abs(a.y - b.y) <= Math.min(a.h, b.h) * 0.6;
 
+    // Which mixed-case words sit under exactly ONE capitalised word.
+    //
+    // Grouping here is union-find, which is transitive, and that makes an
+    // ambiguous given name destructive rather than merely unhelpful: where two
+    // copies of the same book stand side by side, a "Megan" lying under both
+    // "WALKER" stickers welds the two surnames into a single label and one of
+    // the two books disappears from the shelf entirely. The anchor path pairs
+    // one-to-one and cannot do this; union-find can, so the ambiguity has to be
+    // resolved before it reaches the loop. A given name with two possible
+    // surnames above it is simply left unattached -- a bare surname is a
+    // partial read, a welded pair is a lost book.
+    const nestedUnder = (cap, low) => {
+      if (low.y <= cap.y) return false;
+      const ov = Math.min(cap.x + cap.w, low.x + low.w) - Math.max(cap.x, low.x);
+      return ov / Math.max(1, low.w) >= 0.8;
+    };
+    const soleParent = new Map();
+    for (const low of cand) {
+      if (isCaps(low)) continue;
+      const parents = cand.filter(c => isCaps(c) && nestedUnder(c, low) &&
+        Math.max(c.y, low.y) - Math.min(c.y + c.h, low.y + low.h) <= Math.max(c.h, low.h) * 1.2);
+      if (parents.length === 1) soleParent.set(low, parents[0]);
+    }
+    const nestedPair = (a, b) => soleParent.get(a) === b || soleParent.get(b) === a;
+
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
         const a = cand[i], b = cand[j];
@@ -2734,9 +2759,24 @@
           if (r.x - (l.x + l.w) <= Math.max(a.h, b.h) * 1.5) union(i, j);
           continue;
         }
-        if (xOv(a, b) < 0.4) continue;
         const gap = Math.max(a.y, b.y) - Math.min(a.y + a.h, b.y + b.h);
-        if (gap <= Math.max(a.h, b.h) * 1.2) union(i, j);
+        if (gap > Math.max(a.h, b.h) * 1.2) continue;
+        // xOv normalises by the WIDER word, so a SHORT given name under a long
+        // surname can never reach 0.4 however perfectly it sits: "Kris" (35px)
+        // centred under "WALDHERR" (87px) scores 0.35 and the book comes out as
+        // a bare surname. Measured across the two fiction shelves, four books
+        // lose their given name to nothing but this arithmetic.
+        //
+        // The 0.4 bar is not wrong -- it exists because dividing by the
+        // NARROWER word let a two-letter scrap off the next spine score a
+        // perfect 1.0 and poison the label ("VREELAND Susan NE"). So keep it,
+        // and add the one relationship it cannot express: a mixed-case word
+        // sitting BELOW an all-caps word and essentially inside its x-span is a
+        // given name under its surname, which is the shape of every fiction
+        // sticker in this library. The scrap case the bar was written for is
+        // excluded by construction, because "NE" is capitalised.
+        if (xOv(a, b) < 0.4 && !nestedPair(a, b)) continue;
+        union(i, j);
       }
     }
 
