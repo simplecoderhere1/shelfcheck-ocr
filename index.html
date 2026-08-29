@@ -3820,6 +3820,7 @@
   // see the note at the call site — smaller is what makes this land while three
   // Azure uploads are in flight, and it measured neutral-to-better on reading.
   const GEMINI_NAMES_MAX_DIM = 2400;
+  const GEMINI_NAMES_QUALITY = 0.42;
 
   async function callGeminiNames(blob, section, signal, budgetMs) {
     const t0 = performance.now();
@@ -4704,10 +4705,17 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // encoding again produced a byte-for-byte equivalent JPEG for
           // nothing -- measured 62-195ms of pure duplicated work on the
           // critical path, on a device where that is the scarce resource.
+          // Full RESOLUTION, lower JPEG QUALITY.
+          //
+          // The call competes for upstream with the Azure reads and lands only
+          // about half the time, and landing is worth ~7 points of fiction
+          // reading. Cutting RESOLUTION to buy bytes was tried and lost -- it
+          // landed LESS often, not more. Quality is the other axis and a
+          // better one for this: the sticker text stays the same size in
+          // pixels, which is what the model needs, while the bytes fall.
           const gemBlobP = !wantNames ? null
-            : GEMINI_NAMES_MAX_DIM >= 2400
-              ? Promise.resolve(enc.blob)
-              : encodeForOCR(GEMINI_NAMES_MAX_DIM, 0.85).then(e => e.blob).catch(() => enc.blob);
+            : encodeForOCR(GEMINI_NAMES_MAX_DIM, GEMINI_NAMES_QUALITY)
+                .then(e => e.blob).catch(() => enc.blob);
           namesP = wantNames
             // TRIED AND REVERTED: an adaptive deadline, giving the call
             // whatever was left of a 4.3s wall-clock budget instead of a flat
