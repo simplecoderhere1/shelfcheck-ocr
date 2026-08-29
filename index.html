@@ -2331,33 +2331,51 @@
       }
       return last.yb;
     };
+    // The shelf's own cutter length, taken from the labels that DID pair with a
+    // call number -- the ones with independent evidence behind them.
+    const anchorCutLen = dominantCutLen(labels);
+    const _pr = probePoint();
+    const _near = w => _pr && Math.abs(w.x - _pr[0]) < 150 && Math.abs(w.y - _pr[1]) < 80;
+    const _rej = (w, why) => { if (_near(w)) console.log(`[probe] anchorless ${JSON.stringify(w.t)} @${Math.round(w.x)},${Math.round(w.y)} REJECTED: ${why}`); };
     for (const w of small) {
-      if (used.has(w)) continue;
+      if (used.has(w)) { _rej(w, 'already used by another label'); continue; }
       const u = w.t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
-      if (!AZ_RX_CUTTER.test(u)) continue;
+      if (!AZ_RX_CUTTER.test(u)) { _rej(w, 'not cutter-shaped'); continue; }
       // Three letters minimum, stricter than a PAIRED tag needs to be. A paired
       // tag has a call number sitting above it vouching for it; this one has
       // nothing, and two-letter candidates ("AK", "MO", "BA", "CO") were all
       // fragments, never books.
-      if (u.replace(/[^A-Z]/g, '').length < 3) continue;
+      if (u.replace(/[^A-Z]/g, '').length < 3) { _rej(w, 'under 3 letters'); continue; }
+      // ...and no LONGER than this shelf's own cutter convention either. An
+      // anchorless candidate has no call number vouching for it, so the only
+      // evidence it is a label at all is that it looks like one, and a library
+      // that files under three letters does not suddenly issue a five-letter
+      // tag. Without this the pass earns its keep in reverse: measured over
+      // four nonfiction shelves it produced "CHINA", "JENNY" and "HOW" -- cover
+      // text, every one, each drawn on the photo as an amber box over a book
+      // that does not exist -- and not one real book.
+      if (anchorCutLen && u.replace(/[^A-Z]/g, '').length > anchorCutLen) {
+        _rej(w, `longer than this shelf's ${anchorCutLen}-letter cutters`); continue;
+      }
       const wc = w.x + w.w / 2;
       const ry = rowYAt(wc);
-      if (ry == null || Math.abs((w.y + w.h) - ry) > w.h * 2) continue;
+      if (ry == null || Math.abs((w.y + w.h) - ry) > w.h * 2) { _rej(w, `off the row baseline (ry=${ry == null ? 'none' : Math.round(ry)}, bottom=${Math.round(w.y + w.h)}, allowed ${Math.round(w.h * 2)})`); continue; }
       // A book the pairing missed leaves a GAP in the row. A title fragment
       // that merely happens to sit at label height does not — it lands on top
       // of a spine whose label was already built. Requiring a real hole took
       // this from 4-of-20 candidates being genuine books to a set small enough
       // to show a volunteer without burying the real boxes.
-      if (pitchPx && onRow.some(o => Math.abs(o.cx - wc) < pitchPx * 0.45)) continue;
+      if (pitchPx && onRow.some(o => Math.abs(o.cx - wc) < pitchPx * 0.45)) { _rej(w, `no gap in the row (pitch=${Math.round(pitchPx)})`); continue; }
       // Same light-background gate the real labels pass: a tag is printed on
       // the white sticker, so this keeps spine and cover lettering out.
-      if (lightRatio(ctx, w.x - 4, w.y - 4, w.w + 8, w.h + 8) < 0.10) continue;
+      if (lightRatio(ctx, w.x - 4, w.y - 4, w.w + 8, w.h + 8) < 0.10) { _rej(w, 'not on a light sticker'); continue; }
       labels.push({
         text: u, num: null, cut: u, truncated: false, ambiguousTail: false,
         unclear: true, malformed: true, anchorless: true,
         numBox: [w.x, w.y, w.w, w.h], bbox: [w.x, w.y, w.w, w.h],
         score: w.c ?? 0.9,
       });
+      if (_near(w)) console.log(`[probe] anchorless ${JSON.stringify(w.t)} ACCEPTED`);
     }
 
     return dedupeStickerLabels(keepUnpaired ? labels : labels.filter(l => l.cut));
