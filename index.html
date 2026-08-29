@@ -3812,13 +3812,23 @@
   // landed (the call itself measures 2.4-3.2s typically).
   const GEMINI_NAMES_TIMEOUT_MS = 3500;
 
-  async function callGeminiNames(blob, signal) {
+  async function callGeminiNames(blob, section, signal) {
     const t0 = performance.now();
-    const prompt = `This photo shows library FICTION shelves, filed by author surname.
+    const fiction = section === 'fiction';
+    const prompt = fiction
+      ? `This photo shows library FICTION shelves, filed by author surname.
 Each spine has a small white label at its base with the author's name.
 Read every label LEFT TO RIGHT, top shelf first, and return ONLY JSON:
 {"a":["SURNAME, Given", ...]}
 One entry per physical book, in shelf order, including repeated copies.
+Use null for a label you genuinely cannot read.
+Do NOT invent a book that is not in the photo, and do not merge two books into one.`
+      : `This photo shows library NONFICTION shelves, filed by Dewey decimal call number.
+Each spine has a small white label at its base, e.g. "635 GAR" or "635.0222 MUS".
+Read every label LEFT TO RIGHT, top shelf first, and return ONLY JSON:
+{"a":["635 GAR","635.0222 MUS", ...]}
+One entry per physical book, in shelf order, including repeated copies.
+Copy the digits exactly, including every decimal place.
 Use null for a label you genuinely cannot read.
 Do NOT invent a book that is not in the photo, and do not merge two books into one.`;
     // Base64 BEFORE the clock starts. It is pure CPU on a ~900KB blob, and on
@@ -3874,9 +3884,17 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
   // is anchored by the labels Azure DID read correctly.
   //
   // Only the text is taken. Boxes, row assignment and count stay Azure's.
-  function alignNamesToLabels(labels, names) {
-    const surOf = s => {
+  function alignNamesToLabels(labels, names, section) {
+    // What to compare on differs by section, and getting this wrong silently
+    // aligns nothing: a fiction label's identity is its SURNAME, but every
+    // nonfiction label on one shelf opens with the SAME Dewey number, so
+    // comparing leading tokens there scores every pair identical and the
+    // alignment becomes arbitrary. Nonfiction compares the whole call number
+    // plus cutter.
+    const fiction = section === 'fiction';
+    const keyOf = s => {
       const t = String(s || '').trim().toUpperCase();
+      if (!fiction) return t.replace(/[^A-Z0-9.]/g, '');
       const m = /^(VON\s+\w+|VAN\s+\w+|DE\s+\w+|LA\s+\w+)/.exec(t);
       if (m) return m[1].replace(/[^A-Z]/g, '');
       return (t.split(/[,\s]+/)[0] || '').replace(/[^A-Z]/g, '');
@@ -3884,12 +3902,12 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
     // 1.0 identical, 0 unrelated — a prefix match is most of the signal here,
     // because Azure's failure is usually truncation rather than substitution.
     const sim = (a, b) => {
-      const x = surOf(a), y = surOf(b);
+      const x = keyOf(a), y = keyOf(b);
       if (!x || !y) return 0;
       if (x === y) return 1;
       let n = 0; const m = Math.min(x.length, y.length);
       while (n < m && x[n] === y[n]) n++;
-      if (n < 3) return 0;
+      if (n < (fiction ? 3 : 4)) return 0;
       return n / Math.max(x.length, y.length);
     };
     const N = labels.length, M = names.length;
@@ -3956,7 +3974,80 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
       if (strong[p]) lab.score = Math.max(lab.score ?? 0, 0.95);
       applied++;
     }
-    return applied;
+
+    // ── Books Azure never found ──────────────────────────────────────────
+    //
+    // Everything above only ever RELABELS a box Azure located, so a book Azure
+    // missed entirely could not be recovered — its name was dropped as a
+    // phantom. That was the ceiling: of the six books still missed across the
+    // corpus, five are stickers Azure never returned any text for, and the
+    // model demonstrably reads some of them (asked to read 195901698 it
+    // returned the "635 GAR" stranded between CHI and COL that Azure has never
+    // once found).
+    //
+    // So: a run of model names that aligned to NOTHING becomes real books, but
+    // only where the geometry says books are missing. The test is physical, not
+    // textual — the flanking labels must be confidently matched, on the same
+    // row, and the space between their boxes must be wide enough to hold the
+    // spines being claimed. A phantom repeat of an identical neighbour (the
+    // model's known weakness) fails that test, because a repeat sits where its
+    // twin already is and leaves no room.
+    const created = [];
+    // OFF by default, and kept only because the reasoning behind it was sound
+    // and the code is the place to record that it did not pay.
+    //
+    // The premise was that books Azure never located cannot be recovered. That
+    // turned out to be the wrong diagnosis of the actual misses: the stranded
+    // "635 GAR" on 195901698 is not a sticker Azure failed to FIND, it is one
+    // Azure found and misread (as "635 COM"/"635 COL"), so the relabelling
+    // above already recovers it -- verified by A/B, both runs return 49 books
+    // and only the model-on run flags GAR.
+    //
+    // Measured with insertion ON across the corpus: 8 extra books, +16 yellow
+    // boxes, and NO detection gain -- with it OFF, both books it was built for
+    // (635 GAR and 635 WHA) still flag RED. Sixteen more shelves for a
+    // volunteer to hand-check, for nothing. ?ginsert=on re-enables it.
+    const allowInsert = typeof location !== 'undefined' &&
+      (new URLSearchParams(location.search).get('ginsert') || 'off') === 'on';
+    const anchorIdx = allowInsert ? [] : null;
+    if (!allowInsert) { for (const c of created) labels.push(c); return { applied, created: 0 }; }
+    for (let p = 0; p < pairs.length; p++) if (strong[p]) anchorIdx.push(p);
+    for (let a = 0; a + 1 < anchorIdx.length; a++) {
+      const P = pairs[anchorIdx[a]], Q = pairs[anchorIdx[a + 1]];
+      const labGap = Q[0] - P[0] - 1;          // Azure boxes strictly between
+      const nameGap = Q[1] - P[1] - 1;         // model names strictly between
+      const extra = nameGap - labGap;
+      if (extra <= 0) continue;                // nothing unaccounted for
+      const lo = labels[P[0]], hi = labels[Q[0]];
+      if (!lo.bbox || !hi.bbox) continue;
+      if ((lo.shelfRow ?? 0) !== (hi.shelfRow ?? 0)) continue;
+      // Room for the missing spines? Measure against the width of the books we
+      // can see, not a constant, so it scales with how the shelf was shot.
+      const pitch = Math.max(lo.bbox[2], hi.bbox[2]);
+      const span = hi.bbox[0] - (lo.bbox[0] + lo.bbox[2]);
+      const roomFor = Math.floor(span / (pitch * 0.8));
+      if (roomFor < extra) continue;           // no physical space — a phantom
+      // Insert the names that have no label, spread across the gap.
+      for (let k = 1; k <= extra; k++) {
+        const nameIdx = P[1] + labGap + k;
+        if (nameIdx <= P[1] || nameIdx >= Q[1]) continue;
+        const t = names[nameIdx];
+        if (!t || String(t).trim().length < 3) continue;
+        const x = lo.bbox[0] + lo.bbox[2] + (span * k) / (extra + 1);
+        created.push({
+          text: t,
+          bbox: [Math.round(x - pitch / 2), lo.bbox[1], Math.round(pitch), lo.bbox[3]],
+          // Read by ONE engine with no second opinion, so it sorts and can be
+          // shown, but sits just under STRONG_ANCHOR: enough to be judged,
+          // not enough to be treated as corroborated anywhere downstream.
+          score: 0.88,
+          shelfRow: lo.shelfRow ?? 0,
+          gem: true, inserted: true,
+        });
+      }
+    }
+    for (const c of created) labels.push(c);
+    return { applied, created: created.length };
   }
 
   async function callGeminiRead(blob, section, signal) {
@@ -4415,7 +4506,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         // and READ after the catch. Declaring it in the try (as bandMode is)
         // puts it out of scope at the read site, and the ReferenceError
         // rejects the whole analysis with no banner -- the page just waits.
-        let namesP = Promise.resolve(null);
+        let namesP = Promise.resolve(null), namesSection = null;
         try {
           // NONFICTION: read native-resolution vertical strips too, in parallel
           // with the full frame.
@@ -4495,10 +4586,15 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // it, so the model's ~2.4s overlaps Azure's ~0.9s instead of adding
           // to it. Never fatal: a failure leaves the Azure text exactly as it
           // is today. ?gnames=0 turns it off.
-          const wantNames = section === 'fiction' &&
+          const wantNames =
             (new URLSearchParams(location.search).get('gnames') || 'on') !== '0';
+          // Remember WHICH section the prompt was written for. The wrong-tab
+          // guard below can flip the section after this call is already in
+          // flight, and a fiction prompt's answer must not be aligned onto a
+          // nonfiction shelf.
+          namesSection = section;
           namesP = wantNames
-            ? callGeminiNames(enc.blob, signal).catch(e => {
+            ? callGeminiNames(enc.blob, section, signal).catch(e => {
                 console.log('[perf] gemini names skipped:', e.message);
                 return null;
               })
@@ -4668,8 +4764,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         // Take the model's text onto Azure's boxes. Await here, not earlier:
         // the call has been in flight since before the Azure read, so by now
         // it has usually already landed and this costs nothing.
-        if (section === 'fiction') {
-          const names = await namesP;
+        {
+          const names = namesSection === section ? await namesP : null;
           if (names && names.length) {
             // Alignment assumes both lists are in shelf reading order. Azure's
             // labels come out of the reader in assembly order, not necessarily
@@ -4681,9 +4777,14 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
               if (Math.abs(ay - by) > rowH) return ay - by;      // different shelf row
               return (a.bbox?.[0] || 0) - (b.bbox?.[0] || 0);    // same row: left to right
             });
-            const n = alignNamesToLabels(ordered, names);
-            console.log(`[perf] gemini names: ${n} of ${ordered.length} label(s) taken ` +
-                        `from the model (${names.length} name(s) offered)`);
+            const before = ordered.length;
+            const r = alignNamesToLabels(ordered, names, section);
+            // alignNamesToLabels may APPEND recovered books to `ordered`; those
+            // are new labels and have to reach the caller's array too.
+            for (let k = before; k < ordered.length; k++) labels.push(ordered[k]);
+            console.log(`[perf] gemini names: ${r.applied} of ${before} label(s) taken ` +
+                        `from the model, ${r.created} book(s) recovered that Azure missed ` +
+                        `(${names.length} name(s) offered)`);
           }
         }
         // Closer look at the stickers this read is shaky on. ONE extra call, and
@@ -4994,6 +5095,11 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       _malformed:     !!label.malformed,
       _ambiguousTail: !!label.ambiguousTail,
       _noGiven:       !!label.noGiven,
+      // Read by the vision model as well as Azure. Ordering uses this as a
+      // substitute for raw OCR confidence: a sticker two engines agree on is
+      // verified whatever number Azure attached to it.
+      _gem:           !!label.gem,
+      _inserted:      !!label.inserted,
       _src:           label.src || 'ocr',
     }));
   }
@@ -6292,12 +6398,27 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         // 635 WHA). Require the flagged read to actually look like the weaker
         // one — a genuine misread is not more confident than the sticker it
         // was misread from.
+        // "Strong" means the read is trustworthy, and OCR confidence is only
+        // one way to establish that. A sticker the vision model read the same
+        // way is verified by a second, independent engine, which is better
+        // evidence than any single-engine number -- so it clears this bar
+        // whatever Azure scored it.
+        //
+        // This is what the gate was costing: on 195907424 the live read is
+        // PERFECT, all 20 labels matching ground truth including the
+        // transposed WHI/WHA, and nothing was flagged solely because WHI came
+        // back at 0.82 instead of 0.90. Re-running that exact label list with
+        // WHI at 0.90 flags 635 WHA red and its partner yellow, correctly. A
+        // 0.08 confidence difference was deciding whether a real misfile was
+        // caught.
+        const isStrong = k => (checked[k]._score ?? 0) >= STRONG_ANCHOR ||
+                              (!!checked[k]._gem && !checked[k]._inserted);
         const sM = checked[i]._score ?? 0;
         for (const [kN, nIdx] of [[kL, L], [kR, R]]) {
           const cN = kN.val.cut || '';
           if (!cM || !cN || cM === cN || editDistance(cM, cN) > 1) continue;
           const sN = checked[nIdx]._score ?? 0;
-          if (sM >= STRONG_ANCHOR && sN >= STRONG_ANCHOR) continue;
+          if (isStrong(i) && isStrong(nIdx)) continue;
           if (sM > sN) continue;
           demote = true; break;
         }
