@@ -1030,11 +1030,32 @@
 
   // Extract text lines with bboxes from ocr.space TextOverlay.
   // Fraction of pixels in a region whose luminance is >= thresh (0..1).
-  // The default is overridable via ?lumthresh= so it can be swept against the
-  // corpus the same way the light RATIO was.
-  const LUM_THRESH = (typeof location !== 'undefined' &&
-    Number(new URLSearchParams(location.search).get('lumthresh'))) || 150;
-  function lightRatio(ctx, x, y, w, h, thresh = LUM_THRESH) {
+  // 130, not 150. This is the luminance a pixel must reach to count as part of
+  // a white sticker, and 150 assumed the shelf was lit like the photos it was
+  // fitted to. A sticker in SHADOW stays perfectly legible -- Azure read
+  // "641.568 WAL" on 195849222 at 0.96 and 0.87 and the pairing assigned it
+  // correctly -- but its patch means 119.8, so almost no pixel cleared 150 and
+  // the book was discarded AFTER being read and paired.
+  //
+  // Swept offline against the cached responses (azure_recon_bench --lumthresh):
+  //     150  recall 90.7%  precision 74.0%
+  //     130  recall 91.5%  precision 74.2%
+  //     120  recall 91.5%  precision 74.2%
+  //     110  recall 91.5%  precision 74.2%
+  //      90  recall 91.5%  precision 74.2%
+  // Recall improves and precision does NOT degrade -- the usual trade is
+  // absent because a shadowed sticker is still a sticker, not a new class of
+  // false match. It plateaus at 130, so this stops there rather than going as
+  // low as it can: the higher bar is the safer one on shelves not yet seen.
+  // NONFICTION ONLY. The fiction reader shares lightRatio and is NOT helped by
+  // a lower bar -- dropping it to 130 there left fiction recall flat at 88.0%
+  // and cost precision 85.4% -> 80.7%, because a fiction sticker sits among
+  // pale cover art that a lower bar starts admitting. Nonfiction call-number
+  // stickers do not have that neighbour, so the two sections genuinely want
+  // different numbers.
+  const LUM_THRESH_NONFIC = (typeof location !== 'undefined' &&
+    Number(new URLSearchParams(location.search).get('lumthresh'))) || 130;
+  function lightRatio(ctx, x, y, w, h, thresh = 150) {
     const cw = ctx.canvas.width, ch = ctx.canvas.height;
     x = Math.max(0, Math.round(x)); y = Math.max(0, Math.round(y));
     w = Math.min(cw - x, Math.max(1, Math.round(w)));
@@ -2230,7 +2251,7 @@
       // cutter sitting in Azure's word list (azure_recon_bench --why), i.e.
       // they were read and then thrown away here. 0.02 keeps a token guard
       // against a genuinely black region while recovering most of that.
-      const _lit = lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8);
+      const _lit = lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8, LUM_THRESH_NONFIC);
       if (typeof location !== 'undefined') {
         const pr = (new URLSearchParams(location.search).get('probe') || '').split(',').map(Number);
         if (pr.length === 2 && !pr.some(isNaN) && Math.abs(ux - pr[0]) < 200 && Math.abs(uy - pr[1]) < 80)
