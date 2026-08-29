@@ -792,9 +792,11 @@
   // review-then-Analyze step so the user can pick/replace the image first.
   function loadPhoto(file, autoAnalyze = false) {
     lastUnreadFrac = [];   // stale unread boxes must not carry onto a new photo
+    const tLoad0 = performance.now();
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = async () => {
+      const tDecoded = performance.now();
       const scale = Math.min(1, MAX_CANVAS_DIM / Math.max(img.naturalWidth, img.naturalHeight));
       snapshot.width  = Math.round(img.naturalWidth  * scale);
       snapshot.height = Math.round(img.naturalHeight * scale);
@@ -810,6 +812,9 @@
       // synchronous canvas work (filter + drawImage) before their first
       // await, which would otherwise block this same paint.
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      console.log(`[perf] loadPhoto: decode ${Math.round(tDecoded - tLoad0)}ms, ` +
+                  `draw+save ${Math.round(performance.now() - tDecoded)}ms ` +
+                  `(${img.naturalWidth}x${img.naturalHeight} -> ${snapshot.width}x${snapshot.height})`);
       pendingEncode = encodeForOCR();
       // Only when the read path will actually USE the grid — see tilesWanted.
       // With label bands on (the default) it will not, and encoding it here
@@ -3810,7 +3815,7 @@
   // worst case at ~4.85s against the 5s bar. Raising it to 4s pushed the tail
   // to 5.2-5.7s; lowering it much further starts losing draws that would have
   // landed (the call itself measures 2.4-3.2s typically).
-  const GEMINI_NAMES_TIMEOUT_MS = 3500;
+  const GEMINI_NAMES_TIMEOUT_MS = 4500;
   // Long edge of the frame sent to the model. NOT the same as the Azure frame:
   // see the note at the call site — smaller is what makes this land while three
   // Azure uploads are in flight, and it measured neutral-to-better on reading.
@@ -4663,8 +4668,22 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // it, so the model's ~2.4s overlaps Azure's ~0.9s instead of adding
           // to it. Never fatal: a failure leaves the Azure text exactly as it
           // is today. ?gnames=0 turns it off.
-          const wantNames =
-            (new URLSearchParams(location.search).get('gnames') || 'on') !== '0';
+          // FICTION ONLY by default.
+          //
+          // On nonfiction the model is verify-only -- it may confirm a sticker
+          // but never rewrite one, because Azure reads Dewey digits better
+          // (measured three separate ways). Confirming turns out to buy no
+          // recall at all: 84.6% sorted with the call and 84.6% without it,
+          // identical to the book. What it does buy is 2.4 SECONDS -- nonfiction
+          // runs 1.55s mean without it and 3.93s with, and its worst shelf went
+          // through the 5s bar at 5.1s.
+          //
+          // The one thing lost is the near-twin confidence gate (635 WHA), a
+          // detection case rather than a reading one. ?gnames=all re-enables it
+          // for nonfiction if that trade is ever worth making again.
+          const gnames = new URLSearchParams(location.search).get('gnames') || 'on';
+          const wantNames = gnames !== '0' &&
+            (section === 'fiction' || gnames === 'all');
           // Remember WHICH section the prompt was written for. The wrong-tab
           // guard below can flip the section after this call is already in
           // flight, and a fiction prompt's answer must not be aligned onto a
@@ -4680,9 +4699,15 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // properly -- 4 runs of both fiction shelves, 400 book-observations
           // per arm -- it is not: 76.5% sorted at 1400px against 77.8% at
           // 2400px. The single-shelf result was noise. Left at 2400px.
-          const gemBlobP = wantNames
-            ? encodeForOCR(GEMINI_NAMES_MAX_DIM, 0.85).then(e => e.blob).catch(() => enc.blob)
-            : null;
+          // Reuse the frame already encoded for Azure when it is the same size.
+          // GEMINI_NAMES_MAX_DIM matches the Azure encode by default, so
+          // encoding again produced a byte-for-byte equivalent JPEG for
+          // nothing -- measured 62-195ms of pure duplicated work on the
+          // critical path, on a device where that is the scarce resource.
+          const gemBlobP = !wantNames ? null
+            : GEMINI_NAMES_MAX_DIM >= 2400
+              ? Promise.resolve(enc.blob)
+              : encodeForOCR(GEMINI_NAMES_MAX_DIM, 0.85).then(e => e.blob).catch(() => enc.blob);
           namesP = wantNames
             // TRIED AND REVERTED: an adaptive deadline, giving the call
             // whatever was left of a 4.3s wall-clock budget instead of a flat
