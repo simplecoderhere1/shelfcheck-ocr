@@ -6325,7 +6325,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // yellow; the red-vs-yellow gate lives in checkOrderOneShelf's final pass.
     // Genuinely weak reads (score < 0.5, e.g. the 0.4 low-confidence tier) and
     // score-less "uncertain" GT rows (_score undefined) stay unsortable/yellow.
-    if (book.confidence === 'low' && !(book._score >= 0.5)) return null;
+    if (book.confidence === 'low' && !(book._score >= 0.5) && !book._numCorroborated) return null;
     const vol   = extractVolume(book);
     // Titles must never tie-break unless human/OL-verified: Gemini titles are
     // frequently unverified (verifyTitlesOpenLibrary's timeout/budget-abort
@@ -6544,6 +6544,44 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   }
 
   function checkOrderOneShelf(books, section) {
+    // A nonfiction label can be read PERFECTLY and still not sort, because the
+    // score is the MINIMUM confidence across its words and one shaky glyph in a
+    // three-letter cutter drags the whole label under the 0.5 floor. Three books
+    // in the corpus carry text identical to ground truth and are shown as "no
+    // sortable call number could be read" at 0.08, 0.39 and 0.47.
+    //
+    // Lowering the floor for everyone was measured and rejected: sorted +2 but
+    // WRONG +2, trading honest amber boxes for silent misfilings. So corroborate
+    // instead of trusting. Let a sub-floor label sort only when a CONFIDENT
+    // label in the same row carries the identical call number, which is the
+    // half of the label the sort actually turns on. That leaves the cutter as
+    // the only unverified part, and a wrong cutter cannot manufacture a red
+    // flag by itself -- the red bar (RED_MIN_SCORE) is applied separately and
+    // still excludes these books. The exposure is that a wrong cutter drags the
+    // in-order chain and makes a NEIGHBOUR look misplaced, which is exactly
+    // what replay_order's must_not_flag guard is there to catch.
+    const CORROB_MIN = 0.9;
+    if (section === 'nonfiction') {
+      const numFor = b => (/^\s*(\d{1,3}(?:\.\d+)?)(?=\s|$)/.exec(String(b.spine_label || '')) || [])[1] || null;
+      const solid = new Map();
+      for (const b of books) {
+        const n = numFor(b);
+        if (!n || !(b._score >= CORROB_MIN) || b._truncated) continue;
+        const row = b.shelfRow ?? 0;
+        if (!solid.has(row)) solid.set(row, new Set());
+        solid.get(row).add(n);
+      }
+      for (const b of books) {
+        // Recomputed, not accumulated: checkOrder runs more than once on the
+        // same book objects, and a corroboration that held on one pass must not
+        // survive into a pass where the row no longer supports it.
+        b._numCorroborated = false;
+        if (b._score >= 0.5 || b._truncated) continue;
+        const n = numFor(b);
+        if (n && solid.get(b.shelfRow ?? 0)?.has(n)) b._numCorroborated = true;
+      }
+    }
+
     const keys = books.map(b => sortKey(b, section));
 
     function samePrimary(a, b) {
