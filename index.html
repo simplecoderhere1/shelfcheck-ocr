@@ -1222,7 +1222,58 @@
         a.truncated = true;
       }
     }
+
     return words.filter(w => !eaten.has(w));
+  }
+
+  // The same split, laid out SIDEWAYS -- and applied to the MERGED word set.
+  //
+  // mergeAzureNumberFragments joins "641." sitting ABOVE "568", which is how a
+  // sticker wraps when the number is too long for one line. A wide sticker
+  // keeps the number on ONE line and Azure still splits it, dropping the
+  // point: measured on 185412743, "690" @445,1457 and "8028" @494,1457 -- same
+  // baseline, a THREE PIXEL gap, both at 0.98 confidence -- with "DIC"
+  // directly beneath. The app built "690 DIC" and threw the 8028 away, and
+  // "690" then sorts ahead of every "690.8xxx" on the shelf, so a book that was
+  // read perfectly is filed at the wrong end of the run.
+  //
+  // This runs AFTER the full-frame and band reads are merged, not inside
+  // parseAzureWords like the vertical pass. The two halves routinely come from
+  // DIFFERENT responses -- the full frame sees one, a band sees the other -- so
+  // a per-response join never sees them together and does nothing at all.
+  //
+  // Gated on adjacency rather than order: same baseline, same text size, and
+  // within a fraction of a character height of the anchor's right edge. A
+  // neighbouring book's number is a whole spine away and cannot be caught.
+  function joinSideBySideNumbers(words) {
+    const eaten = new Set();
+    for (const a of words) {
+      // A word ALREADY flagged truncated is the main customer here, not an
+      // exclusion. mergeAzureNumberFragments sets that flag when it sees
+      // "690." and finds no tail BELOW it -- which is exactly the case where
+      // the tail is beside it instead. Skipping them matched nothing at all.
+      if (eaten.has(a) || !/^\d{3}$/.test(a.t)) continue;
+      let best = null, bestGap = Infinity;
+      for (const b of words) {
+        if (b === a || eaten.has(b) || !/^\d{1,4}$/.test(b.t)) continue;
+        const gap = b.x - (a.x + a.w);
+        if (gap < -a.h * 0.15 || gap > a.h * 0.6) continue;      // must abut
+        if (Math.abs(b.y - a.y) > a.h * 0.5) continue;           // same baseline
+        if (Math.abs(b.h - a.h) > a.h * 0.5) continue;           // same text size
+        if (gap < bestGap) { best = b; bestGap = gap; }
+      }
+      if (!best) continue;
+      const x = Math.min(a.x, best.x), y = Math.min(a.y, best.y);
+      a.w = Math.max(a.x + a.w, best.x + best.w) - x;
+      a.h = Math.max(a.y + a.h, best.y + best.h) - y;
+      a.x = x; a.y = y;
+      a.t = a.t + '.' + best.t;
+      a.truncated = false;          // the missing digits are no longer missing
+      eaten.add(best);
+    }
+    if (typeof location !== 'undefined' && new URLSearchParams(location.search).get('dumpwords') === '1')
+      console.log('[joinSBS] joined ' + eaten.size + ' side-by-side number fragment(s)');
+    return eaten.size ? words.filter(w => !eaten.has(w)) : words;
   }
 
   function parseAzureWords(data) {
@@ -4907,13 +4958,24 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
             setActiveTab('fiction');
           }
         }
+        // ?dumpwords=1 exposes the raw word set the readers were given, so a
+        // missing book can be attributed: words present means assembly lost
+        // it, words absent means Azure never read it. Those need completely
+        // different fixes and cannot be told apart from the labels alone.
+        if (new URLSearchParams(location.search).get('dumpwords') === '1') {
+          window.__shelfcheckWords = mergeAzureWordSets(
+            parseAzureWords(data), tileWords, enc.sentW / snapshot.width)
+            .map(w => ({ t: w.t, c: w.c, x: Math.round(w.x), y: Math.round(w.y),
+                         w: Math.round(w.w), h: Math.round(w.h) }));
+        }
         labels = section === 'fiction'
           ? reconstructFictionAzure(
               mergeFictionBandWords(parseAzureWords(data), tileWords,
                                     enc.sentW / snapshot.width), ctx)
           : reconstructNonfictionAzure(
-              mergeAzureWordSets(parseAzureWords(data), tileWords,
-                                 enc.sentW / snapshot.width), ctx, true);
+              joinSideBySideNumbers(
+                mergeAzureWordSets(parseAzureWords(data), tileWords,
+                                   enc.sentW / snapshot.width)), ctx, true);
         // Take the model's text onto Azure's boxes. Await here, not earlier:
         // the call has been in flight since before the Azure read, so by now
         // it has usually already landed and this costs nothing.
