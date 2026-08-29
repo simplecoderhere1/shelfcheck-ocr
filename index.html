@@ -1030,7 +1030,11 @@
 
   // Extract text lines with bboxes from ocr.space TextOverlay.
   // Fraction of pixels in a region whose luminance is >= thresh (0..1).
-  function lightRatio(ctx, x, y, w, h, thresh = 150) {
+  // The default is overridable via ?lumthresh= so it can be swept against the
+  // corpus the same way the light RATIO was.
+  const LUM_THRESH = (typeof location !== 'undefined' &&
+    Number(new URLSearchParams(location.search).get('lumthresh'))) || 150;
+  function lightRatio(ctx, x, y, w, h, thresh = LUM_THRESH) {
     const cw = ctx.canvas.width, ch = ctx.canvas.height;
     x = Math.max(0, Math.round(x)); y = Math.max(0, Math.round(y));
     w = Math.min(cw - x, Math.max(1, Math.round(w)));
@@ -1968,6 +1972,20 @@
       ? numHs[numHs.length >> 1] * AZ_TEXT_H_K
       : maxDim * 0.022;
     const small = dedupeWordReads(words.filter(w => w.h <= maxH && w.w >= w.h * 0.5));
+    // ?probe=x,y reports whether the words around one point survived the
+    // candidate filters and, if not, which one dropped them. A book can be
+    // lost at three different stages and the labels alone cannot say which.
+    if (typeof location !== 'undefined') {
+      const pr = (new URLSearchParams(location.search).get('probe') || '').split(',').map(Number);
+      if (pr.length === 2 && !pr.some(isNaN)) {
+        const near = w => Math.abs(w.x - pr[0]) < 120 && Math.abs(w.y - pr[1]) < 60;
+        console.log(`[probe] maxH=${maxH.toFixed(1)}  words near ${pr}:`);
+        for (const w of words.filter(near))
+          console.log(`[probe]   ${JSON.stringify(w.t).padEnd(14)} h=${w.h} w=${w.w} ` +
+            `tooTall=${w.h > maxH} tooThin=${!(w.w >= w.h * 0.5)} ` +
+            `inSmall=${small.includes(w)}`);
+      }
+    }
 
     // Orphan decimal tails. Azure splits a call number across two words —
     // "641." above "568" — and mergeAzureNumberFragments stitches them back
@@ -2162,6 +2180,17 @@
       used.add(p.w);
     }
 
+    if (typeof location !== 'undefined') {
+      const pr = (new URLSearchParams(location.search).get('probe') || '').split(',').map(Number);
+      if (pr.length === 2 && !pr.some(isNaN)) {
+        const near = (x, y) => Math.abs(x - pr[0]) < 200 && Math.abs(y - pr[1]) < 80;
+        for (const st of stubs) if (near(st.a.x, st.a.y))
+          console.log(`[probe] stub num=${st.num} @${st.a.x},${st.a.y} -> cutter=${st.cutter || 'NONE'}`);
+        for (const w of small) if (!used.has(w) && near(w.x, w.y))
+          console.log(`[probe] unused word ${JSON.stringify(w.t)} @${w.x},${w.y}`);
+      }
+    }
+
     // ── Pass 3: build the labels ────────────────────────────────────────────
     for (const { a, num, parts, cutter } of stubs) {
       const ux = Math.min(...parts.map(p => p.x)),  uy = Math.min(...parts.map(p => p.y));
@@ -2201,7 +2230,14 @@
       // cutter sitting in Azure's word list (azure_recon_bench --why), i.e.
       // they were read and then thrown away here. 0.02 keeps a token guard
       // against a genuinely black region while recovering most of that.
-      if (lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8) < 0.02) continue;
+      const _lit = lightRatio(ctx, ux - 4, uy - 4, (ur - ux) + 8, (ub - uy) + 8);
+      if (typeof location !== 'undefined') {
+        const pr = (new URLSearchParams(location.search).get('probe') || '').split(',').map(Number);
+        if (pr.length === 2 && !pr.some(isNaN) && Math.abs(ux - pr[0]) < 200 && Math.abs(uy - pr[1]) < 80)
+          console.log(`[probe] pass3 ${num} ${cutter || 'NOCUT'} box=${Math.round(ux)},${Math.round(uy)} ${Math.round(ur-ux)}x${Math.round(ub-uy)} canvas=${ctx.canvas.width}x${ctx.canvas.height} lit=${_lit.toFixed(3)} ` +
+                      `${_lit < 0.02 ? 'DROPPED by light gate' : cutter ? 'kept' : 'no cutter'}`);
+      }
+      if (_lit < 0.02) continue;
 
       const conf = Math.min(...parts.map(p => p.c ?? 0.9));
       labels.push({
