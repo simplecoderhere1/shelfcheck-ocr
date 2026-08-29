@@ -3816,7 +3816,7 @@
   // Azure uploads are in flight, and it measured neutral-to-better on reading.
   const GEMINI_NAMES_MAX_DIM = 2400;
 
-  async function callGeminiNames(blob, section, signal) {
+  async function callGeminiNames(blob, section, signal, budgetMs) {
     const t0 = performance.now();
     const fiction = section === 'fiction';
     const prompt = fiction
@@ -3843,7 +3843,8 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
     // the names. The deadline should cover the round trip, nothing else.
     const b64 = await blobToBase64(blob);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), GEMINI_NAMES_TIMEOUT_MS);
+    const timer = setTimeout(() => ctrl.abort(),
+      Math.max(1500, Math.min(GEMINI_NAMES_TIMEOUT_MS, budgetMs ?? GEMINI_NAMES_TIMEOUT_MS)));
     const onAbort = () => ctrl.abort();
     if (signal) {
       if (signal.aborted) ctrl.abort();
@@ -4676,6 +4677,12 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
             ? encodeForOCR(GEMINI_NAMES_MAX_DIM, 0.85).then(e => e.blob).catch(() => enc.blob)
             : null;
           namesP = wantNames
+            // TRIED AND REVERTED: an adaptive deadline, giving the call
+            // whatever was left of a 4.3s wall-clock budget instead of a flat
+            // 3.5s. It did raise the landing rate (6 of 6 runs vs intermittent
+            // aborts) but fiction scored 77.8% either way over 4 repeats -- the
+            // extra landings changed no verdicts -- while worst-case latency
+            // went 4.7s -> 5.5s, through the 5s bar. Not a trade worth making.
             ? gemBlobP.then(b => callGeminiNames(b, section, signal)).catch(e => {
                 console.log('[perf] gemini names skipped:', e.message);
                 return null;
