@@ -3241,6 +3241,52 @@
   // and a Dewey boundary (635 next to 635.0484) simply disagrees and is left
   // alone. At a row's edge there is only one neighbour, so require instead
   // that the whole row agrees, with enough numbered labels to mean it.
+  // 635 read as 035, 791.4302 read as 191.4302. Azure confuses 6/0 and 7/1 on
+  // small sticker digits, and the result is a call number that exists nowhere
+  // on the shelf, sorts far from where the book sits, and shows the user an
+  // amber box on a label they can read perfectly well.
+  //
+  // This is NOT the clipped-decimal problem, which was tried three times and
+  // failed every time. There the question is LENGTH -- whether 690.83 is a
+  // short reading of 690.837 or a real number one shelf-slot earlier -- and no
+  // row-local evidence separates those. Here the length is identical and only
+  // one glyph differs, so nothing about the number's precision is in doubt; the
+  // only question is whether one character was misread. Require the row to hold
+  // a strong consensus the read is one glyph away from, and require the read's
+  // own number to appear nowhere else in the photo, so a genuine lone call
+  // number is never rewritten into its neighbours.
+  function repairGlyphSlips(labels) {
+    const CONSENSUS_MIN = 3;
+    const numOf = t => (/^\s*(\d{1,3}(?:\.\d+)?)(?=\s|$)/.exec(String(t)) || [])[1] || null;
+    const oneApart = (a, b) => {
+      if (a.length !== b.length) return false;
+      let d = 0;
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) { if (++d > 1) return false; }
+      return d === 1;
+    };
+    const everywhere = new Map();
+    for (const l of labels) {
+      const n = numOf(l.text);
+      if (n) everywhere.set(n, (everywhere.get(n) || 0) + 1);
+    }
+    const byRow = new Map();
+    for (const l of labels) {
+      const n = numOf(l.text);
+      if (!n || !(l.score >= 0.9)) continue;
+      if (!byRow.has(l._row)) byRow.set(l._row, new Map());
+      const m = byRow.get(l._row);
+      m.set(n, (m.get(n) || 0) + 1);
+    }
+    for (const l of labels) {
+      const n = numOf(l.text);
+      if (!n || everywhere.get(n) !== 1) continue;
+      const cons = [...(byRow.get(l._row) || new Map())]
+        .filter(([o, c]) => c >= CONSENSUS_MIN && oneApart(o, n));
+      if (cons.length !== 1) continue;
+      l.text = l.text.replace(n, cons[0][0]);
+    }
+  }
+
   function inheritRowNumbers(labels) {
     const BARE_CUTTER = /^\s*([A-Za-z][A-Za-z'.-]{1,3})\s*$/;
     const numOf = t => (/^\s*(\d{1,3}(?:\.\d+)?)(?=\s|$)/.exec(String(t)) || [])[1] || null;
@@ -4637,7 +4683,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       }
     }
 
-    if (section === 'nonfiction') inheritRowNumbers(labels);
+    if (section === 'nonfiction') { repairGlyphSlips(labels); inheritRowNumbers(labels); }
 
     const out = labels.map(l => ({
       text:           l.text,
