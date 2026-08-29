@@ -3811,6 +3811,10 @@
   // to 5.2-5.7s; lowering it much further starts losing draws that would have
   // landed (the call itself measures 2.4-3.2s typically).
   const GEMINI_NAMES_TIMEOUT_MS = 3500;
+  // Long edge of the frame sent to the model. NOT the same as the Azure frame:
+  // see the note at the call site — smaller is what makes this land while three
+  // Azure uploads are in flight, and it measured neutral-to-better on reading.
+  const GEMINI_NAMES_MAX_DIM = 2400;
 
   async function callGeminiNames(blob, section, signal) {
     const t0 = performance.now();
@@ -4658,8 +4662,21 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // flight, and a fiction prompt's answer must not be aligned onto a
           // nonfiction shelf.
           namesSection = section;
+          // The model gets its own encode, at GEMINI_NAMES_MAX_DIM.
+          //
+          // TRIED AND REVERTED: shrinking it to 1400px. The call uploads while
+          // the Azure full-frame and band reads are also in flight over one
+          // upstream link, and standalone it takes 2.4-3.6s but inside the app
+          // was regularly aborting at the deadline, so fewer bytes looked like
+          // the fix. On a single shelf 1400px even scored BETTER. Repeated
+          // properly -- 4 runs of both fiction shelves, 400 book-observations
+          // per arm -- it is not: 76.5% sorted at 1400px against 77.8% at
+          // 2400px. The single-shelf result was noise. Left at 2400px.
+          const gemBlobP = wantNames
+            ? encodeForOCR(GEMINI_NAMES_MAX_DIM, 0.85).then(e => e.blob).catch(() => enc.blob)
+            : null;
           namesP = wantNames
-            ? callGeminiNames(enc.blob, section, signal).catch(e => {
+            ? gemBlobP.then(b => callGeminiNames(b, section, signal)).catch(e => {
                 console.log('[perf] gemini names skipped:', e.message);
                 return null;
               })
