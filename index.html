@@ -714,7 +714,7 @@
   // 'https://yourname--shelfcheck-ocr-ocr-web.modal.run'). That turns cloud OCR
   // on for every volunteer. Leave empty to stay on-device only.
   let _flaggedRowMap   = new Map();  // book object → flagged-list DOM row
-  let _cleanPhotoData  = null;   // ImageData snapshot of the photo before any boxes are drawn
+  let _cleanPhotoSrc   = null;   // the decoded photo itself, for redrawing under the boxes
   let analysisCancelled = false;
   let analysisAbort     = null;
   let analysisGeneration = 0;   // bumped on every new analysis/retake so a late refine can't clobber stale UI
@@ -800,7 +800,7 @@
       snapshot.height = Math.round(img.naturalHeight * scale);
       snapshot.getContext('2d').drawImage(img, 0, 0, snapshot.width, snapshot.height);
       URL.revokeObjectURL(url);
-      saveCleanPhoto();
+      saveCleanPhoto(img);
       photoPlaceholder.style.display = 'none';
       snapshot.style.display = 'block';
       actionBar.classList.add('show');
@@ -839,7 +839,7 @@
     pendingEncode    = null;
     pendingTiles     = null;
     pendingLocal     = null;
-    _cleanPhotoData  = null;
+    _cleanPhotoSrc   = null;
     lastApiDims      = null;
     lastRawBooks     = null;
     lastCheckedBooks = [];
@@ -849,13 +849,23 @@
   }
 
   // ── Clean-photo save/restore (for re-drawing boxes on tab switch) ─────────
-  function saveCleanPhoto() {
-    _cleanPhotoData = snapshot.getContext('2d').getImageData(0, 0, snapshot.width, snapshot.height);
+  // Keep the decoded IMAGE, not a pixel copy of the canvas.
+  //
+  // This used to getImageData() the whole snapshot -- on a 4080x3072 phone
+  // photo that is a ~50MB GPU->CPU readback, on the critical path, before the
+  // read can even start, and putImageData costs it again on every redraw.
+  // Measured at 4x CPU throttle it was most of the ~0.9s spent in loadPhoto
+  // before analyzeShelf begins. Redrawing from the source image is the same
+  // picture for free, because the browser already has it decoded.
+  function saveCleanPhoto(img) {
+    if (img) _cleanPhotoSrc = img;
   }
 
   function restoreCleanPhoto() {
-    if (_cleanPhotoData && _cleanPhotoData.width === snapshot.width)
-      snapshot.getContext('2d').putImageData(_cleanPhotoData, 0, 0);
+    if (!_cleanPhotoSrc) return;
+    const ctx = snapshot.getContext('2d');
+    ctx.clearRect(0, 0, snapshot.width, snapshot.height);
+    ctx.drawImage(_cleanPhotoSrc, 0, 0, snapshot.width, snapshot.height);
   }
 
   // Main capture path: hand off to the phone's NATIVE camera app (photoInput is
@@ -3794,7 +3804,13 @@
   // what keeps the whole read under the 5s bar. On a slow draw the fetch is
   // aborted and the Azure text stands -- the shelf is still read, just not as
   // well -- which is the right trade when the alternative is an 8s wait.
-  const GEMINI_NAMES_TIMEOUT_MS = 4000;
+  // Sized from the measured budget, not guessed: at 4x CPU throttle the rest
+  // of the read (pre-encode, the Azure round trip it overlaps, alignment,
+  // render) adds a steady ~1.35s on top of this call, so 3.5s here puts the
+  // worst case at ~4.85s against the 5s bar. Raising it to 4s pushed the tail
+  // to 5.2-5.7s; lowering it much further starts losing draws that would have
+  // landed (the call itself measures 2.4-3.2s typically).
+  const GEMINI_NAMES_TIMEOUT_MS = 3500;
 
   async function callGeminiNames(blob, signal) {
     const t0 = performance.now();
@@ -3805,6 +3821,13 @@ Read every label LEFT TO RIGHT, top shelf first, and return ONLY JSON:
 One entry per physical book, in shelf order, including repeated copies.
 Use null for a label you genuinely cannot read.
 Do NOT invent a book that is not in the photo, and do not merge two books into one.`;
+    // Base64 BEFORE the clock starts. It is pure CPU on a ~900KB blob, and on
+    // a phone it costs a second or more — charging that to the network budget
+    // left too little for the request itself, so the call was aborted having
+    // spent the whole allowance and returned nothing. Measured at 4x throttle:
+    // two of three fiction shelves timed out that way, taking 5.6s AND losing
+    // the names. The deadline should cover the round trip, nothing else.
+    const b64 = await blobToBase64(blob);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), GEMINI_NAMES_TIMEOUT_MS);
     const onAbort = () => ctrl.abort();
@@ -3825,7 +3848,7 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
             thinkingConfig: { thinkingBudget: 0 },
           },
           contents: [{ parts: [{ text: prompt },
-            { inline_data: { mime_type: 'image/jpeg', data: await blobToBase64(blob) } }] }],
+            { inline_data: { mime_type: 'image/jpeg', data: b64 } }] }],
         }),
       });
       if (!res.ok) throw new Error('gemini ' + res.status);
