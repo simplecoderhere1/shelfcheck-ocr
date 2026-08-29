@@ -3230,6 +3230,39 @@
   // two rows whenever its sticker centers straddled a band edge, which made
   // OCR's row count disagree with Gemini's and forced fusion into the
   // degraded flatten path.
+  // A cutter read with no call number ("DON") cannot be sorted at all: it has
+  // no number to compare, so it lands as an unreadable amber box even though
+  // its three letters came through perfectly. But shelves are numbered in
+  // runs, and where the books on BOTH sides carry the same number, the one
+  // between them has that number too -- there is nowhere else on the shelf it
+  // could be. Borrow it. The both-sides agreement is what makes this safe: an
+  // inherited number equal to both neighbours' sorts the book between them, so
+  // it cannot turn into a flag against the very labels it was inferred from,
+  // and a Dewey boundary (635 next to 635.0484) simply disagrees and is left
+  // alone. At a row's edge there is only one neighbour, so require instead
+  // that the whole row agrees, with enough numbered labels to mean it.
+  function inheritRowNumbers(labels) {
+    const BARE_CUTTER = /^\s*([A-Za-z][A-Za-z'.-]{1,3})\s*$/;
+    const numOf = t => (/^\s*(\d{1,3}(?:\.\d+)?)(?=\s|$)/.exec(String(t)) || [])[1] || null;
+    const ROW_MIN = 3;
+    for (let i = 0; i < labels.length; i++) {
+      const l = labels[i];
+      const m = BARE_CUTTER.exec(l.text);
+      if (!m) continue;
+      const sameRow = j => labels[j] && labels[j]._row === l._row;
+      const ln = sameRow(i - 1) ? numOf(labels[i - 1].text) : null;
+      const rn = sameRow(i + 1) ? numOf(labels[i + 1].text) : null;
+      let num = null;
+      if (ln && rn) { if (ln === rn) num = ln; }
+      else {
+        const rowNums = labels.filter(o => o._row === l._row && o !== l)
+                              .map(o => numOf(o.text)).filter(Boolean);
+        if (rowNums.length >= ROW_MIN && rowNums.every(n => n === rowNums[0])) num = rowNums[0];
+      }
+      if (num) l.text = num + ' ' + m[1];
+    }
+  }
+
   function clusterRowIndex(labels, imgH) {
     const threshold = Math.max(imgH * 0.05, 24);
     const withCy = labels.map(l => ({ l, cy: l.bbox[1] + l.bbox[3] / 2 }));
@@ -4603,6 +4636,8 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         l.text = l.text.replace(/^[^\d]{2,24}?\s+(?=\d{1,3}(?:\.\d+)?(?:\s|$))/, '');
       }
     }
+
+    if (section === 'nonfiction') inheritRowNumbers(labels);
 
     const out = labels.map(l => ({
       text:           l.text,
