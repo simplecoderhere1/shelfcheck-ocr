@@ -3901,14 +3901,37 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
     };
     // 1.0 identical, 0 unrelated — a prefix match is most of the signal here,
     // because Azure's failure is usually truncation rather than substitution.
-    const sim = (a, b) => {
-      const x = keyOf(a), y = keyOf(b);
+    const pfx = (x, y, min) => {
       if (!x || !y) return 0;
       if (x === y) return 1;
       let n = 0; const m = Math.min(x.length, y.length);
       while (n < m && x[n] === y[n]) n++;
-      if (n < (fiction ? 3 : 4)) return 0;
+      if (n < min) return 0;
       return n / Math.max(x.length, y.length);
+    };
+    // The GIVEN name is a second, independent handle on the same sticker, and
+    // it rescues exactly the cases the surname cannot. Azure read one label as
+    // "ION Elizabe" — its surname scores 0 against "VON ARNIM" however
+    // obviously they are the same book, because the V and the whole first word
+    // are gone. The given name is intact: "elizabe" against "elizabeth" is a
+    // 7-character prefix. Without this those books stay unmatched and are
+    // dropped, and they were 7 of the 23 books the app lost entirely.
+    //
+    // Scored slightly below a surname agreement, because given names repeat
+    // across a shelf far more than surnames do and so carry less information
+    // on their own; the monotonic alignment supplies the rest of the
+    // constraint.
+    const givenOf = s => {
+      const t = String(s || '').toUpperCase();
+      const c = t.indexOf(',');
+      const rest = c >= 0 ? t.slice(c + 1) : t.split(/\s+/).slice(1).join(' ');
+      return rest.replace(/[^A-Z]/g, '');
+    };
+    const sim = (a, b) => {
+      const surScore = pfx(keyOf(a), keyOf(b), fiction ? 3 : 4);
+      if (!fiction) return surScore;
+      const givScore = pfx(givenOf(a), givenOf(b), 4) * 0.9;
+      return Math.max(surScore, givScore);
     };
     const N = labels.length, M = names.length;
     if (!N || !M) return 0;
@@ -3961,10 +3984,52 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
       if (pairs[R][0] - pairs[L][0] === pairs[R][1] - pairs[L][1]) take[p] = true;
     }
 
+    // VERIFY-ONLY for nonfiction.
+    //
+    // Measured over the 336 clearly-readable ground-truth books: letting the
+    // model REPLACE text lifts fiction from 84.0% to 91.0% sorted, but drops
+    // nonfiction from 85.2% to 83.5%. Azure reads a Dewey number better than
+    // the model does (it is digits in a fixed format, which OCR is good at and
+    // where a language model's priors do not help), so overwriting a correct
+    // call number with the model's guess loses books.
+    //
+    // The model is still worth having on nonfiction, just in the other role:
+    // where it AGREES with Azure it is a second engine confirming the sticker,
+    // which is what lets the near-twin rule stop suppressing a real misfile
+    // (see `isStrong` in checkOrderOneShelf, and 635 WHA). So on nonfiction it
+    // may vouch for a read but never rewrite one.
+    const verifyOnly = section !== 'fiction';
     let applied = 0;
     for (let p = 0; p < pairs.length; p++) {
       if (!take[p]) continue;
       const lab = labels[pairs[p][0]];
+      if (verifyOnly) {
+        // Only an actual agreement is evidence; a positionally-pinned guess is
+        // not, and must not be allowed to vouch for anything.
+        if (strong[p]) { lab.gem = true; applied++; continue; }
+        // One exception to verify-only: where Azure produced a NUMBER but no
+        // cutter at all, there is no good read to corrupt. sortKey refuses to
+        // file a nonfiction label with an empty cutter, so these are shown as
+        // "couldn't read this one" no matter how clear the sticker was. If the
+        // model offers a full label for that position whose NUMBER agrees,
+        // taking it can only turn an unsortable book into a sortable one.
+        //
+        // Measured NEUTRAL on the corpus (nonfiction sorted 85.2% either way):
+        // the number-without-cutter case is rarer than it looks, and where it
+        // happens the model usually has no confident label either. Kept
+        // because it cannot regress and covers a real failure mode, but it is
+        // not the nonfiction win -- do not expect one from it.
+        const cur = String(lab.text || '');
+        const hasNum = /^\s*\d/.test(cur), hasCut = /\d\s*[A-Za-z]{2,}/.test(cur);
+        if (hasNum && !hasCut) {
+          const cand = String(names[pairs[p][1]] || '');
+          const numOf = t => (/^\s*(\d+(?:\.\d+)?)/.exec(t) || [])[1] || null;
+          if (numOf(cand) && numOf(cand) === numOf(cur) && /\d\s*[A-Za-z]{2,}/.test(cand)) {
+            lab.text = cand; lab.gem = true; applied++;
+          }
+        }
+        continue;
+      }
       lab.text = names[pairs[p][1]];
       lab.gem = true;
       // A sticker two independent engines agree on is the most trustworthy
@@ -4007,7 +4072,7 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
     // boxes, and NO detection gain -- with it OFF, both books it was built for
     // (635 GAR and 635 WHA) still flag RED. Sixteen more shelves for a
     // volunteer to hand-check, for nothing. ?ginsert=on re-enables it.
-    const allowInsert = typeof location !== 'undefined' &&
+    const allowInsert = !verifyOnly && typeof location !== 'undefined' &&
       (new URLSearchParams(location.search).get('ginsert') || 'off') === 'on';
     const anchorIdx = allowInsert ? [] : null;
     if (!allowInsert) { for (const c of created) labels.push(c); return { applied, created: 0 }; }
