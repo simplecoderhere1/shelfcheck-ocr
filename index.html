@@ -4025,13 +4025,15 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
         // because it cannot regress and covers a real failure mode, but it is
         // not the nonfiction win -- do not expect one from it.
         const cur = String(lab.text || '');
+        const cand = String(names[pairs[p][1]] || '');
+        const numOf = t => (/^\s*(\d+(?:\.\d+)?)/.exec(t) || [])[1] || null;
+        const cutOfT = t => ((/^\s*\d+(?:\.\d+)?\s*([A-Za-z]{2,})/.exec(t) || [])[1] || '').toUpperCase();
         const hasNum = /^\s*\d/.test(cur), hasCut = /\d\s*[A-Za-z]{2,}/.test(cur);
         if (hasNum && !hasCut) {
-          const cand = String(names[pairs[p][1]] || '');
-          const numOf = t => (/^\s*(\d+(?:\.\d+)?)/.exec(t) || [])[1] || null;
           if (numOf(cand) && numOf(cand) === numOf(cur) && /\d\s*[A-Za-z]{2,}/.test(cand)) {
             lab.text = cand; lab.gem = true; applied++;
           }
+          continue;
         }
         continue;
       }
@@ -4077,8 +4079,13 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
     // boxes, and NO detection gain -- with it OFF, both books it was built for
     // (635 GAR and 635 WHA) still flag RED. Sixteen more shelves for a
     // volunteer to hand-check, for nothing. ?ginsert=on re-enables it.
-    const allowInsert = !verifyOnly && typeof location !== 'undefined' &&
-      (new URLSearchParams(location.search).get('ginsert') || 'off') === 'on';
+    // ?ginsert=on   both sections   ?ginsert=nonfic   nonfiction only
+    // Nonfiction insertion is the untested case: the section is verify-only,
+    // so a sticker Azure never found stays missing however clearly the model
+    // read it, and missing books are the largest remaining loss bucket.
+    const _gi = typeof location === 'undefined' ? 'off'
+      : (new URLSearchParams(location.search).get('ginsert') || 'off');
+    const allowInsert = _gi === 'on' || (_gi === 'nonfic' && verifyOnly);
     const anchorIdx = allowInsert ? [] : null;
     if (!allowInsert) { for (const c of created) labels.push(c); return { applied, created: 0 }; }
     for (let p = 0; p < pairs.length; p++) if (strong[p]) anchorIdx.push(p);
@@ -4906,6 +4913,32 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // still reaches the volunteer as a book to check by hand instead of
           // silently disappearing (the tag-read/number-missing mirror case is
           // handled the same way earlier in reconstructNonfictionAzure).
+          // Repair call numbers Azure read SHORT, from the shelf itself.
+          //
+          // Azure routinely stops early on a deep decimal: "641 COS" for
+          // "641.568 COS", "635 COB" for "635.0484 COB". The cutter is right so
+          // the book is not mis-identified, but it IS mis-filed -- "641" sorts
+          // before every "641.5xx" and it lands at the head of the run instead
+          // of its own slot. Truncation was the ENTIRE silently-wrong bucket on
+          // this corpus.
+          //
+          // Where another label on the shelf carries the same cutter with a
+          // number that strictly EXTENDS this one, that longer read is the same
+          // sticker seen better, so take it. Measured over the nonfiction
+          // shelves: repairs 6 books and rewrites 0 correct ones.
+          //
+          // Deliberately NOT the shelf's modal number, which looks like the
+          // same idea and is not: it repairs 3 and CORRUPTS 6 books that were
+          // already right, because a genuinely short call number sitting on a
+          // deep-decimal shelf is a real thing.
+          {
+            const asBooks = labels.map(l => ({ spine_label: l.text }));
+            const n = mergeTileDecimals(asBooks, asBooks);
+            if (n) {
+              asBooks.forEach((b, i) => { labels[i].text = b.spine_label; });
+              console.log(`[perf] decimals: ${n} short call number(s) extended from a sibling on the shelf`);
+            }
+          }
           for (const l of labels) if (!l.cut) { l.unclear = true; l.malformed = true; }
         // bandModeFor(section), NOT the bandMode const above: that one is
         // scoped to the try block around the Azure calls and is not in scope
