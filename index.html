@@ -1242,9 +1242,26 @@
   // DIFFERENT responses -- the full frame sees one, a band sees the other -- so
   // a per-response join never sees them together and does nothing at all.
   //
-  // Gated on adjacency rather than order: same baseline, same text size, and
-  // within a fraction of a character height of the anchor's right edge. A
-  // neighbouring book's number is a whole spine away and cannot be caught.
+  // DELIBERATELY UNCORROBORATED, and that needs justifying, because
+  // reconstructNonfictionAzure already has a side-by-side join that requires
+  // the stitched number to appear IN FULL elsewhere on the shelf, with a
+  // comment recording that geometry alone was tried there and cost recall.
+  //
+  // This one runs anyway, for the case that rule cannot reach: when BOTH
+  // copies of a number are split, there is no full twin to corroborate
+  // against. On 185412743 both 690.8028 books were split, so the corroborated
+  // pass had nothing to match and left both short.
+  //
+  // What makes it safe is that the gates are far tighter than the pass it
+  // complements -- a 3px gap against that rule's ~18px, plus same baseline AND
+  // same text size, so the two fragments must be the same printed line rather
+  // than merely near each other. A neighbouring book's number is a whole spine
+  // away and cannot be caught. Measured: silently mis-filed nonfiction books
+  // 22 -> 14 over 586 observations with sorted unchanged, and reading recall
+  // and precision on the older library unchanged at 90.7% / 74.0%.
+  //
+  // If this ever does start inventing digits, the fix is to give it the same
+  // corroboration bar and accept that both-copies-split stays unreadable.
   function joinSideBySideNumbers(words) {
     const eaten = new Set();
     for (const a of words) {
