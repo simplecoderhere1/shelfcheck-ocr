@@ -3821,6 +3821,10 @@
   // Azure uploads are in flight, and it measured neutral-to-better on reading.
   const GEMINI_NAMES_MAX_DIM = 2400;
   const GEMINI_NAMES_QUALITY = 0.42;
+  // Latched when the model's daily free-tier allowance runs out. Fiction then
+  // reads on Azure alone, which is exactly what it did before the model
+  // existed -- worse, but never broken.
+  let geminiNamesSpent = false;
 
   async function callGeminiNames(blob, section, signal, budgetMs) {
     const t0 = performance.now();
@@ -3872,7 +3876,18 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
             { inline_data: { mime_type: 'image/jpeg', data: b64 } }] }],
         }),
       });
-      if (!res.ok) throw new Error('gemini ' + res.status);
+      if (!res.ok) {
+        // 429 from this endpoint is the DAY's free-tier allowance gone (500
+        // requests), not a per-minute burst: it will still be 429 for every
+        // remaining shelf, so latch and stop asking. Each pointless attempt
+        // costs a round trip on the critical path, and a volunteer working
+        // through a trolley would pay it on every photo.
+        if (res.status === 429) {
+          geminiNamesSpent = true;
+          console.log('[perf] gemini names: daily allowance spent — not asking again this session');
+        }
+        throw new Error('gemini ' + res.status);
+      }
       const j = await res.json();
       const txt = j?.candidates?.[0]?.content?.parts?.[0]?.text || '';
       const names = (JSON.parse(txt).a || []).filter(n => typeof n === 'string' && n.trim());
@@ -4683,7 +4698,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           // detection case rather than a reading one. ?gnames=all re-enables it
           // for nonfiction if that trade is ever worth making again.
           const gnames = new URLSearchParams(location.search).get('gnames') || 'on';
-          const wantNames = gnames !== '0' &&
+          const wantNames = gnames !== '0' && !geminiNamesSpent &&
             (section === 'fiction' || gnames === 'all');
           // Remember WHICH section the prompt was written for. The wrong-tab
           // guard below can flip the section after this call is already in
