@@ -4257,13 +4257,43 @@ Do NOT invent a book that is not in the photo, and do not merge two books into o
         }
         continue;
       }
+      const ocrText = lab.text;
+      const surOfT = t => (String(t || '').trim().toUpperCase()
+        .match(/^[A-Z][A-Z'-]*/) || [''])[0];
+      // Do not let a POSITIONALLY-PINNED pair overwrite a confident Azure
+      // surname with a different one. The model returned 62 names for 49
+      // labels on one shelf and the alignment slid by a place: a clean Azure
+      // read of "WALLACE. David" was replaced with a neighbour's name and the
+      // book vanished, taking with it the one genuine misfiling on that shelf
+      // (WALLACE filed ahead of every WALKER). A strong pair has the two
+      // engines agreeing that this IS the same sticker, so it may still
+      // rewrite; a pinned one was matched by position alone, and where its two
+      // surnames disagree the likelier explanation is that the pairing is off,
+      // not that Azure misread. Take only what the model is uniquely for.
+      if (!strong[p] && (lab.score ?? 0) >= 0.9) {
+        const os = surOfT(ocrText), ms = surOfT(names[pairs[p][1]]);
+        if (os && ms && os !== ms) continue;
+      }
       lab.text = names[pairs[p][1]];
       lab.gem = true;
       // A sticker two independent engines agree on is the most trustworthy
       // read the app gets; without this it stays under the red bar and can
       // only ever render yellow. Positionally-pinned ones deliberately do NOT
       // get that boost — trusted enough to sort, not enough to accuse alone.
-      if (strong[p]) lab.score = Math.max(lab.score ?? 0, 0.95);
+      //
+      // But `strong` is a SIMILARITY score, not agreement, and sim() rates a
+      // prefix match highly — so Azure's "WAGAMESE, Richard" and the model's
+      // "WAGAMES, Richard" came out strong, the model's dropped letter replaced
+      // the correct text, and the boost promoted it to 0.95. It then sorted
+      // away from the real WAGAMESE run and red-flagged a correctly shelved
+      // book, which is exactly what the fusion path's demote-on-disagreement
+      // rule exists to prevent. Require the two engines to agree on the part
+      // the SORT actually uses. The given name may differ freely — supplying it
+      // is the whole point of the model — but the surname decides where a book
+      // files, so a label may not accuse its neighbours until both engines read
+      // that the same way.
+      if (strong[p] && surOfT(ocrText) && surOfT(ocrText) === surOfT(lab.text))
+        lab.score = Math.max(lab.score ?? 0, 0.95);
       applied++;
     }
 
