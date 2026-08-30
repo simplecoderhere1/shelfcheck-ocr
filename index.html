@@ -5688,6 +5688,21 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   }
 
   function friendlyErrorMessage(err) {
+    // The month's reading allowance is the ONE failure the app can explain
+    // exactly, and it was the one it explained worst: primeQuota already knows
+    // the allowance is spent and when it comes back, and the banner still said
+    // "Analysis failed:" over a Retry button that cannot succeed until the
+    // reset. A volunteer reads that as the app being broken and keeps tapping.
+    if (azureDown && azureDownReason === 'quota') {
+      let when = '';
+      try {
+        const d = azureQuota && azureQuota.reset ? new Date(azureQuota.reset) : null;
+        if (d && !isNaN(d)) when = ` It resets on ${d.toLocaleDateString(undefined,
+          { day: 'numeric', month: 'long' })}.`;
+      } catch {}
+      return `This month's free reading allowance is used up.${when} ` +
+             `Photos taken now cannot be read.`;
+    }
     if (err.name === 'AbortError' || err.name === 'TimeoutError')
       return 'Reading timed out. Move closer, improve lighting, and tap Retry.';
     if (!navigator.onLine || /Failed to fetch|NetworkError/i.test(err.message))
@@ -5701,10 +5716,14 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     document.getElementById('errorBanner')?.remove();
     const banner = document.createElement('div');
     banner.id = 'errorBanner'; banner.className = 'error-banner';
-    banner.innerHTML = `<span class="error-banner-msg">${escapeHtml(message)}</span>
-      <button class="error-banner-retry" id="errBannerRetry">Retry</button>`;
+    // No Retry button when retrying cannot work. Offering one for a spent
+    // monthly allowance invites a volunteer to tap it until they give up on the
+    // app, when the honest answer is "not today".
+    const canRetry = !!onRetry && !(azureDown && azureDownReason === 'quota');
+    banner.innerHTML = `<span class="error-banner-msg">${escapeHtml(message)}</span>` +
+      (canRetry ? `<button class="error-banner-retry" id="errBannerRetry">Retry</button>` : '');
     parent.appendChild(banner);
-    document.getElementById('errBannerRetry').onclick = () => { banner.remove(); onRetry(); };
+    if (canRetry) document.getElementById('errBannerRetry').onclick = () => { banner.remove(); onRetry(); };
   }
 
   // ── Bounding box drawing (classic still-photo view only) ────────────────
