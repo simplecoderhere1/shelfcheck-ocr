@@ -39,8 +39,16 @@ const MONTH_BUDGET = 4900;
 // about 2.7 calls/photo. Reporting "photos left" against the worst case
 // would understate the real allowance by 4x (445 shelves rather than about
 // 1,800) and make the app look far closer to the wall than it is.
+//
+// 2.7 was derived, not measured, and it was optimistic. COUNTED on 2026-08-29
+// by intercepting every OCR POST while driving the real page over the ten
+// ground-truth photos: 4,3,4,4,3,3,3,4,4,1 -- 3.3 per photo overall and 3.5
+// for nonfiction, not 2.7. At 2.7 the app told the user 1,814 photos were left
+// when the true figure was 1,484, overstating the remaining month by 22% and
+// promising capacity it could not deliver. Re-count with _replay_app.mjs if
+// the number of passes changes again.
 const PHOTO_RESERVE = 11;
-const PHOTO_TYPICAL = 2.7;
+const PHOTO_TYPICAL = 3.3;
 
 const monthKey = (d = new Date()) =>
   `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
