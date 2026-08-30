@@ -701,9 +701,13 @@
   // to the previous engines, which is how the offline suites still run.
   let geminiReadEnabled = new URLSearchParams(location.search).get('noread') !== '1';
   // Read the shelf with the model when Azure's monthly allowance is spent.
-  // Default OFF: it changes what the app says, which is the owner's decision.
-  const OVERFLOW_FALLBACK = typeof location !== 'undefined' &&
-    new URLSearchParams(location.search).get('overflow') === '1';
+  // ON by default: an app that reads nothing at all for the rest of the month
+  // is worse than one reading with the weaker engine, and a model-only read
+  // cannot raise a red flag anyway (see the `_src` condition on the red gate in
+  // checkOrderOneShelf), so nobody is sent to a shelf on an inferred digit.
+  // ?overflow=0 turns it off.
+  const OVERFLOW_FALLBACK = typeof location === 'undefined' ||
+    new URLSearchParams(location.search).get('overflow') !== '0';
   let geminiTitlesEnabled = new URLSearchParams(location.search).get('notitles') === '1'
     ? false : (localStorage.getItem('shelfcheck.gemtitles') ?? '1') === '1';
 
@@ -986,7 +990,7 @@
     // intentionally gone: a failed Azure read surfaces as "couldn't read" rather
     // than a Gemini guess.
     //
-    // OVERFLOW, opt-in via ?overflow=1. The cost of that decision turned out to
+    // OVERFLOW, on by default (?overflow=0 disables). The cost of removing it
     // be larger than it looks: when the month's 4,900 calls run out the app has
     // no reader at all, and EVERY photo fails until the 1st -- reported live on
     // 2026-08-29 as "it just says error retry". That is potentially a fortnight
@@ -999,8 +1003,9 @@
     // from red to amber. A model-only read can therefore say "check this one"
     // but never "move it" -- nobody is sent anywhere on an inferred digit.
     //
-    // Kept opt-in regardless, because it changes what the app will say on a
-    // shelf and that is the owner's call, not this function's.
+    // The model's own free tier is small and 429s after a handful of calls, so
+    // this softens the outage rather than removing it; when it has nothing left
+    // the read falls through to the banner, which names the cause and the date.
     if (OVERFLOW_FALLBACK && azureDown && azureDownReason === 'quota') {
       console.log('[perf] azure allowance spent — reading with the model (overflow)');
       return callGeminiReadMerged(src, getSection(), signal).catch(err => {
