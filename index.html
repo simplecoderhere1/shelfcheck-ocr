@@ -700,6 +700,10 @@
   // Gemini reads the labels themselves (not just titles). ?noread=1 falls back
   // to the previous engines, which is how the offline suites still run.
   let geminiReadEnabled = new URLSearchParams(location.search).get('noread') !== '1';
+  // Read the shelf with the model when Azure's monthly allowance is spent.
+  // Default OFF: it changes what the app says, which is the owner's decision.
+  const OVERFLOW_FALLBACK = typeof location !== 'undefined' &&
+    new URLSearchParams(location.search).get('overflow') === '1';
   let geminiTitlesEnabled = new URLSearchParams(location.search).get('notitles') === '1'
     ? false : (localStorage.getItem('shelfcheck.gemtitles') ?? '1') === '1';
 
@@ -980,8 +984,30 @@
     // or past its 5,000/month quota (it already returned null whenever Azure was
     // healthy, so it never touched the normal assembly). That fallback is now
     // intentionally gone: a failed Azure read surfaces as "couldn't read" rather
-    // than a Gemini guess. Stub kept because runOcr still calls it; the
-    // callGemini* / fuseLabels gem-path below is now dead code.
+    // than a Gemini guess.
+    //
+    // OVERFLOW, opt-in via ?overflow=1. The cost of that decision turned out to
+    // be larger than it looks: when the month's 4,900 calls run out the app has
+    // no reader at all, and EVERY photo fails until the 1st -- reported live on
+    // 2026-08-29 as "it just says error retry". That is potentially a fortnight
+    // of no app, not an edge case.
+    //
+    // The reason given for removing it was that a volunteer acting on a digit
+    // Gemini inferred is sent to the wrong book. That risk is already handled
+    // elsewhere, and was when the fallback was removed: the red gate in
+    // checkOrderOneShelf demotes any book whose `_src` is not 'azure' or 'both'
+    // from red to amber. A model-only read can therefore say "check this one"
+    // but never "move it" -- nobody is sent anywhere on an inferred digit.
+    //
+    // Kept opt-in regardless, because it changes what the app will say on a
+    // shelf and that is the owner's call, not this function's.
+    if (OVERFLOW_FALLBACK && azureDown && azureDownReason === 'quota') {
+      console.log('[perf] azure allowance spent — reading with the model (overflow)');
+      return callGeminiReadMerged(src, getSection(), signal).catch(err => {
+        console.log('[perf] overflow read failed:', err && err.message);
+        return null;
+      });
+    }
     return Promise.resolve(null);
   }
 
