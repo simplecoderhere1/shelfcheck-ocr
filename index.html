@@ -1924,9 +1924,24 @@
       const i = keep.findIndex(o => kind(o) === k && overlapMin(o, w) >= 0.55);
       if (i < 0) { keep.push(w); continue; }
       const dup = keep[i];
-      const better = w.t.length !== dup.t.length
-        ? w.t.length > dup.t.length
-        : (w.c ?? 0.9) > (dup.c ?? 0.9);
+      // Length first, confidence only to break a tie -- except when the two
+      // confidences are far apart, and then length is the wrong order. Azure
+      // returned "WALL" at 0.22 and "WAL" at 0.97 for one sticker; keeping the
+      // longer discarded the clean read, the stub paired with the garble, and
+      // 641.568 WAL was lost. A whole extra character read at a fifth of the
+      // confidence is not more of the word, it is noise on the end of it.
+      //
+      // ...and only for LETTERS. On a number, a longer read means more decimal
+      // places were actually captured -- "635.048" over "635" is strictly more
+      // information, and preferring confidence there cost two books for the one
+      // it fixed. On a cutter there is nothing more to capture beyond the tag,
+      // so an extra character at a fifth of the confidence is noise on the end.
+      const dc = (w.c ?? 0.9) - (dup.c ?? 0.9);
+      const better = (k === 'a' && Math.abs(dc) >= 0.4)
+        ? dc > 0
+        : (w.t.length !== dup.t.length
+            ? w.t.length > dup.t.length
+            : dc > 0);
       if (better) keep[i] = w;
     }
     return keep;
