@@ -2221,9 +2221,40 @@
     // text-HEIGHT term on top of the shared width term — otherwise a wide number
     // reaches into the neighbouring spine and steals its tag.
     const pairs = [];
+    // Two reads of ONE cutter, where one is a fragment of the other, must not
+    // both stand as candidates. Azure returns "LAI" (0.96) and "AL" (0.64) for
+    // the same three letters, and the pairing below scores on geometry alone --
+    // so the wide call number above them, whose centre sits to the right, picks
+    // the SHORTER fragment because it happens to be nearer that centre. The
+    // book then has cutter "AL", fails the shape gate, and "LAI" is left over
+    // and refused by the anchorless path because a label already occupies its
+    // slot. Measured: that is how 641.5686 LAI is lost.
+    //
+    // A confidence term in the score was tried before and did nothing (noted
+    // below), but this is not confidence -- it is one word being a strict
+    // fragment of another at the same place, which cannot be two books.
+    const dropped = new Set();
+    for (const a of small) {
+      const la = a.t.toUpperCase().replace(/[^A-Z]/g, '');
+      if (la.length < 2 || la.length > 4) continue;
+      for (const b of small) {
+        if (a === b) continue;
+        const lb = b.t.toUpperCase().replace(/[^A-Z]/g, '');
+        // Longer AND at least as confident. "AL" is not a substring of "LAI" --
+        // the letters are not contiguous, it is a MISREAD of the same sticker,
+        // not a fragment of it -- so a substring test misses exactly the case
+        // this exists for. Two overlapping cutter reads are one sticker; keep
+        // the one that saw more of it and was surer.
+        if (lb.length <= la.length || (b.c ?? 0) < (a.c ?? 0)) continue;
+        const ix = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+        const iy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+        if (ix > 0 && iy > 0 && (ix * iy) / Math.max(1, a.w * a.h) >= 0.5) { dropped.add(a); break; }
+      }
+    }
+
     for (const s of stubs) {
       for (const w of small) {
-        if (used.has(w)) continue;
+        if (used.has(w) || dropped.has(w)) continue;
         const u = w.t.toUpperCase().replace(/0/g, 'O').replace(/1/g, 'I');
         if (!AZ_RX_CUTTER.test(u)) continue;
         const dy = w.y - s.curBottom;
