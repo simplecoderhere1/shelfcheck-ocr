@@ -2455,6 +2455,63 @@
       if (_near(w)) console.log(`[probe] anchorless ${JSON.stringify(w.t)} ACCEPTED`);
     }
 
+    // A WELD that no label claimed: Azure returned the call number and its
+    // cutter glued into one word ("56STA"), which matches neither the number
+    // pattern nor the cutter pattern, so no anchor and no tag were ever seen.
+    //
+    // Splitting it and leaving the letters for the anchorless path does not
+    // work -- traced: the bare cutter is refused by the "real hole in the row"
+    // guard, which is load-bearing for precision and must not be loosened. So
+    // build the label here instead. The digits are usually a FRAGMENT of the
+    // number ("56" of 641.5676), useless as an anchor, but the nearest label in
+    // the same row has the number, and on these shelves a row shares one.
+    //
+    // The evidence is strong and specific: digits and letters read TOGETHER in
+    // one small word on a light sticker is the shape of a call number and
+    // almost nothing else. Guarded to the shelf's own cutter length, to a word
+    // that passed the sticker light gate, and to a row whose neighbour supplies
+    // the number -- and it must not duplicate a cutter the row already has.
+    {
+      const WELD = /^(\d{2,3}(?:[.,]\d+)?)([A-Za-z][A-Za-z'.-]{1,5})$/;
+      const cutLen = dominantCutLen(labels);
+      const claimed = new Set(labels.map(l => String(l.cut || '').toUpperCase()));
+      for (const w of small) {
+        if (used.has(w)) continue;
+        const m = WELD.exec(String(w.t).trim());
+        if (!m) continue;
+        const tag = m[2].replace(/[^A-Za-z]/g, '').toUpperCase();
+        if (!tag || (cutLen && tag.length !== cutLen)) continue;
+        if (claimed.has(tag)) continue;
+        if (lightRatio(ctx, w.x - 4, w.y - 4, w.w + 8, w.h + 8) < 0.35) continue;
+        // The number comes from the nearest label on the same row. Row
+        // CONSENSUS was tried and is worse -- it reaches across to a different
+        // run and gave 641.568 for a 641.5676 book, where nearest gave 641,
+        // which is at least a true prefix of it.
+        let near = null, bestD = Infinity;
+        for (const l of labels) {
+          if (!l.num || !l.bbox) continue;
+          const dy = Math.abs((l.bbox[1] + l.bbox[3] / 2) - (w.y + w.h / 2));
+          if (dy > w.h * 4) continue;
+          const d = Math.abs((l.bbox[0] + l.bbox[2] / 2) - (w.x + w.w / 2));
+          if (d < bestD) { bestD = d; near = l; }
+        }
+        if (!near) continue;
+        claimed.add(tag);
+        used.add(w);
+        labels.push({
+          text: near.num + ' ' + tag, num: near.num, cut: tag,
+          ambiguousTail: false, unclear: true, malformed: false,
+          numBox: [w.x, w.y, w.w, w.h], bbox: [w.x, w.y, w.w, w.h],
+          // Below RED_MIN_SCORE deliberately. The cutter was read but the
+          // NUMBER was inherited from a neighbour, so this label may sort and
+          // may be shown, and may never be the reason a book is called
+          // misshelved. Same invariant the overflow reader is held to.
+          score: Math.min(w.c ?? 0.9, 0.5),
+          truncated: true,
+        });
+      }
+    }
+
     return dedupeStickerLabels(keepUnpaired ? labels : labels.filter(l => l.cut));
   }
 
