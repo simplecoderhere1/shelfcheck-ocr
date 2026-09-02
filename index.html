@@ -4782,6 +4782,12 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // cut off" verdict) was dead in the shipping build.
       truncated:      !!l.truncated,
       unclear:        !!l.unclear,
+      // ...and `gem` was the next casualty of the same whitelist. It is set by
+      // alignNamesToLabels when the vision model read this shelf independently
+      // and matched this label -- 42 of 44 labels on one audit photo -- and it
+      // died here, so labelsToBooks saw undefined and every book shipped with
+      // _gem:false. Every rule that depends on it has therefore never fired.
+      gem:            !!l.gem,
     }));
 
     // Shape gate: a label that does not look like a label this library issues
@@ -6469,7 +6475,22 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // yellow; the red-vs-yellow gate lives in checkOrderOneShelf's final pass.
     // Genuinely weak reads (score < 0.5, e.g. the 0.4 low-confidence tier) and
     // score-less "uncertain" GT rows (_score undefined) stay unsortable/yellow.
-    if (book.confidence === 'low' && !(book._score >= 0.5) && !book._numCorroborated) return null;
+    // ...or when the VISION MODEL read the same label independently.
+    //
+    // The score is the MINIMUM confidence across a label's words, so one shaky
+    // glyph sinks an otherwise perfect read. Measured on the audit corpus, two
+    // of the four misfilings the app finds but will not call are exactly that:
+    // "WEISBERGER, Lauren" at 0.30 and "TATA, A.J." at 0.23, both
+    // character-for-character correct, both left unsortable and shown amber.
+    //
+    // `_gem` means a second, independent engine read the same shelf and agreed
+    // on this label. That is corroboration, not a lowered bar -- the same
+    // reasoning as _numCorroborated above, and the general rule holds on any
+    // shelf: two engines agreeing beats one engine's confidence number. The
+    // red bar (RED_MIN_SCORE) is applied separately, so this lets a book be
+    // sorted and judged; it does not by itself make it red.
+    if (book.confidence === 'low' && !(book._score >= 0.5) &&
+        !book._numCorroborated && !book._gem) return null;
     const vol   = extractVolume(book);
     // Titles must never tie-break unless human/OL-verified: Gemini titles are
     // frequently unverified (verifyTitlesOpenLibrary's timeout/budget-abort
