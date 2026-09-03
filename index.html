@@ -4091,6 +4091,21 @@
   // worst case at ~4.85s against the 5s bar. Raising it to 4s pushed the tail
   // to 5.2-5.7s; lowering it much further starts losing draws that would have
   // landed (the call itself measures 2.4-3.2s typically).
+  //
+  // SUPERSEDED by a7f1708, and the paragraph above is kept only because its
+  // latency arithmetic is still right -- its CONCLUSION is not. Instrumenting
+  // whether the names actually arrive showed they landed on 0 of 6 fiction runs
+  // at 3.5s, so everything measured at that deadline was measuring the fallback
+  // path rather than the model. At 4.5s they land about half the time and
+  // fiction reading goes 69.0% -> 76.0%.
+  //
+  // The cost is real and is a deliberate trade, not an oversight: a dense
+  // fiction shelf now runs 4.3-5.7s and does breach the 5s bar on some draws
+  // (measured 2026-09-02 on a 42-book shelf: 3.0 / 4.3 / 4.3 / 5.3 / 5.6 / 5.7).
+  // Nonfiction is unaffected -- it skips the call entirely and runs ~1.8s mean.
+  // Do not "fix" the breach by lowering this back to 3.5s without re-reading
+  // a7f1708: that buys ~0.7s off the tail and gives up seven points of fiction
+  // reading, which is the wrong way round.
   const GEMINI_NAMES_TIMEOUT_MS = 4500;
   // Long edge of the frame sent to the model. NOT the same as the Azure frame:
   // see the note at the call site — smaller is what makes this land while three
@@ -6588,6 +6603,10 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
   // Counts how many entries on THIS shelf carry each exact surname string —
   // see the corroboration check where it's used.
   let CURRENT_SURNAME_COUNTS = null;
+  // Where each fully-read author name ("murray jamess") sits on the current
+  // shelf. Built beside CURRENT_SURNAME_COUNTS; read only by the sameauthor
+  // pass, to tell a repeated real name from a one-off garbled one.
+  let CURRENT_AUTHOR_POS = null;
 
   function compareKeys(a, b) {
     if (a.kind !== b.kind) return a.kind === 'dewey' ? -1 : 1;
@@ -6856,9 +6875,22 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     for (const i of misreads) keys[i] = null;
 
     CURRENT_SURNAME_COUNTS = new Map();
-    for (const k of keys) {
+    // ...and the same census for the FULL author name. A garbled given name is
+    // a one-off -- "Eud" happens once on a shelf of Eudoras -- while a real
+    // author with several books on the shelf has their whole name read the same
+    // way more than once, on physically different spines. That is the one piece
+    // of evidence the sameauthor pass below can use to tell the two apart; see
+    // the note there. Indexed positionally so a corroborating copy can be
+    // required to sit somewhere ELSE on the shelf.
+    CURRENT_AUTHOR_POS = new Map();
+    for (let ki = 0; ki < keys.length; ki++) {
+      const k = keys[ki];
       if (!k || k.kind !== 'str' || !k.val) continue;
       CURRENT_SURNAME_COUNTS.set(k.val, (CURRENT_SURNAME_COUNTS.get(k.val) || 0) + 1);
+      if (!k.first) continue;
+      const full = k.val + '|' + k.first;
+      if (!CURRENT_AUTHOR_POS.has(full)) CURRENT_AUTHOR_POS.set(full, []);
+      CURRENT_AUTHOR_POS.get(full).push(ki);
     }
 
     const vIdx = []; keys.forEach((k, i) => { if (k) vIdx.push(i); });
@@ -7173,7 +7205,52 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
           if (!(corroborated && namesDisagree) &&
               a0.length >= NAME_PREFIX_MIN && b0.length >= NAME_PREFIX_MIN &&
               (a0.startsWith(b0) || b0.startsWith(a0))) return true;
-          return dir < 0 ? compareFiling(v, sur) <= 0 : compareFiling(sur, v) <= 0;
+          // FIFTH ATTEMPT (2026-09-02), and the first one with evidence behind
+          // it. Everything above stands: a given name may NOT accuse on its own.
+          // But read the four failures again -- "WELTY Eud" for Eudora, "TILLY,
+          // Med" for Meg, "WHITE Kafe" for Kate, and the WALKER shelf's "Ann
+          // Mario" / "waren" -- and they are all the SAME shape. Every one is a
+          // garble that occurs ONCE. Attempt (a) already identified the missing
+          // ingredient ("a given name verified in the READER") but looked for it
+          // in the wrong place: it asked for a second read of the same sticker,
+          // which the reader merges away before checkOrder ever sees it.
+          //
+          // The verification does exist, and it survives that merge, because it
+          // is not a second read -- it is a second BOOK. An author with several
+          // books on a shelf has their whole name read identically on several
+          // physically separate spines; OCR does not garble the same name the
+          // same way twice at different points on the shelf. So: compare given
+          // names only when BOTH sides' full author names are corroborated by a
+          // copy standing elsewhere on this shelf.
+          //
+          // That is the exact discriminator. On the reported photo "MURRAY,
+          // James S." is read four times (0.99 / 0.97 / 0.95 / 0.95) and the
+          // flank "MURRAY, Amita" three times, so the stranded copy filed ahead
+          // of the Amita run is judged and goes red. "WELTY Eud" is read once,
+          // scores no corroboration, and stays demoted exactly as before -- as
+          // do all four historical false positives, none of which can reach a
+          // count of two. It is the same corroboration test compareKeys already
+          // applies to SURNAMES (CURRENT_SURNAME_COUNTS), just extended to the
+          // rest of the name.
+          //
+          // Distance >= 2 so a garble cannot corroborate itself off an adjacent
+          // duplicate read, and nameSlip still absorbs an ordinary truncation
+          // ("Jame" vs "James"), so this can only ever fire on two names that
+          // are both repeated AND unmistakably different.
+          const corrob = idx => {
+            const k = keys[idx];
+            if (!k || k.kind !== 'str' || !k.val || !k.first || !CURRENT_AUTHOR_POS) return false;
+            const at = CURRENT_AUTHOR_POS.get(k.val + '|' + k.first) || [];
+            return at.some(p => Math.abs(p - idx) >= 2);
+          };
+          const surCmp = dir < 0 ? compareFiling(v, sur) : compareFiling(sur, v);
+          if (surCmp > 0) return false;              // real cross-author stranding
+          if (surCmp === 0 && corrob(i) && corrob(j)) {
+            const gI = keys[i].first || '', gJ = keys[j].first || '';
+            if (gI && gJ && !nameSlip(gI, gJ))
+              return dir < 0 ? compareFiling(gJ, gI) <= 0 : compareFiling(gI, gJ) <= 0;
+          }
+          return true;
         };
         if (flankOk(L, -1) && flankOk(R, 1)) {
           checked[i].outOfOrder = false; checked[i].possiblyOutOfOrder = true;
@@ -7713,6 +7790,15 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         _ambiguousTail:     !!b._ambiguousTail,
         _malformed:         !!b._malformed,
         _why:               b._why ?? null,
+        // computeFlaggedSuppressed filters on `_bbox` and collapses overlapping
+        // boxes with it, so a harness that reads these books and then calls it
+        // suppressed NOTHING and scored the raw verdict list instead of the
+        // boxes on screen. Three live harnesses did exactly that. `_gem` is
+        // here for the same reason: the ordering rules read it, and this is the
+        // second time a whitelist has quietly starved them (see 893685c).
+        _bbox:              b._bbox ? Array.from(b._bbox) : null,
+        _gem:               !!b._gem,
+        _inserted:          !!b._inserted,
       })),
     });
 
