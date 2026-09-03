@@ -5886,6 +5886,18 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       for (let j = i + 1; j < toks.length; j++) {
         if (toks[i] === toks[j]) return true;
         if (toks[i].length >= 4 && (toks[j].startsWith(toks[i]) || toks[i].startsWith(toks[j]))) return true;
+        // The damage does not always land on the head. "TORRAY URRAY, abina" is
+        // one MURRAY sticker read twice with a neighbour's ink bled into the
+        // first copy: neither token contains the other, so the prefix tests
+        // above miss it and the volunteer gets a yellow box captioned with
+        // gibberish. A four-character shared TAIL between two five-character
+        // tokens is the same fingerprint from the other end. Both lengths are
+        // deliberately long: JOHNSON/JACKSON share 3, HOUTEN/KIRSTEN share 3.
+        if (toks[i].length >= 5 && toks[j].length >= 5) {
+          let n = 0; const m = Math.min(toks[i].length, toks[j].length);
+          while (n < m && toks[i][toks[i].length - 1 - n] === toks[j][toks[j].length - 1 - n]) n++;
+          if (n >= 4) return true;
+        }
       }
     }
     return false;
@@ -6920,6 +6932,13 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // violation). The demotion it disables is doing real work. Left exactly
       // as-is, deliberately.
       const crossConfirmed = checked[i]._score >= STRONG_ANCHOR && !checked[i]._malformed && !checked[i]._truncated;
+      // "Strong" means the read is trustworthy, and OCR confidence is only one
+      // way to establish that -- a sticker the vision model read the same way is
+      // verified by a second, independent engine, which is better evidence than
+      // any single-engine number. Hoisted out of the Dewey branch below because
+      // the SURNAME branch needs exactly the same test and never had one.
+      const isStrong = k => (checked[k]._score ?? 0) >= STRONG_ANCHOR ||
+                            (!!checked[k]._gem && !checked[k]._inserted);
       let demote = !crossConfirmed && compareKeys(kL, kR) === 0;
       if (!demote && kL.kind === kR.kind && kM.kind === kL.kind) {
         const vL = kL.kind === 'str' ? kL.val : String(kL.val.num ?? '');
@@ -6931,12 +6950,35 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       }
       if (!demote && kM.kind === 'str') {
         const vM = kM.val || '';
-        for (const kN of [kL, kR]) {
+        for (const [kN, nIdx] of [[kL, L], [kR, R]]) {
           if (kN.kind !== 'str') continue;
           const vN = kN.val || '';
           const minLen = Math.min(vM.length, vN.length);
-          if (vM !== vN && ((minLen >= 5 && editDistance(vM, vN) <= 2) ||
-                            (minLen >= 4 && editDistance(vM, vN) <= 1))) { demote = true; break; }
+          // Two confident reads that are NOT a truncation of one another are
+          // two different surnames, not one sticker read twice.
+          //
+          // Edit distance alone cannot tell those apart, and shelving is what
+          // makes that fatal: the surnames closest in spelling are exactly the
+          // ones filed next to each other. MURPHY and MURRAY are two edits
+          // apart, both read at 0.99, and this rule quietly ate the genuine
+          // misfile sitting between them (James S. Murray's "The Stowaway"
+          // filed ahead of the three Amita Murrays).
+          //
+          // The truncation test is what keeps that safe. A real garble on a
+          // dense run drops characters off the END -- "WALKE" beside "WALKER",
+          // and Azure will hand back a truncated word at 0.9+ perfectly
+          // happily, so confidence on its own is NOT enough (measured: without
+          // this clause "WALKER Boo" goes red on a photo whose audit lists it
+          // as must-not-flag). An internal substitution between two confident
+          // reads is a different matter: OCR does not turn RRAY into RPHY.
+          // Scoped to the edit-distance test only -- the shared-prefix test
+          // below is the TREMBLAY/TREMBES family case and keeps its old
+          // behaviour untouched.
+          const truncation = vM.startsWith(vN) || vN.startsWith(vM);
+          const bothSure = isStrong(i) && isStrong(nIdx) && !truncation;
+          if (!bothSure && vM !== vN &&
+              ((minLen >= 5 && editDistance(vM, vN) <= 2) ||
+               (minLen >= 4 && editDistance(vM, vN) <= 1))) { demote = true; break; }
           // Long shared prefix: several damaged reads of ONE surname. A dense
           // author run returns "TREMBLAY", "TREMBES", "TREMBL", "TREME" for the
           // same five books; the tails diverge too far for edit distance (3+)
@@ -6965,11 +7007,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         // 635 WHA). Require the flagged read to actually look like the weaker
         // one — a genuine misread is not more confident than the sticker it
         // was misread from.
-        // "Strong" means the read is trustworthy, and OCR confidence is only
-        // one way to establish that. A sticker the vision model read the same
-        // way is verified by a second, independent engine, which is better
-        // evidence than any single-engine number -- so it clears this bar
-        // whatever Azure scored it.
+        // `isStrong` (hoisted above) is what "trustworthy" means here.
         //
         // This is what the gate was costing: on 195907424 the live read is
         // PERFECT, all 20 labels matching ground truth including the
@@ -6978,8 +7016,6 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         // WHI at 0.90 flags 635 WHA red and its partner yellow, correctly. A
         // 0.08 confidence difference was deciding whether a real misfile was
         // caught.
-        const isStrong = k => (checked[k]._score ?? 0) >= STRONG_ANCHOR ||
-                              (!!checked[k]._gem && !checked[k]._inserted);
         const sM = checked[i]._score ?? 0;
         for (const [kN, nIdx] of [[kL, L], [kR, R]]) {
           const cN = kN.val.cut || '';
@@ -7548,6 +7584,18 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         const bad = dir > 0 ? compareKeys(keys[i], keys[j]) > 0
                             : compareKeys(keys[j], keys[i]) > 0;
         if (!bad) continue;
+        // ...but only when it is genuinely undecidable, which the rule above
+        // asserts and never tested. A partner whose own key is repeated by
+        // UNFLAGGED books elsewhere in the row is confirmed in place by its own
+        // copies: there is nothing for a volunteer to decide, and the "the book
+        // between them was unreadable" story does not apply. Measured on a
+        // MURPHY shelf: MUNAWEERA sitting alone inside a run of twenty MURPHYs
+        // is an unambiguous red, and this rule put a yellow on one of six
+        // identical "MURPHY, Monica" reads whose five siblings were green.
+        if (checked.some((o, k) => k !== j && keys[k] &&
+              !o.outOfOrder && !o.unverifiable && !o.possiblyOutOfOrder &&
+              (books[k].shelfRow ?? 0) === (books[j].shelfRow ?? 0) &&
+              compareKeys(keys[k], keys[j]) === 0)) continue;
         checked[j].possiblyOutOfOrder = true;
         checked[j].idealPosition = null;
         checked[j]._why = 'pair';
@@ -7727,6 +7775,10 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     malformed: 'This does not have the shape of a call label',
     nokey:     'No sortable call number could be read from this spine',
     lowconf:   'Read confidence too low to accuse on',
+    // The partner of a red flag. This had no entry at all, so `amberReason`
+    // returned null and the card rendered with a yellow box and no explanation
+    // under it -- the least actionable thing the app can show.
+    pair:      'The book beside this one is flagged — either could be the one out of place',
   };
   function amberReason(book) {
     return book.outOfOrder ? null : (AMBER_WHY[book._why] || null);
