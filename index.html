@@ -5425,7 +5425,36 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       // Promise.all, and a failure just returns null.
       // When Gemini is the label reader it already returns titles in the same
       // response, so a second titles call would be a redundant round trip.
-      const titlesP = (geminiTitlesEnabled && !geminiReadEnabled && encoded?.blob)
+      //
+      // ...and the same is true whenever a NAMES call is already in flight for
+      // this photo, which on fiction it always is. Two model calls on one image
+      // do not run for free: they compete, and the one ordering depends on is
+      // the one that loses. Measured on a 42-book fiction shelf, every run
+      // logged `gemini names skipped: signal is aborted without reason` -- the
+      // names call spent its whole 4.5s deadline and returned NOTHING, while
+      // runOcr sat waiting on titles until ~4.7s. Dropping the titles call on
+      // that photo: first render 4.8s -> 2.5-3.0s, and the names went from
+      // aborted every time to 40 of 42 labels taken from the model. So the 7
+      // points of fiction reading that a7f1708 bought with a 4.5s deadline were
+      // being thrown away by a call that cannot affect the answer.
+      //
+      // It cannot affect the answer because a title only ever tie-breaks when
+      // it is OPEN LIBRARY VERIFIED -- sortKey resolves an unverified title to
+      // '' precisely so a model guess can never move a book. Measured: 0 of
+      // 1266 books across the whole fixture corpus have title_verified, and 0
+      // of 42 on this photo. Titles are display-only in practice, so trading
+      // them for the names is not a close call.
+      //
+      // Nonfiction is untouched: it makes no names call (a7f1708), so there is
+      // nothing to compete with and it already renders in ~1.8s.
+      // FOLLOW-UP, not done here: callGeminiTitles' prompt returns
+      // [sticker_text, title] per book in shelf order -- column 0 is exactly
+      // what callGeminiNames asks for. One call could serve both and halve
+      // fiction's model usage against the 500/day free tier. Not swapped blind:
+      // name quality drives fiction reading and that prompt is unmeasured as a
+      // names source.
+      const titlesP = (geminiTitlesEnabled && !geminiReadEnabled && encoded?.blob
+                       && namesSection !== section)
         ? callGeminiTitles(encoded.blob, section, signal)
         : Promise.resolve(null);
 
