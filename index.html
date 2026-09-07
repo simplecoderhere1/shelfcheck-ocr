@@ -7637,7 +7637,32 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         const mine = sur(b.spine_label);
         const twin = mine && checked.some(o => o !== b && !o._malformed &&
                                                sur(o.spine_label) === mine);
-        if (twin) {
+        // The `twin` test alone was too coarse: a surname-only read whose
+        // SURNAME sorts out of order at the surname level -- a stray "TATA"
+        // physically sitting AFTER the whole TAWADA run (TATA < TAWADA) -- has
+        // twins (the 7 real Tatas at the start of the shelf) yet its misfiling
+        // has nothing to do with a missing given name. Keep it RED when the
+        // surname ITSELF is misplaced against the nearest STRONG, in-order
+        // (LIS-backbone) neighbour on either side -- the exact surname-level,
+        // strong-anchor evidence the sameauthor flank rule already trusts.
+        // Cannot red a correctly-shelved book: a correct surname is, by
+        // definition, in order against its confirmed in-order flanks.
+        const bi = checked.indexOf(b);
+        let surnameMisplaced = false;
+        if (keys[bi] && keys[bi].kind === 'str') {
+          const surI = keys[bi].val || '';
+          let L = bi - 1;
+          while (L >= 0 && !(keys[L] && keys[L].kind === 'str' && lisGlobal.has(L) &&
+                             checked[L]._score >= STRONG_ANCHOR)) L--;
+          let R = bi + 1;
+          while (R < checked.length && !(keys[R] && keys[R].kind === 'str' && lisGlobal.has(R) &&
+                                         checked[R]._score >= STRONG_ANCHOR)) R++;
+          if (L >= 0 && (keys[L].val || '') !== surI &&
+              compareFiling(keys[L].val || '', surI) > 0) surnameMisplaced = true;
+          if (R < checked.length && (keys[R].val || '') !== surI &&
+              compareFiling(surI, keys[R].val || '') > 0) surnameMisplaced = true;
+        }
+        if (twin && !surnameMisplaced) {
           b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
           b._why = 'nogiven';
         }
