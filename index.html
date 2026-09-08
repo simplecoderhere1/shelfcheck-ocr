@@ -669,6 +669,14 @@
   // fall back to on-device title reading rather than hold up the result.
   const GEMINI_TITLE_TIMEOUT_MS = 9000;
   const OCR_TIMEOUT_MS = 20000;
+  // Wall-clock cap on the WHOLE analysis. A normal read is ~3-4s and even a
+  // dense shelf on a slow phone lands well under this; past it, one hung
+  // network call (a stalled Azure/Gemini request the per-call timeout hasn't
+  // given up on yet) is holding the volunteer on a spinner. Rather than let
+  // that run 20s+, abort and offer "Try again" -- a fresh attempt almost always
+  // draws a fast response. Measured: the one 21.5s outlier in the corpus was a
+  // single stalled call on an otherwise-normal shelf.
+  const ANALYSIS_HARD_CAP_MS = 12000;
 
   // ── Gemini as the primary READER (measured 2026-07-27) ────────────────────
   // Gemini reads a whole shelf in ~3.5s at 89.6% label recall AND returns
@@ -5768,6 +5776,15 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     advanceStage();  // → "Reading labels"
 
     let ocrData, apiTime;
+    // Hard wall-clock cap: if the analysis stalls (one hung call), abort and
+    // fall through to the Retry banner instead of spinning for 20s+. A separate
+    // flag from analysisCancelled so the catch below knows it was a timeout,
+    // not a user cancel, and shows the right message.
+    let analysisTimedOut = false;
+    const capTimer = setTimeout(() => {
+      analysisTimedOut = true;
+      analysisAbort?.abort();
+    }, ANALYSIS_HARD_CAP_MS);
     try {
       const t0 = performance.now();
       ocrData = await runOcr(encoded, analysisAbort.signal, () => {
@@ -5780,10 +5797,16 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         enterReadingPreview(boxes.length);
       });
       apiTime = Math.round(performance.now() - t0);
+      clearTimeout(capTimer);
     } catch (err) {
+      clearTimeout(capTimer);
       if (analysisCancelled) return;
       hideLoading();
-      showErrorBanner(friendlyErrorMessage(err), () => analyzeShelf());
+      showErrorBanner(
+        analysisTimedOut
+          ? 'This is taking longer than usual — tap Try again.'
+          : friendlyErrorMessage(err),
+        () => analyzeShelf());
       analyzeBtn.disabled    = false;
       analyzeBtn.textContent = 'Analyze';
       return;
@@ -5843,7 +5866,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
              `Photos taken now cannot be read.`;
     }
     if (err.name === 'AbortError' || err.name === 'TimeoutError')
-      return 'Reading timed out. Move closer, improve lighting, and tap Retry.';
+      return 'Reading timed out. Move closer, improve lighting, and tap Try again.';
     if (!navigator.onLine || /Failed to fetch|NetworkError/i.test(err.message))
       return "Couldn't reach the server. Check your connection.";
     if (err.status === 429) return 'Server is busy — wait a moment and retry.';
@@ -5860,7 +5883,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // app, when the honest answer is "not today".
     const canRetry = !!onRetry && !(azureDown && azureDownReason === 'quota');
     banner.innerHTML = `<span class="error-banner-msg">${escapeHtml(message)}</span>` +
-      (canRetry ? `<button class="error-banner-retry" id="errBannerRetry">Retry</button>` : '');
+      (canRetry ? `<button class="error-banner-retry" id="errBannerRetry">Try again</button>` : '');
     parent.appendChild(banner);
     if (canRetry) document.getElementById('errBannerRetry').onclick = () => { banner.remove(); onRetry(); };
   }
