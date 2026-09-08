@@ -29,6 +29,8 @@
       --accent-hi: #60a5fa;
       --bad:       #ef4444;
       --bad-bg:    #3f1013;
+      --chk:       #f97316;
+      --chk-bg:    #3a1e08;
       --warn:      #eab308;
       --warn-bg:   #3d2c07;
       --good:      #22c55e;
@@ -449,6 +451,7 @@
        carries the status colour further down a dim aisle than a 9px circle. */
     .flagged-item-dot { flex-shrink: 0; width: 3px; height: 26px; border-radius: 2px; }
     .flagged-item-dot-bad { background: var(--bad); }
+    .flagged-item-dot-chk { background: var(--chk); }
     .flagged-item-dot-unv { background: var(--warn); }
     .flagged-item-text { flex: 1; min-width: 0; }
     .flagged-item-label {
@@ -463,7 +466,12 @@
       border-radius: 999px; letter-spacing: .02em;
     }
     .flagged-item-status-bad { background: var(--bad-bg); color: #fca5a5; }
+    .flagged-item-status-chk { background: var(--chk-bg); color: #fdba74; }
     .flagged-item-status-unv { background: var(--warn-bg); color: #fde047; }
+    /* Three-colour legend under the flagged-list header. */
+    .flagged-legend { display: flex; flex-wrap: wrap; gap: 10px 14px; padding: 4px 2px 10px; }
+    .flagged-legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #9a9a9a; }
+    .flagged-legend-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
 
     /* Stage-based loading */
     .stage-list { display: flex; flex-direction: column; gap: 13px; width: 100%; max-width: 220px; }
@@ -574,7 +582,7 @@
     <div class="photo-placeholder" id="photoPlaceholder">
       <div class="pick-btns">
         <p class="pick-title">Check a shelf</p>
-        <p class="pick-sub">Photograph a shelf and ShelfCheck marks anything filed out of order.</p>
+        <p class="pick-sub">Photograph a shelf and ShelfCheck marks each book: <b style="color:#ef4444">red</b> = out of order, move it · <b style="color:#f97316">orange</b> = might be out of place, check it · <b style="color:#eab308">yellow</b> = couldn't read the label, check by hand.</p>
         <button class="pick-btn pick-btn-camera" id="takePicBtn" aria-label="Take photo with camera">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false">
             <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
@@ -601,6 +609,10 @@
           <div class="pick-tip">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M4 19V6a2 2 0 0 1 2-2h3v15H6a2 2 0 0 0-2 2z"/><path d="M20 19V6a2 2 0 0 0-2-2h-3v15h3a2 2 0 0 1 2 2z"/></svg>
             <span>One or two shelves at a time reads better than a whole bay.</span>
+          </div>
+          <div class="pick-tip">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="6" cy="12" r="3.2" fill="#ef4444"/><circle cx="12" cy="12" r="3.2" fill="#f97316"/><circle cx="18" cy="12" r="3.2" fill="#eab308"/></svg>
+            <span><b style="color:#ef4444">Red</b> move it · <b style="color:#f97316">orange</b> check its place · <b style="color:#eab308">yellow</b> couldn't read, look by hand. No box = filed correctly.</span>
           </div>
         </div>
       </div>
@@ -6052,9 +6064,9 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       const i = checkedBooks.indexOf(book);
       const [bx, by, bw, bh] = bookDisplayBox(book._bbox, sentH);
       const cx = bx * sx, cy = by * sy, cw = bw * sx, ch = bh * sy;
-      // Red only for confirmed (fused+verified) out-of-order; both "unsure"
-      // states (unverifiable label, possibly-out-of-order title) are yellow.
-      const color = book.outOfOrder ? '#ef4444' : '#eab308';
+      // Three colours: red = out of order (move it), orange = read but maybe
+      // misplaced (check it), yellow = couldn't read the label (read by hand).
+      const color = FLAG_COLOR[flagKind(book)];
 
       ctx.strokeStyle = color;
       ctx.lineWidth   = lw;
@@ -6206,7 +6218,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       const oRect = arLiveOverlay.getBoundingClientRect();
       const pRect = cameraLive.getBoundingClientRect();
       const [ox, oy, ow, oh] = entry._overlayRect;
-      pulse.style.color  = book.outOfOrder ? '#ef4444' : '#eab308';
+      pulse.style.color  = FLAG_COLOR[flagKind(book)];
       pulse.style.left   = `${(oRect.left - pRect.left) + ox / dpr}px`;
       pulse.style.top    = `${(oRect.top  - pRect.top)  + oy / dpr}px`;
       pulse.style.width  = `${ow / dpr}px`;
@@ -6230,7 +6242,7 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     // Same rule as the drawn box (see drawBoxes): red only for confirmed
     // out-of-order, yellow for both "unsure" states. Keying off .unverifiable
     // instead put a red ring around a yellow box for possiblyOutOfOrder books.
-    pulse.style.color  = book.outOfOrder ? '#ef4444' : '#eab308';
+    pulse.style.color  = FLAG_COLOR[flagKind(book)];
     pulse.style.left   = `${left}px`;
     pulse.style.top    = `${top}px`;
     pulse.style.width  = `${bw * sx}px`;
@@ -7924,6 +7936,25 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
     return book.outOfOrder ? null : (AMBER_WHY[book._why] || null);
   }
 
+  // Three distinct verdicts, so a volunteer can tell them apart at a glance:
+  //   'red'    — read clearly AND out of place: MOVE it.
+  //   'check'  — read clearly, but the app can't be sure it's misfiled
+  //              (partner of a flag / within-author order / no given name):
+  //              LOOK at it, it might be out of place.
+  //   'unread' — the label itself could not be read cleanly, so no placement
+  //              judgement is possible at all: READ it by hand.
+  // The split is by reason, not by the possiblyOutOfOrder/unverifiable fields,
+  // because those two flags do not line up with "read fine" vs "couldn't read"
+  // (e.g. neartwin/malformed are couldn't-read but set possiblyOutOfOrder).
+  const CHECK_WHYS = new Set(['pair', 'sameauthor', 'nogiven']);
+  function flagKind(book) {
+    if (book.outOfOrder) return 'red';
+    if (CHECK_WHYS.has(book._why)) return 'check';
+    return 'unread';
+  }
+  // Single source of truth for the three colours, reused by every render site.
+  const FLAG_COLOR = { red: '#ef4444', check: '#f97316', unread: '#eab308' };
+
   function showFlaggedList(checked, panel = document.getElementById('flaggedList'), unreadCount = 0) {
     // Same overlap-collapse the boxes use, so a sticker read several times is
     // one row here too (not three near-identical "check" rows for one book).
@@ -7979,17 +8010,45 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
       : `Flagged books (${flagged.length})`;
     panel.appendChild(header);
 
+    // Three-colour key, so the boxes on the photo and the rows below read the
+    // same way: red = move it, orange = might be out of place, yellow = the
+    // label couldn't be read. Only show the colours that actually appear.
+    const kinds = new Set(flagged.map(flagKind));
+    if (unreadCount) kinds.add('unread');
+    const legendBits = [
+      ['red',    'Out of order — move it'],
+      ['check',  'Might be out of place — check'],
+      ['unread', "Couldn't read — check by hand"],
+    ].filter(([k]) => kinds.has(k));
+    if (legendBits.length > 1) {
+      const legend = document.createElement('div');
+      legend.className = 'flagged-legend';
+      legend.innerHTML = legendBits.map(([k, txt]) =>
+        `<span class="flagged-legend-item"><span class="flagged-legend-swatch" style="background:${FLAG_COLOR[k]}"></span>${txt}</span>`).join('');
+      panel.appendChild(legend);
+    }
+
     // Build a global index map: book → arrow number (1-based position in checked array)
     const globalIdx = new Map(checked.map((b, i) => [b, i + 1]));
 
     for (const book of flagged) {
       const isBad = book.outOfOrder;
+      const kind = flagKind(book);                       // 'red' | 'check' | 'unread'
+      const kindWord = kind === 'red' ? 'out of order'
+                     : kind === 'check' ? 'possibly out of order — check'
+                                        : "couldn't read — check by hand";
+      const dotCls = kind === 'red' ? 'flagged-item-dot-bad'
+                   : kind === 'check' ? 'flagged-item-dot-chk' : 'flagged-item-dot-unv';
+      const statusCls = kind === 'red' ? 'flagged-item-status-bad'
+                      : kind === 'check' ? 'flagged-item-status-chk' : 'flagged-item-status-unv';
+      const statusWord = kind === 'red' ? 'Out of order'
+                       : kind === 'check' ? 'Check order' : "Couldn't read";
       const row = document.createElement('div');
       row.className = 'flagged-item';
       row.setAttribute('role', 'button');
       row.setAttribute('tabindex', '0');
       row.setAttribute('aria-expanded', 'false');
-      row.setAttribute('aria-label', `${book.spine_label || 'Book'}${book.title ? `, ${book.title}` : ''} — ${isBad ? 'out of order' : book.possiblyOutOfOrder ? 'possibly out of order' : 'check manually'}`);
+      row.setAttribute('aria-label', `${book.spine_label || 'Book'}${book.title ? `, ${book.title}` : ''} — ${kindWord}`);
       _flaggedRowMap.set(book, row);
 
       const posBits = [];
@@ -7999,22 +8058,22 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
 
       const titleLine = book.title ? `<div class="flagged-item-title">${escapeHtml(book.title)}</div>` : '';
       row.innerHTML = `
-        <div class="flagged-item-dot ${isBad ? 'flagged-item-dot-bad' : 'flagged-item-dot-unv'}"></div>
+        <div class="flagged-item-dot ${dotCls}"></div>
         <div class="flagged-item-text">
           <div class="flagged-item-label">${escapeHtml(book.spine_label) || '—'}</div>
           ${titleLine}
           <div class="flagged-item-sub">${escapeHtml(posBits.join(' · '))}</div>
         </div>
-        <div class="flagged-item-status ${isBad ? 'flagged-item-status-bad' : 'flagged-item-status-unv'}">${isBad ? 'Out of order' : book.possiblyOutOfOrder ? 'Check order' : 'Check'}</div>`;
+        <div class="flagged-item-status ${statusCls}">${statusWord}</div>`;
 
       // Build inline expandable detail (shown below row on tap)
       const detail = document.createElement('div');
       detail.className = 'flagged-item-detail';
-      const dcolor = book.outOfOrder ? '#ef4444' : '#eab308';
-      const dstatus = book.outOfOrder ? 'Out of order'
+      const dcolor = FLAG_COLOR[flagKind(book)];
+      const dstatus = kind === 'red' ? 'Out of order — move this book'
                     : amberReason(book)
-                    || (book.possiblyOutOfOrder ? 'Possibly out of order — check title order'
-                                                : 'Check manually');
+                    || (kind === 'check' ? 'Possibly out of order — check its place'
+                                         : "Couldn't read the label — check by hand");
       detail.innerHTML = `
         ${book.title ? `<div class="fi-drow"><span class="fi-dk">Title</span><span class="fi-dv">${escapeHtml(book.title)}${book.title_verified ? ' <span style="opacity:.5;font-size:10px">✓</span>' : ''}</span></div>` : ''}
         <div class="fi-drow"><span class="fi-dk">Where</span><span class="fi-dv">#${book.shelfPosition} of ${book.shelfSize} on shelf ${(book.shelfIndex ?? 0) + 1}</span></div>
@@ -8227,20 +8286,26 @@ Example: [["973.7 HAR","Lincoln"],["KIN","The Stand"],[null,"Harry Potter"]]`;
         <div class="first-hint-key">What the boxes mean</div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#ef4444"></span>
-          <span><b>Red — move it.</b> This book is filed out of order. It is listed
-            underneath the photo with the slot it belongs in.</span>
+          <span><b>Red — move it.</b> The label was read clearly and the book is
+            filed out of order. It is listed underneath the photo with the slot
+            it belongs in.</span>
+        </div>
+        <div class="first-hint-row">
+          <span class="first-hint-dot" style="background:#f97316"></span>
+          <span><b>Orange — check its place.</b> The label was read fine, but the
+            app can't be sure it is misfiled — its place is too close to call, or
+            it is one of several books by the same author. Give it a look.</span>
         </div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#eab308"></span>
-          <span><b>Amber — check by eye.</b> Either the label could not be read
-            clearly, or it was read fine but its place next to the book beside
-            it is too close to call. Either way the app will not judge it; the
-            list underneath says which.</span>
+          <span><b>Yellow — read it by hand.</b> The label itself could not be read
+            clearly, so the app can't judge its place at all. Only the books the
+            camera genuinely could not read get this.</span>
         </div>
         <div class="first-hint-row">
           <span class="first-hint-dot" style="background:#22c55e"></span>
-          <span><b>Green — leave it.</b> In order. Tap any flagged book below to
-            see what was read off its spine.</span>
+          <span><b>Green — leave it.</b> Read clearly and in order. Tap any flagged
+            book below to see what was read off its spine.</span>
         </div>
 
         <button class="first-hint-btn" id="firstHintBtn">Got it</button>
