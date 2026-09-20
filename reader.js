@@ -99,14 +99,26 @@ function blobToBase64(blob) {
   });
 }
 
-// Median latency measured against real shelf photos is 2-4s, but a single
-// call was observed taking 19.8s against the shared proxy — a real network/
-// API variance, not a bug (see [[shelfcheck-latency]] precedent: output-token
-// generation is the slow, variable part). One retry on timeout catches a
-// stalled call without making a volunteer wait indefinitely; a genuinely
-// overloaded backend fails the same way twice and the caller sees a clear
-// error instead of a spinner that never resolves.
-const READ_TIMEOUT_MS = 25000;
+// Median latency measured against real shelf photos is 2-4s for a close crop,
+// but a whole-shelf read runs 5-12s here on a fast connection and a single
+// call was once observed taking ~20s (real network/API variance, not a bug —
+// see [[shelfcheck-latency]]: output-token generation is the slow part). A
+// phone on library Wi-Fi is slower still and drops requests, so the timeout is
+// generous and network failures are retried a few times with backoff before
+// the volunteer sees an error. `TIMEOUT` gets its own message because "wait
+// longer / better signal" is different advice from "the reader is down".
+const READ_TIMEOUT_MS = 40000;
+const MAX_ATTEMPTS = 3;
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Errors are tagged so callGemini knows what to retry and what to tell the
+// user. NETWORK (fetch could not complete — the "Failed to fetch" the phone
+// hit) and TIMEOUT and HTTP-5xx are transient and worth retrying; HTTP-4xx and
+// a malformed body are not.
+class ReaderError extends Error {
+  constructor(kind, message, retryable) { super(message); this.kind = kind; this.retryable = retryable; }
+}
 
 async function callGeminiOnce(geminiUrl, base64, section, model, externalSignal) {
   const body = {
@@ -122,41 +134,59 @@ async function callGeminiOnce(geminiUrl, base64, section, model, externalSignal)
     ]}],
   };
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error('timed out')), READ_TIMEOUT_MS);
-  const onExternalAbort = () => ctrl.abort(externalSignal.reason);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, READ_TIMEOUT_MS);
+  const onExternalAbort = () => ctrl.abort();
   if (externalSignal) externalSignal.addEventListener('abort', onExternalAbort);
+  let res;
   try {
-    const res = await fetch(geminiUrl, {
+    res = await fetch(geminiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error(`reader: HTTP ${res.status} ${errText.slice(0, 200)}`);
-    }
-    const json = await res.json();
-    const parts = json?.candidates?.[0]?.content?.parts || [];
-    const text = parts.map(p => p.text || '').join('');
-    let rows;
-    try { rows = JSON.parse(text); }
-    catch (e) { throw new Error(`reader: model returned non-JSON: ${text.slice(0, 200)}`); }
-    if (!Array.isArray(rows)) throw new Error('reader: model did not return an array');
-    return rows;
+  } catch (e) {
+    if (externalSignal?.aborted) throw new ReaderError('ABORTED', 'cancelled', false);
+    if (timedOut) throw new ReaderError('TIMEOUT', 'the reader took too long to answer', true);
+    // A fetch that rejects (rather than returning a response) is a network
+    // failure: no connection, DNS, or the request was blocked/dropped.
+    throw new ReaderError('NETWORK', 'could not reach the reader (no network response)', true);
   } finally {
     clearTimeout(timer);
     if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
   }
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new ReaderError('HTTP', `reader service returned HTTP ${res.status} ${errText.slice(0, 160)}`.trim(), res.status >= 500 || res.status === 429);
+  }
+  const json = await res.json().catch(() => null);
+  const parts = json?.candidates?.[0]?.content?.parts || [];
+  const text = parts.map(p => p.text || '').join('');
+  // The model usually returns a clean JSON array, but occasionally wraps it in
+  // stray text or a code fence; take the outermost [...] before parsing.
+  const start = text.indexOf('['), end = text.lastIndexOf(']');
+  const slice = start >= 0 && end > start ? text.slice(start, end + 1) : text;
+  let rows;
+  try { rows = JSON.parse(slice); }
+  catch (e) { throw new ReaderError('PARSE', `reader returned an unreadable response: ${text.slice(0, 160)}`, false); }
+  if (!Array.isArray(rows)) throw new ReaderError('PARSE', 'reader did not return a list of books', false);
+  return rows;
 }
 
 async function callGemini(geminiUrl, base64, section, model, externalSignal) {
-  try {
-    return await callGeminiOnce(geminiUrl, base64, section, model, externalSignal);
-  } catch (err) {
-    if (externalSignal?.aborted) throw err;   // the caller cancelled — don't retry
-    return await callGeminiOnce(geminiUrl, base64, section, model, externalSignal);
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await callGeminiOnce(geminiUrl, base64, section, model, externalSignal);
+    } catch (err) {
+      lastErr = err;
+      if (externalSignal?.aborted) throw err;              // the caller cancelled
+      if (!(err instanceof ReaderError) || !err.retryable) throw err;
+      if (attempt < MAX_ATTEMPTS) await sleep(700 * attempt);  // 0.7s, 1.4s backoff
+    }
   }
+  throw lastErr;
 }
 
 // Model boxes arrive as [ymin, xmin, ymax, xmax] in 0-1000. Parse into

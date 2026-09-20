@@ -174,7 +174,11 @@ async function addSegment(file) {
     seg.checked = checkOrder(seg.books, section);
   } catch (err) {
     seg.status = 'error'; seg.error = String(err.message || err);
-    showError(`Couldn't read that photo: ${seg.error}`);
+    const kind = err && err.kind;
+    const msg = (kind === 'NETWORK' || kind === 'TIMEOUT')
+      ? 'Couldn\'t reach the reader — check your connection and tap the photo button to try again.'
+      : `Couldn't read that photo: ${seg.error}`;
+    showError(msg);
   }
   render();
 }
