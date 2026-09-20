@@ -25,6 +25,7 @@
     margin-bottom: 12px; font-size: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.08); flex-wrap: wrap;
   }
   .summary b { font-size: 16px; }
+  .summary .batch-time { margin-left: auto; color: #888; font-size: 12px; align-self: center; }
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
   .dot.red { background: #e0453c; }
   .dot.yellow { background: #e8b923; }
@@ -98,9 +99,9 @@
 
 <div class="actions">
   <button class="btn-secondary" id="btnNewShelf">Clear</button>
-  <button class="btn-primary" id="btnAddPhoto">Take / choose photo</button>
+  <button class="btn-primary" id="btnAddPhoto">Take / choose photos</button>
 </div>
-<input type="file" id="photoInput" accept="image/*" capture="environment" style="display:none">
+<input type="file" id="photoInput" accept="image/*" multiple style="display:none">
 
 <script type="module">
 import { readShelf } from './reader.js';
@@ -127,6 +128,8 @@ const els = {
 // carries the model's shelfRow, so one photo's rows are ordered on their own.
 let segments = [];
 let section = 'fiction';
+let batchWallMs = 0;   // wall-clock time of the last multi-photo batch
+let batchCount = 0;    // photos read in that batch
 
 els.btnFiction.onclick = () => setSection('fiction');
 els.btnNonfiction.onclick = () => setSection('nonfiction');
@@ -138,15 +141,16 @@ function setSection(s) {
 
 els.btnNewShelf.onclick = () => {
   segments = [];
+  batchWallMs = 0; batchCount = 0;
   render();
 };
 
 els.btnAddPhoto.onclick = () => els.photoInput.click();
 els.photoInput.onchange = async () => {
-  const file = els.photoInput.files[0];
+  const files = Array.from(els.photoInput.files || []);
   els.photoInput.value = '';
-  if (!file) return;
-  await addSegment(file);
+  if (!files.length) return;
+  await addSegments(files);
 };
 
 async function decodeToCanvas(file) {
@@ -158,15 +162,52 @@ async function decodeToCanvas(file) {
   return canvas;
 }
 
-async function addSegment(file) {
+// Free-tier proxy rate-limits bursts (4-way concurrency hit 429s in testing),
+// so read at most this many photos at once. reader.js retries a 429 with
+// backoff, but keeping the burst small avoids most of them in the first place.
+const READ_CONCURRENCY = 2;
+
+// Take one or several photos at once. Each is decoded and shown as its own row
+// immediately, then read concurrently (capped) so a batch finishes in roughly
+// the time of its slowest few reads rather than the sum of all of them.
+async function addSegments(files) {
   hideError();
-  const canvas = await decodeToCanvas(file);
-  const imgUrl = canvas.toDataURL('image/jpeg', 0.85);
-  const seg = { imgUrl, sentW: canvas.width, sentH: canvas.height, books: [], status: 'loading' };
-  segments.push(seg);
+  const batch = [];
+  for (const file of files) {
+    let seg;
+    try {
+      const canvas = await decodeToCanvas(file);
+      seg = { canvas, imgUrl: canvas.toDataURL('image/jpeg', 0.85),
+              sentW: canvas.width, sentH: canvas.height, books: [], status: 'loading' };
+    } catch (e) {
+      seg = { imgUrl: '', books: [], status: 'error', error: 'could not open this image' };
+    }
+    segments.push(seg); batch.push(seg);
+  }
   render();
+
+  const t0 = performance.now();
+  let next = 0;
+  const worker = async () => {
+    while (next < batch.length) {
+      const seg = batch[next++];
+      if (seg.status === 'error') continue;   // failed to decode
+      await readSegment(seg);
+      render();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(READ_CONCURRENCY, batch.length) }, worker));
+
+  if (batch.length > 1) {
+    batchWallMs = Math.round(performance.now() - t0);
+    batchCount = batch.filter(s => s.status === 'done').length;
+    render();
+  }
+}
+
+async function readSegment(seg) {
   try {
-    const result = await readShelf(canvas, section, { geminiUrl: GEMINI_URL });
+    const result = await readShelf(seg.canvas, section, { geminiUrl: GEMINI_URL });
     seg.sentW = result.sentW; seg.sentH = result.sentH;
     seg.books = result.books; seg.status = 'done'; seg.elapsedMs = result.elapsedMs;
     // Each photo is its own whole shelf: check its rows on their own. The books
@@ -179,8 +220,9 @@ async function addSegment(file) {
       ? 'Couldn\'t reach the reader — check your connection and tap the photo button to try again.'
       : `Couldn't read that photo: ${seg.error}`;
     showError(msg);
+  } finally {
+    seg.canvas = null;   // free the decoded bitmap once read
   }
-  render();
 }
 
 function flagKind(b) {
@@ -232,10 +274,13 @@ function render() {
   const total = red + yellow + green;
   if (total > 0) {
     els.summary.style.display = '';
+    const batchNote = (batchCount > 1 && batchWallMs)
+      ? `<span class="batch-time">${batchCount} photos in ${(batchWallMs/1000).toFixed(1)}s</span>` : '';
     els.summary.innerHTML = `
       <span><span class="dot red"></span><b>${red}</b> check now</span>
       <span><span class="dot yellow"></span><b>${yellow}</b> not sure</span>
-      <span><span class="dot green"></span><b>${green}</b> in order</span>`;
+      <span><span class="dot green"></span><b>${green}</b> in order</span>
+      ${batchNote}`;
   } else {
     els.summary.style.display = 'none';
   }
