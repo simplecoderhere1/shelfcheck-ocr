@@ -47,19 +47,23 @@ requests cuts its long tail (its latency is bimodal and random per request).
 The page falls back to calling both proxies directly if the Worker is down, and
 to a Gemini-only read (approximate box positions) if Azure is.
 
-## Measured (2026-09-27, 36 photos in the test corpus)
+## Measured (2026-09-28, 36 photos in the test corpus)
+
+Held-out run of the final build on the live site, phone profile (4x CPU
+throttle, 6 Mbps upload), reads never used for tuning:
 
 | | |
 |---|---|
-| Latency, phone profile (4× CPU, 6 Mbps up) | mean 3.9s, median 3.8s, 32/36 under 5s |
-| Latency, desktop | ~2–3s |
-| Known misfiles flagged red | 16–18 of 24 per read |
-| False red flags | 0–2 per read, ~1,250 books |
-| Sort-relevant reading (10 fully transcribed shelves) | 91–94% |
+| Latency | mean 3.9s, median 3.7s, 34/36 under 5s |
+| Correctly shelved shelves with any box at all | 0 of 18 |
+| Known misfiles flagged red | 15 of 24 (16-18 on the three tuning reads) |
+| False red flags | 1 in 1,238 books (a misfiled WILSON boxed under a neighbour's given name) |
+| Sort-relevant reading, 10 fully transcribed shelves | 90% |
 
-The misfiles not flagged are ones whose deciding digits are hidden on the
-sticker (wrapped round the spine or cut by the frame) or unreadable by both
-engines; those stay unmarked rather than guessed.
+Of the 9 not flagged red: 5 hinge on call-number digits that are wrapped round
+the spine or cut by the frame (those books get a yellow "check by hand" box),
+1 sticker is unreadable to both engines (also yellow), and 3 are the model
+shifting a label one place inside a same-author run.
 
 ## Limits worth knowing
 
