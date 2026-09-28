@@ -28,7 +28,7 @@ ROW: <sticker of book 1> | <sticker of book 2> | ... (that row's books left to r
 Rules:
 - Each book's WHOLE sticker as one item (number and letters together).
 - Only rows whose stickers are visible; skip a row cut off by the photo edge.
-- Skip books displayed face-out (cover facing the camera) or lying flat; list only spines standing in the row.
+- A book displayed face-out (its front cover toward the camera, often past a bookend at a row's end) or lying flat is not in the row: skip it. List only spines standing in the row.
 - Copy the characters exactly as printed. Never pad or complete a number or name to match neighbouring books.
 - Write ? for each character you cannot read, or just ? for a book whose sticker is unreadable (blurred, turned away, half cut off).`;
 }
@@ -39,7 +39,8 @@ export function parseLabels(text) {
     let line = raw.trim().replace(/^```\w*|```$/g, '').trim();
     if (!line) continue;
     line = line.replace(/^ROW\s*\d*\s*[:.-]?\s*/i, '');
-    const items = line.split('|').map(s => s.trim().replace(/\s+/g, ' ')).filter(Boolean);
+    const items = line.split('|').map(s => s.trim().replace(/\s+/g, ' ')
+      .replace(/^(\d{3})\s*\.\s+(\d)/, '$1.$2')).filter(Boolean);   // some stickers print "364. 1066"
     if (items.length) rows.push(items);
   }
   for (const r of rows) for (let i = 0; i < r.length - 1; i++)
@@ -545,7 +546,10 @@ export function fuse(gemRows, az, section, opts = {}) {
       if (!G) { if (A.length >= 3 && w.conf >= 0.6) adopt(); return; }
       const surWords = U(b.key.sur || '').split(/[\s-]+/).map(letters);
       // (a) Azure saw part of the same word (a dropped leading/trailing letter, or one word of "VON ARNIM")
-      if ((A.length >= 3 && (G.includes(A) || A.startsWith(G) || surWords.includes(A))) ||
+      // (also: A is one word of a multi-word surname, possibly with a neighbour's letters welded on --
+      //  "REINHOLDEN" for VON REINHOLD)
+      const wordHit = surWords.some(sw => sw.length >= 4 && (A.startsWith(sw) || sw.startsWith(A) || ed(A, sw) <= 1));
+      if ((A.length >= 3 && (G.includes(A) || A.startsWith(G) || surWords.includes(A) || (surWords.length > 1 && wordHit))) ||
           (A.length >= 2 && (G.startsWith(A) || G.endsWith(A)))) { b.agree = 'partial'; return; }
       const full = ed(A, G), pre = ed(A, G.slice(0, A.length));
       // (b) one-letter slip: the literal engine wins when it is sure (the model inserts letters too: "THEVALL")
@@ -574,7 +578,9 @@ export function fuse(gemRows, az, section, opts = {}) {
           (b.azNum.startsWith(b.key.num.replace(/\.$/, '')) || b.key.num.startsWith(b.azNum));
       }
       const copiesLabel = [books[i - 1], books[i + 1]].filter(Boolean).some(o => U(o.label) === U(b.label));
-      if (A.length >= 3 && w.conf >= 0.6 && (confirmed || (copiesLabel && w.conf >= 0.75))) {
+      // a sticker confirmed by its other half needs less from the word itself (WEISBERGER read
+      // at 0.58, "Lauren" under it at 0.99); a bare neighbour-copy needs a confident word
+      if (A.length >= 3 && ((confirmed && w.conf >= 0.5) || (copiesLabel && w.conf >= 0.75))) {
         // a copied label's given name is the neighbour's, not this book's
         adopt(confirmed ? undefined : (section === 'fiction' ? (b.azGiv || '') : undefined));
       }
@@ -596,7 +602,7 @@ export function fuse(gemRows, az, section, opts = {}) {
     // inserted books
     for (const ins of inserts.sort((a, b) => b.afterIdx - a.afterIdx)) {
       const w = ins.w; let label;
-      if (section === 'fiction') label = `${w.text.replace(/,$/, '')}${ins.below[0] ? ', ' + ins.below[0].text : ''}`;
+      if (section === 'fiction') label = `${w.text.replace(/[^A-Za-z' -]+$/, '')}${w.giv ? ', ' + w.giv : ''}`;
       else label = `${numberAbove(words, w).T} ${w.L}`;
       const nb = { label, key: keyOf(label, section), tokW: w, cx: w.cx, agree: 'azonly', inserted: true };
       let at = books.findIndex(b => b.cx != null && b.cx > w.cx); if (at < 0) at = books.length;
@@ -626,12 +632,13 @@ export function fuse(gemRows, az, section, opts = {}) {
       bs[i].cx = L != null && R != null ? bs[L].cx + (bs[R].cx - bs[L].cx) * (i - L) / (R - L)
         : L != null ? bs[L].cx + pitch * (i - L) : R != null ? bs[R].cx - pitch * (R - i) : (i + 0.5) * W / bs.length;
       bs[i].interp = true;
+      bs[i].extrap = !(L != null && R != null);   // beyond the last sticker Azure placed: position is a guess
     }
     const hh = median(bs.filter(b => b.tokW).map(b => b.tokW.h)) || hMed;
     bs.forEach((b, i) => {
       const y = b.tokW ? b.tokW.cy : row.line ? row.line.yAt(b.cx) : H * (rows.indexOf(row) + 0.5) / rows.length;
       const left = i ? (bs[i - 1].cx + b.cx) / 2 : b.cx - pitch / 2, right = i < bs.length - 1 ? (b.cx + bs[i + 1].cx) / 2 : b.cx + pitch / 2;
-      b.x0 = Math.max(0, left); b.x1 = Math.min(W, right); b.y0 = Math.max(0, y - hh * 6); b.y1 = Math.min(H, y + hh * 3);
+      b.x0 = Math.max(0, left); b.x1 = Math.min(W, right); b.y0 = Math.max(0, y - hh * 11); b.y1 = Math.min(H, y + hh * 3);
       b.az = !!b.tokW && b.agree !== 'disagree';
     });
   }
@@ -651,6 +658,7 @@ export function cleanForOrder(label, section) {
     else {
       let num = m[1], rest = m[2];
       if (num.includes('?')) { num = num.slice(0, num.indexOf('?')).replace(/\.$/, ''); trunc = true; }
+      if (num.endsWith('.')) { num = num.slice(0, -1); trunc = true; }   // "796. CHE": decimals wrapped out of view
       if (/\?/.test(rest.split(/\s+/)[0] || '?')) unreadable = true;
       s = `${num} ${rest.replace(/\?/g, '')}`.trim();
     }
@@ -688,6 +696,9 @@ export function toBooks(fused, section) {
       _bbox: [b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0],
       _box01: [b.x0 / fused.W, b.y0 / fused.H, (b.x1 - b.x0) / fused.W, (b.y1 - b.y0) / fused.H],
       _raw: b.label, _agree: b.agree || null, _override: !!b.override, _inserted: !!b.inserted,
+      // where the box can honestly be drawn: not extrapolated past the placed stickers,
+      // and not a spine cut by the photo's edge (it belongs to the next photo)
+      _extrap: !!b.extrap, _edge: b.x0 <= fused.W * 0.015 || b.x1 >= fused.W * 0.985,
       // both engines read this sticker's name/cutter the same way (or Azure's literal
       // read replaced the model's on confirmed evidence): not a garbled read
       ...(!c.unreadable && (b.agree === 'exact' || b.agree === 'partial' || b.override) ? { _azConfirmed: true } : {}),

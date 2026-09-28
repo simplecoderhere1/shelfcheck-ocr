@@ -43,10 +43,20 @@
   }
   .segment .box.red { background: rgba(224,69,60,.28); border: 3px solid #e0453c; }
   .segment .box.yellow { background: rgba(232,185,35,.24); border: 3px solid #e8b923; }
+  .segment .box { align-items: flex-start; }
   .segment .box span {
-    background: rgba(0,0,0,.78); color: #fff; font-size: 11px; padding: 2px 5px; border-radius: 4px;
-    margin: 3px; max-width: 96%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    position: absolute; top: -11px; left: 50%; transform: translateX(-50%);
+    min-width: 20px; height: 20px; line-height: 20px; border-radius: 10px; text-align: center;
+    font-size: 12px; font-weight: 700; color: #fff; padding: 0 4px;
   }
+  .segment .box.red span { background: #e0453c; }
+  .segment .box.yellow span { background: #c99a00; }
+  .flagged-list .num {
+    min-width: 24px; height: 24px; line-height: 24px; border-radius: 12px; text-align: center;
+    font-size: 13px; font-weight: 700; color: #fff; flex: none;
+  }
+  .flagged-list .num.red { background: #e0453c; }
+  .flagged-list .num.yellow { background: #c99a00; }
   .segment .meta { padding: 8px 12px; font-size: 12px; color: #888; display: flex; justify-content: space-between; }
   .segment .status { padding: 30px; text-align: center; color: #888; font-size: 14px; }
 
@@ -105,7 +115,7 @@
 
 <script type="module">
 import { readShelf } from './reader.js';
-import { checkOrder } from './ordering.js';
+import { checkOrder, sortKey, compareKeys } from './ordering.js';
 
 const GEMINI_URL = 'https://selfcheck-proxy.krish-sundareswar.workers.dev/';
 // Azure Read through the Cloudflare worker that holds the key (workers/azure-ocr-worker.js).
@@ -238,7 +248,8 @@ async function readSegment(seg) {
 // too weak to accuse (ordering.js demotes those to possiblyOutOfOrder) gets no
 // box -- the volunteer is told only what the app actually knows.
 function isUnreadable(b) {
-  return !b.outOfOrder && (!!b._unreadable || b._why === 'nokey' || b._why === 'trunc');
+  if (b.outOfOrder || b._extrap || b._edge) return false;   // no box where we cannot place it, or for a spine cut by the frame
+  return !!b._unreadable || b._why === 'nokey' || b._why === 'trunc';
 }
 function flagKind(b) {
   if (b.outOfOrder) return 'red';
@@ -250,6 +261,7 @@ function render() {
   els.empty.style.display = segments.length ? 'none' : '';
   els.segments.innerHTML = '';
   let red = 0, yellow = 0, green = 0;
+  let badge = 0;   // flagged books are numbered across all photos; the list below uses the same numbers
 
   for (const seg of segments) {
     const div = document.createElement('div');
@@ -273,7 +285,8 @@ function render() {
         const left = Math.max(0, x - pad), top = Math.max(0, y - pad);
         const width = Math.min(1 - left, w + pad * 2), height = Math.min(1 - top, h + pad * 2);
         const style = `left:${(left*100).toFixed(2)}%;top:${(top*100).toFixed(2)}%;width:${(width*100).toFixed(2)}%;height:${(height*100).toFixed(2)}%`;
-        return `<div class="box ${kind}" style="${style}"><span>${escapeHtml(b.spine_label)}</span></div>`;
+        checkedBook._badge = ++badge;
+        return `<div class="box ${kind}" style="${style}"><span>${checkedBook._badge}</span></div>`;
       }).join('');
       for (const b of (seg.checked || [])) {
         const k = flagKind(b);
@@ -301,19 +314,38 @@ function render() {
   }
 
   const flagged = segments.filter(s => s.status === 'done')
-    .flatMap(s => s.checked || [])
-    .filter(b => flagKind(b));
+    .flatMap(s => (s.checked || []).map(b => ({ b, seg: s })))
+    .filter(({ b }) => flagKind(b));
   if (flagged.length) {
     els.flaggedWrap.style.display = '';
-    els.flaggedList.innerHTML = flagged.map(b => `
+    els.flaggedList.innerHTML = flagged.map(({ b, seg }) => `
       <div class="row">
-        <span class="dot ${b.outOfOrder ? 'red' : 'yellow'}"></span>
+        <span class="num ${b.outOfOrder ? 'red' : 'yellow'}">${b._badge || ''}</span>
         <span class="label">${escapeHtml(b.spine_label)}</span>
-        <span class="why">${b.outOfOrder ? 'out of place' : 'sticker unreadable — check by hand'}</span>
+        <span class="why">${b.outOfOrder ? escapeHtml(whereItGoes(b, seg)) : 'sticker unreadable — check by hand'}</span>
       </div>`).join('');
   } else {
     els.flaggedWrap.style.display = 'none';
   }
+}
+
+// Where a red book belongs on its shelf: after the last in-order book whose
+// label sorts at or before it (same comparator the order check uses).
+function whereItGoes(b, seg) {
+  const row = (seg.checked || []).filter(o => o.shelfRow === b.shelfRow);
+  const kb = sortKey(b, seg.section);
+  if (!kb) return 'out of place';
+  let after = null, first = null;
+  for (const o of row) {
+    if (o === b || o.outOfOrder || o._unreadable) continue;
+    const ko = sortKey(o, seg.section);
+    if (!ko) continue;
+    if (!first) first = o;
+    if (compareKeys(ko, kb) <= 0) after = o;
+  }
+  if (after) return `out of place · goes after ${after.spine_label}`;
+  if (first) return `out of place · goes before ${first.spine_label}`;
+  return 'out of place';
 }
 
 function showError(msg) { els.errorBanner.textContent = msg; els.errorBanner.style.display = ''; }
