@@ -232,10 +232,12 @@ async function readSegment(seg) {
     (window.__shelfcheck ||= []).push({ raw: result.raw, via: result.via, model: result.model, timings: result.timings, elapsedMs: seg.elapsedMs, section: result.section, degraded: result.degraded,
       books: seg.checked.map(b => ({ label: b.spine_label, raw: b._raw, row: b.shelfRow, red: !!b.outOfOrder, unread: isUnreadable(b), box: b._box01, why: b._why || null })) });
   } catch (err) {
-    seg.status = 'error'; seg.error = String(err.message || err);
+    seg.status = 'error'; seg.error = err && err.kind === 'QUOTA' ? 'daily reading allowance used up' : String(err.message || err);
     const kind = err && err.kind;
     const msg = (kind === 'NETWORK' || kind === 'TIMEOUT')
       ? 'Couldn\'t reach the reader — check your connection and tap the photo button to try again.'
+      : kind === 'QUOTA'
+      ? 'Today\'s free reading allowance is used up (it resets at midnight Pacific time). Please try again later.'
       : `Couldn't read that photo: ${seg.error}`;
     showError(msg);
   } finally {

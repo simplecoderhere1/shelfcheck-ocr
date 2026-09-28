@@ -194,7 +194,7 @@ async function readViaFanout(url, blob, section, signal) {
       throw new ReaderError('NETWORK', 'could not reach the reader', true);
     }
     const j = await res.json().catch(() => null);
-    if (!res.ok || !j || !j.gemini) throw new ReaderError(j?.kind === 'QUOTA' ? 'QUOTA' : 'HTTP', `reader: ${j?.message || j?.error || res.status}`, res.status >= 500);
+    if (!res.ok || !j || !j.gemini) throw new ReaderError(j?.kind === 'QUOTA' ? 'QUOTA' : 'HTTP', `reader: ${j?.message || j?.error || res.status}`, res.status >= 500 && j?.kind !== 'QUOTA');
     const rows = parseLabels(j.gemini.text);
     if (!rows.length) throw new ReaderError('EMPTY', 'reader returned no books', true);
     return { gem: { rows, text: j.gemini.text, model: j.gemini.model }, az: j.azure && j.azure.readResult ? j.azure : null, ms: j.ms || {} };
@@ -222,7 +222,9 @@ export async function readShelf(source, section, { readUrl, geminiUrl, azureUrl,
         timings: { encode: Math.round(tEnc - t0), gemini: r.ms.gemini, azure: r.ms.azure, total: Math.round(performance.now() - t0) },
       };
     } catch (e) {
-      if (e instanceof ReaderError && e.kind === 'ABORTED') throw e;
+      // Out of quota is out of quota on the direct path too (same keys): say so now
+      // instead of spending ~15s re-trying it.
+      if (e instanceof ReaderError && (e.kind === 'ABORTED' || e.kind === 'QUOTA')) throw e;
       // otherwise fall through to calling the two engines directly
     }
   }
