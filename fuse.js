@@ -690,6 +690,10 @@ export function toBooks(fused, section) {
     books.push({
       spine_label: c.s || b.label, shelfRow: ri, _src: 'gemini', _score: score,
       ...(c.unreadable ? { confidence: 'low', _unreadable: true } : {}),
+      // "couldn't read" is a claim about THIS sticker: the model said so ("?" / a clipped
+      // number), or Azure saw a sticker there that did not parse. A model-only label
+      // that does not parse is more likely spine text than a sticker, and gets no box.
+      _readTrunc: c.trunc, _saidUnreadable: /\?/.test(b.label) || !!b.tokW || c.trunc,
       ...(c.trunc ? { _truncated: true } : {}),
       // a surname with no readable given name files under its author but not within it
       ...(section === 'fiction' && !c.unreadable && !/,\s*\S/.test(c.s) ? { _noGiven: true } : {}),

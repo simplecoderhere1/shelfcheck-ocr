@@ -251,7 +251,8 @@ async function readSegment(seg) {
 // box -- the volunteer is told only what the app actually knows.
 function isUnreadable(b) {
   if (b.outOfOrder || b._extrap || b._edge) return false;   // no box where we cannot place it, or for a spine cut by the frame
-  return !!b._unreadable || b._why === 'nokey' || b._why === 'trunc';
+  if (b._why === 'trunc') return true;                      // its deciding digits are not in the photo (wrapped, clipped)
+  return (!!b._unreadable || b._why === 'nokey') && !!b._saidUnreadable;
 }
 function flagKind(b) {
   if (b.outOfOrder) return 'red';
