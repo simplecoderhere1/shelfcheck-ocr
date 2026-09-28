@@ -1,0 +1,16 @@
+{
+  // One-upload fan-out for the page: see read-worker.js.
+  "name": "shelfcheck-read",
+  "main": "read-worker.js",
+  "compatibility_date": "2025-06-01",
+  // Buffer (native base64) for the image bytes
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  // Direct Worker-to-Worker calls: no public round trip, and the keys stay in
+  // the Workers that already hold them.
+  "services": [
+    { "binding": "GEMINI", "service": "selfcheck-proxy" },
+    { "binding": "AZURE", "service": "shelfcheck-azure-ocr" }
+  ],
+  "observability": { "enabled": true }
+}

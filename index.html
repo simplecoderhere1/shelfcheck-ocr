@@ -108,6 +108,10 @@ import { readShelf } from './reader.js';
 import { checkOrder } from './ordering.js';
 
 const GEMINI_URL = 'https://selfcheck-proxy.krish-sundareswar.workers.dev/';
+// Azure Read through the Cloudflare worker that holds the key (workers/azure-ocr-worker.js).
+const AZURE_URL = 'https://shelfcheck-azure-ocr.krish-sundareswar.workers.dev/ocr';
+// One upload, both engines (workers/read-worker.js); the two URLs above are the fallback.
+const READ_URL = 'https://shelfcheck-read.krish-sundareswar.workers.dev/read';
 
 const els = {
   segments: document.getElementById('segments'),
@@ -153,13 +157,11 @@ els.photoInput.onchange = async () => {
   await addSegments(files);
 };
 
-async function decodeToCanvas(file) {
-  const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
-  const canvas = document.createElement('canvas');
-  canvas.width = bitmap.width;
-  canvas.height = bitmap.height;
-  canvas.getContext('2d').drawImage(bitmap, 0, 0);
-  return canvas;
+// Decode once, orientation applied. The bitmap goes straight to the reader's
+// downscale; the photo on screen is the file itself (an object URL), so no
+// full-resolution re-encode happens on the phone just to display it.
+async function decode(file) {
+  return createImageBitmap(file, { imageOrientation: 'from-image' });
 }
 
 // Free-tier proxy rate-limits bursts (4-way concurrency hit 429s in testing),
@@ -176,9 +178,9 @@ async function addSegments(files) {
   for (const file of files) {
     let seg;
     try {
-      const canvas = await decodeToCanvas(file);
-      seg = { canvas, imgUrl: canvas.toDataURL('image/jpeg', 0.85),
-              sentW: canvas.width, sentH: canvas.height, books: [], status: 'loading' };
+      const bitmap = await decode(file);
+      seg = { bitmap, imgUrl: URL.createObjectURL(file),
+              sentW: bitmap.width, sentH: bitmap.height, books: [], status: 'loading' };
     } catch (e) {
       seg = { imgUrl: '', books: [], status: 'error', error: 'could not open this image' };
     }
@@ -207,12 +209,18 @@ async function addSegments(files) {
 
 async function readSegment(seg) {
   try {
-    const result = await readShelf(seg.canvas, section, { geminiUrl: GEMINI_URL });
-    seg.sentW = result.sentW; seg.sentH = result.sentH;
-    seg.books = result.books; seg.status = 'done'; seg.elapsedMs = result.elapsedMs;
+    const t0 = performance.now();
+    const result = await readShelf(seg.bitmap, section, { readUrl: READ_URL, geminiUrl: GEMINI_URL, azureUrl: AZURE_URL });
+    seg.sentW = result.sentW; seg.sentH = result.sentH; seg.section = result.section;
+    seg.books = result.books; seg.degraded = result.degraded;
     // Each photo is its own whole shelf: check its rows on their own. The books
-    // already carry the model's shelfRow, and checkOrder groups by it.
-    seg.checked = checkOrder(seg.books, section);
+    // already carry their shelfRow, and checkOrder groups by it.
+    seg.checked = checkOrder(seg.books, result.section);
+    seg.elapsedMs = Math.round(performance.now() - t0);
+    seg.status = 'done';
+    // test-only record for the latency/accuracy harness; nothing in the app reads it
+    (window.__shelfcheck ||= []).push({ raw: result.raw, via: result.via, model: result.model, timings: result.timings, elapsedMs: seg.elapsedMs, section: result.section, degraded: result.degraded,
+      books: seg.checked.map(b => ({ label: b.spine_label, raw: b._raw, row: b.shelfRow, red: !!b.outOfOrder, unread: isUnreadable(b), box: b._box01, why: b._why || null })) });
   } catch (err) {
     seg.status = 'error'; seg.error = String(err.message || err);
     const kind = err && err.kind;
@@ -221,13 +229,20 @@ async function readSegment(seg) {
       : `Couldn't read that photo: ${seg.error}`;
     showError(msg);
   } finally {
-    seg.canvas = null;   // free the decoded bitmap once read
+    if (seg.bitmap) { seg.bitmap.close?.(); seg.bitmap = null; }   // free the decoded photo once read
   }
 }
 
+// A box means one of exactly two things: the book is in the wrong place (red),
+// or its sticker could not be read (yellow). A book whose order evidence was
+// too weak to accuse (ordering.js demotes those to possiblyOutOfOrder) gets no
+// box -- the volunteer is told only what the app actually knows.
+function isUnreadable(b) {
+  return !b.outOfOrder && (!!b._unreadable || b._why === 'nokey' || b._why === 'trunc');
+}
 function flagKind(b) {
   if (b.outOfOrder) return 'red';
-  if (b.possiblyOutOfOrder) return 'yellow';
+  if (isUnreadable(b)) return 'yellow';
   return null;
 }
 
@@ -266,7 +281,7 @@ function render() {
       }
       div.innerHTML = `
         <div class="imgwrap"><img src="${seg.imgUrl}">${boxesHtml}</div>
-        <div class="meta"><span>${n} books read</span><span>${seg.elapsedMs ? (seg.elapsedMs/1000).toFixed(1)+'s' : ''}</span></div>`;
+        <div class="meta"><span>${n} books${seg.section !== section ? ` · read as ${seg.section}` : ''}${seg.degraded ? ' · box positions approximate' : ''}</span><span>${seg.elapsedMs ? (seg.elapsedMs/1000).toFixed(1)+'s' : ''}</span></div>`;
     }
     els.segments.appendChild(div);
   }
@@ -277,8 +292,8 @@ function render() {
     const batchNote = (batchCount > 1 && batchWallMs)
       ? `<span class="batch-time">${batchCount} photos in ${(batchWallMs/1000).toFixed(1)}s</span>` : '';
     els.summary.innerHTML = `
-      <span><span class="dot red"></span><b>${red}</b> check now</span>
-      <span><span class="dot yellow"></span><b>${yellow}</b> not sure</span>
+      <span><span class="dot red"></span><b>${red}</b> out of place</span>
+      <span><span class="dot yellow"></span><b>${yellow}</b> couldn't read</span>
       <span><span class="dot green"></span><b>${green}</b> in order</span>
       ${batchNote}`;
   } else {
@@ -287,14 +302,14 @@ function render() {
 
   const flagged = segments.filter(s => s.status === 'done')
     .flatMap(s => s.checked || [])
-    .filter(b => b.outOfOrder || b.possiblyOutOfOrder);
+    .filter(b => flagKind(b));
   if (flagged.length) {
     els.flaggedWrap.style.display = '';
     els.flaggedList.innerHTML = flagged.map(b => `
       <div class="row">
         <span class="dot ${b.outOfOrder ? 'red' : 'yellow'}"></span>
         <span class="label">${escapeHtml(b.spine_label)}</span>
-        <span class="why">${b.outOfOrder ? 'check its place' : 'not sure — check by hand'}</span>
+        <span class="why">${b.outOfOrder ? 'out of place' : 'sticker unreadable — check by hand'}</span>
       </div>`).join('');
   } else {
     els.flaggedWrap.style.display = 'none';

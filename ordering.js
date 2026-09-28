@@ -726,7 +726,10 @@ export function checkOrderOneShelf(books, section) {
         // below is the TREMBLAY/TREMBES family case and keeps its old
         // behaviour untouched.
         const truncation = vM.startsWith(vN) || vN.startsWith(vM);
-        const bothSure = isStrong(i) && isStrong(nIdx) && !truncation;
+        // Two engines reading this sticker the same way (fuse.js _azConfirmed) is
+        // the direct evidence this rule otherwise infers from neighbours: the text
+        // is not a garble of the neighbour's, whatever the neighbour's own score.
+        const bothSure = ((isStrong(i) && isStrong(nIdx)) || (checked[i]._azConfirmed && isStrong(i))) && !truncation;
         if (!bothSure && vM !== vN &&
             ((minLen >= 5 && editDistance(vM, vN) <= 2) ||
              (minLen >= 4 && editDistance(vM, vN) <= 1))) { demote = true; break; }
@@ -772,7 +775,7 @@ export function checkOrderOneShelf(books, section) {
         const cN = kN.val.cut || '';
         if (!cM || !cN || cM === cN || editDistance(cM, cN) > 1) continue;
         const sN = checked[nIdx]._score ?? 0;
-        if (isStrong(i) && isStrong(nIdx)) continue;
+        if (isStrong(i) && (isStrong(nIdx) || checked[i]._azConfirmed)) continue;
         if (sM > sN) continue;
         demote = true; break;
       }
@@ -1201,7 +1204,7 @@ export function checkOrderOneShelf(books, section) {
       for (const b of checked) {
         const c = cls(b);
         if (!b.outOfOrder || !c || c === modal) continue;
-        if ((cm.get(c) || 0) <= 1 && off1(c, modal)) {
+        if ((cm.get(c) || 0) <= 1 && off1(c, modal) && !b._numConfirmed) {
           b.outOfOrder = false; b.possiblyOutOfOrder = true; b.idealPosition = null;
         }
       }
@@ -1280,7 +1283,10 @@ export function checkOrderOneShelf(books, section) {
       const sameNumInOrder = checked.some(o => o !== b && numOf(o) === n &&
         (o.shelfRow ?? 0) === (b.shelfRow ?? 0) &&
         !o.outOfOrder && !o.possiblyOutOfOrder && !o.unverifiable);
-      if (sameNumInOrder) {
+      // The flattening this guards against is the VISION model's. When the OCR
+      // engine independently read the same digits (fuse.js sets _numConfirmed),
+      // the number is literal and the cutter clash is real evidence.
+      if (sameNumInOrder && !b._numConfirmed) {
         b.outOfOrder = false; b.possiblyOutOfOrder = true;
         b.idealPosition = null; b._why = 'deepdecimal';
       }
