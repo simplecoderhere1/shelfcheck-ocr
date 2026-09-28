@@ -537,6 +537,13 @@ export function fuse(gemRows, az, section, opts = {}) {
           b.azGiv = gw[0]?.text; b.weld = w.conf >= 0.8;
         }
       }
+      // Azure read only the tail of a name a neighbour carries in full ("GARBER" beside
+      // "WEISGARBER"): it is that name, partly read -- complete it before judging.
+      if (section === 'fiction' && A.length >= 4) {
+        const full = [books[i - 2], books[i - 1], books[i + 1], books[i + 2]].map(o => o?.key.tok)
+          .find(t => t && t.length > A.length + 1 && t.endsWith(A));
+        if (full) { A = full; azText = full; }
+      }
       const adopt = (giv) => {
         b.override = true; b.gemLabel = b.label;
         if (section === 'fiction') b.label = `${azText}, ${giv ?? (b.key.giv || b.azGiv || '')}`.replace(/,\s*$/, '');
