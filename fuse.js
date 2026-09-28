@@ -681,12 +681,15 @@ export function cleanForOrder(label, section) {
 //   0.30 unreadable -> never sorted, shown as "couldn't read"
 export function toBooks(fused, section) {
   const books = [];
+  // Azure unavailable (outage, monthly budget spent): there is no second engine to
+  // require, so the model's read may accuse on its own, as the previous app did.
+  const noAzure = !fused.words || fused.words.length < 5;
   fused.rows.forEach((row, ri) => row.books.forEach(b => {
     const c = cleanForOrder(b.label, section);
     const score = c.unreadable ? 0.3
       : section === 'nonfiction' && b.agree === 'fuzzy' && !b.override ? 0.5   // engines differ by a letter (HAG / HAR)
       : b.agree === 'exact' || b.agree === 'fuzzy' || b.override ? 0.97
-      : b.agree === 'disagree' ? 0.85 : b.inserted ? 0.9 : (b.tokW ? 0.9 : 0.55);   // 0.55: below RED_MIN_SCORE -- a sticker Azure never saw is not accused
+      : b.agree === 'disagree' ? 0.85 : b.inserted ? 0.9 : (b.tokW || noAzure ? 0.9 : 0.55);   // 0.55: below RED_MIN_SCORE -- a sticker Azure never saw is not accused
     books.push({
       spine_label: c.s || b.label, shelfRow: ri, _src: 'gemini', _score: score,
       ...(c.unreadable ? { confidence: 'low', _unreadable: true } : {}),
